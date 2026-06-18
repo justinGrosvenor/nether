@@ -24,10 +24,14 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Nether VMM (requires Linux + /dev/kvm)");
     run_step.dependOn(&run_cmd.step);
 
+    // Tests build for the host so `zig build test` runs locally. The pure-logic
+    // and ABI checks have no KVM dependency. On a macOS host whose xcode-select
+    // points into Xcode.app, prefix with DEVELOPER_DIR=/Library/Developer/
+    // CommandLineTools so the native link finds the SDK.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
-            .target = target,
+            .target = b.resolveTargetQuery(.{}),
             .optimize = optimize,
         }),
     });
