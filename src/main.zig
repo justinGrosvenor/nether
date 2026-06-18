@@ -46,15 +46,24 @@ pub fn main() !void {
     const blob = comptime buildBlob(message);
     @memcpy(low[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
 
+    // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
+    var power = nether.Power{};
     var serial = nether.Serial{};
+    var rtc = nether.Rtc{};
+    var pm = nether.Pm{ .power = &power };
+    var reset = nether.Reset{ .power = &power };
+
     var bus = nether.Bus{};
     try bus.addPio(serial.device());
+    try bus.addPio(rtc.device());
+    try bus.addPio(pm.device());
+    try bus.addPio(reset.device());
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
     try vcpu.setRealModeEntry(CODE_LOAD_ADDR);
 
-    const reason = vcpu.run(&bus) catch |err| {
+    const reason = vcpu.run(&bus, &power) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };

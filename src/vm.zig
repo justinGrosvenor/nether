@@ -7,6 +7,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const kvm = @import("kvm.zig");
 const io = @import("io.zig");
+const pwr = @import("power.zig");
 
 const PROT_RW = linux.PROT.READ | linux.PROT.WRITE;
 const max_regions = 8;
@@ -102,7 +103,7 @@ pub const Vcpu = struct {
     run_page: *kvm.Run,
     run_mem: []u8,
 
-    pub const StopReason = enum { halted, shutdown };
+    pub const StopReason = enum { halted, shutdown, reset };
 
     fn init(kvm_fd: i32, vm_fd: i32, id: u32) Error!Vcpu {
         const fd: i32 = @intCast(try kvm.ioctl(vm_fd, kvm.CREATE_VCPU, id));
@@ -146,8 +147,9 @@ pub const Vcpu = struct {
     }
 
     /// Enter the guest repeatedly, dispatching I/O exits to `bus`, until the
-    /// guest halts or shuts down. Unhandled exits are surfaced as errors.
-    pub fn run(self: *Vcpu, bus: *io.Bus) !StopReason {
+    /// guest halts or a device requests a power transition via `power`.
+    /// Unhandled exits are surfaced as errors.
+    pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power) !StopReason {
         while (true) {
             _ = try kvm.ioctl(self.fd, kvm.RUN, 0);
             switch (self.run_page.exit_reason) {
@@ -162,6 +164,11 @@ pub const Vcpu = struct {
                     return error.UnhandledExit;
                 },
             }
+            // A device handled during this exit may have requested power-off/reset.
+            if (power.action) |a| return switch (a) {
+                .reset => .reset,
+                .shutdown => .shutdown,
+            };
         }
     }
 

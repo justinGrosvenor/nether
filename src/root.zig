@@ -18,7 +18,14 @@ pub const MmioDevice = io.MmioDevice;
 
 pub const memmap = @import("memmap.zig");
 
+const power = @import("power.zig");
+pub const Power = power.Power;
+pub const PowerAction = power.Action;
+
 pub const Serial = @import("serial.zig").Serial;
+pub const Rtc = @import("rtc.zig").Rtc;
+pub const Pm = @import("pm.zig").Pm;
+pub const Reset = @import("reset.zig").Reset;
 
 test {
     @import("std").testing.refAllDecls(@This());
