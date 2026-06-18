@@ -7,7 +7,7 @@ See [`docs/`](docs/README.md) for design, roadmap, and decisions.
 
 ## Status
 
-**Phase 0 — KVM skeleton.** Creates a VM + vCPU, maps one guest RAM region, runs
+**Phase 0 - KVM skeleton.** Creates a VM + vCPU, maps one guest RAM region, runs
 a comptime-assembled real-mode blob that prints over COM1 via `KVM_EXIT_IO`, and
 stops on `HLT`. The spine the rest of the roadmap hangs off.
 

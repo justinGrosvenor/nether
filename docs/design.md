@@ -1,10 +1,10 @@
-# Nether — Design
+# Nether - Design
 
 A type-2 virtual machine monitor written in Zig. Modern guests only, no legacy
 hardware. Runs in the layer below the guest, hence the name.
 
 > Nether is the **isolation layer** of a *govern · isolate · meter · edge*
-> platform — see [thesis.md](thesis.md) for the why. The thesis pulls the edge
+> platform - see [thesis.md](thesis.md) for the why. The thesis pulls the edge
 > path (embeddable core, vsock spine, snapshot-fork, PVH fast boot) forward of
 > the general-VMM path; the design below is the full envelope, the roadmap
 > sequences it.
@@ -41,7 +41,7 @@ OVMF expects a minimum platform, so these exist despite the no-legacy stance:
 LAPIC/IOAPIC via the KVM irqchip, kvmclock/TSC.
 
 > Audit note: the *true* floor is whatever stock OVMF probes at boot. Expect it
-> to also include **fw_cfg** (tables/memory/SMBIOS transport — see
+> to also include **fw_cfg** (tables/memory/SMBIOS transport - see
 > [decisions](decisions.md#d1-ovmf-coupling-fw_cfg-vs-forked-firmware)), the
 > **0xCF9 reset port** (OVMF's ResetSystem path), and an OVMF **debug port**
 > (~0x402). Derive the list from the OVMF source, not from a hang.
@@ -68,7 +68,7 @@ The no-old-hardware cut line:
   thread on epoll over eventfds (irqfd, ioeventfd). No async runtime.
 
 > The datapath is zero-alloc and lock-free per the above. The **config plane is
-> not** — vCPU threads write device state (PCI config, MSI-X tables, virtio
+> not** - vCPU threads write device state (PCI config, MSI-X tables, virtio
 > config) on MMIO/PIO exits while the I/O thread processes virtqueues against the
 > same state. That cross-thread state needs an explicit locking discipline; see
 > [decisions](decisions.md#d3-config-plane-concurrency).
@@ -85,7 +85,7 @@ vhost-user where practical.
 > console, vsock) are owned and fuzzed; large/high-risk surfaces (net, fs, and
 > especially **gpu**) go out-of-process. virtio-gpu with 3D/virgl is a
 > host-side GL command parser and the single biggest attack surface in the
-> device set — scope it deliberately, see
+> device set - scope it deliberately, see
 > [decisions](decisions.md#d4-virtio-gpu-scope).
 
 ## Prior art
