@@ -7,7 +7,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const nether = @import("root.zig");
 
-const GUEST_RAM_SIZE = 16 * nether.memmap.mib; // ample for Phase 0
+const GUEST_RAM_SIZE = 256 * nether.memmap.mib; // room for a kernel + initramfs
 const CODE_LOAD_ADDR = 0x1000;
 
 const message = "Nether lives. Phase 0: real-mode guest over COM1.\n";
@@ -79,11 +79,13 @@ pub fn main() !void {
     const kernel: ?[]u8 = readFile(allocator, "vmlinux") catch null;
     if (kernel) |k| {
         defer allocator.free(k);
-        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0 earlyprintk=ttyS0") catch |err| {
+        const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
+        defer if (initramfs) |fs| allocator.free(fs);
+        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0 earlyprintk=ttyS0", initramfs) catch |err| {
             std.debug.print("[nether] PVH boot failed: {s}\n", .{@errorName(err)});
             return err;
         };
-        std.debug.print("[nether] PVH: booting vmlinux ({d} bytes)\n", .{k.len});
+        std.debug.print("[nether] PVH: booting vmlinux ({d} bytes), initramfs {d} bytes\n", .{ k.len, if (initramfs) |fs| fs.len else 0 });
     } else {
         const blob = comptime buildBlob(message);
         @memcpy(low[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
