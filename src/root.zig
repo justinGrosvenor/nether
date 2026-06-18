@@ -22,6 +22,9 @@ pub const acpi = @import("acpi.zig");
 pub const elf = @import("elf.zig");
 pub const pvh = @import("pvh.zig");
 
+pub const pci = @import("pci.zig");
+pub const PciHost = pci.Host;
+
 const power = @import("power.zig");
 pub const Power = power.Power;
 pub const PowerAction = power.Action;

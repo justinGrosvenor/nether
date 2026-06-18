@@ -65,12 +65,15 @@ pub fn main() !void {
     var reset = nether.Reset{ .power = &power };
     var fw = nether.FwCfg{};
 
+    var pci_host = nether.PciHost{};
+
     var bus = nether.Bus{};
     try bus.addPio(serial.device());
     try bus.addPio(rtc.device());
     try bus.addPio(pm.device());
     try bus.addPio(reset.device());
     try bus.addPio(fw.device());
+    try bus.addMmio(pci_host.mmioDevice()); // PCIe ECAM (empty bus 0 for now)
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
