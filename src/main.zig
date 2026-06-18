@@ -1,8 +1,10 @@
-//! Nether Phase 0 binary: a thin wrapper over the embeddable core. Build a VM
-//! with one RAM region and a serial device, load a comptime-assembled real-mode
-//! blob that prints over COM1, and run until the guest halts.
+//! Nether binary: a thin wrapper over the embeddable core. If a `vmlinux` is
+//! present in the working directory it is PVH-booted; otherwise a comptime
+//! real-mode blob runs as a smoke test. Either way the firmware floor is wired
+//! and the vCPU runs until the guest halts or powers off.
 
 const std = @import("std");
+const linux = std.os.linux;
 const nether = @import("root.zig");
 
 const GUEST_RAM_SIZE = 16 * nether.memmap.mib; // ample for Phase 0
@@ -55,9 +57,6 @@ pub fn main() !void {
     const low = try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
 
-    const blob = comptime buildBlob(message);
-    @memcpy(low[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
-
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
     var power = nether.Power{};
     var serial = nether.Serial{};
@@ -75,11 +74,52 @@ pub fn main() !void {
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
-    try vcpu.setRealModeEntry(CODE_LOAD_ADDR);
+
+    // Boot a PVH kernel if `vmlinux` is present; otherwise run the demo blob.
+    const kernel: ?[]u8 = readFile(allocator, "vmlinux") catch null;
+    if (kernel) |k| {
+        defer allocator.free(k);
+        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0 earlyprintk=ttyS0") catch |err| {
+            std.debug.print("[nether] PVH boot failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        std.debug.print("[nether] PVH: booting vmlinux ({d} bytes)\n", .{k.len});
+    } else {
+        const blob = comptime buildBlob(message);
+        @memcpy(low[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
+        try vcpu.setRealModeEntry(CODE_LOAD_ADDR);
+    }
 
     const reason = vcpu.run(&bus, &power) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };
-    std.debug.print("\n[nether] guest {s}. Phase 0 complete.\n", .{@tagName(reason)});
+    std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// Read an entire file via raw linux syscalls (avoids the std.Io/args churn).
+/// Caller owns the returned slice.
+fn readFile(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
+    const fd_u = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    switch (linux.errno(fd_u)) {
+        .SUCCESS => {},
+        else => return error.OpenFailed,
+    }
+    const fd: i32 = @intCast(fd_u);
+    defer _ = linux.close(fd);
+
+    var buf = try allocator.alloc(u8, 1 << 20);
+    errdefer allocator.free(buf);
+    var total: usize = 0;
+    while (true) {
+        if (total == buf.len) buf = try allocator.realloc(buf, buf.len * 2);
+        const n = linux.read(fd, buf.ptr + total, buf.len - total);
+        switch (linux.errno(n)) {
+            .SUCCESS => {},
+            else => return error.ReadFailed,
+        }
+        if (n == 0) break;
+        total += n;
+    }
+    return allocator.realloc(buf, total);
 }

@@ -17,6 +17,7 @@ pub const Error = error{
     BadApiVersion,
     SyscallFailed,
     TooManyRegions,
+    NotMapped,
 } || kvm.Error;
 
 fn sys(r: usize, comptime what: []const u8) Error!usize {
@@ -94,6 +95,27 @@ pub const Vm = struct {
         return slice;
     }
 
+    /// Return a host slice for the guest physical range, or NotMapped.
+    fn guestSlice(self: *Vm, gpa: u64, len: usize) Error![]u8 {
+        for (self.regions[0..self.region_count]) |r| {
+            if (gpa >= r.guest_phys and gpa + len <= r.guest_phys + r.host.len) {
+                const off: usize = @intCast(gpa - r.guest_phys);
+                return r.host[off .. off + len];
+            }
+        }
+        return error.NotMapped;
+    }
+
+    /// Copy `bytes` into guest physical memory at `gpa`.
+    pub fn guestWrite(self: *Vm, gpa: u64, bytes: []const u8) Error!void {
+        @memcpy(try self.guestSlice(gpa, bytes.len), bytes);
+    }
+
+    /// Zero `len` bytes of guest physical memory at `gpa`.
+    pub fn guestZero(self: *Vm, gpa: u64, len: usize) Error!void {
+        @memset(try self.guestSlice(gpa, len), 0);
+    }
+
     /// Enable the split irqchip (in-kernel LAPIC, userspace IOAPIC/PIC). Must be
     /// called before creating vCPUs.
     pub fn enableSplitIrqchip(self: *Vm) Error!void {
@@ -150,6 +172,54 @@ pub const Vcpu = struct {
         var regs: kvm.Regs = std.mem.zeroes(kvm.Regs);
         regs.rip = ip;
         regs.rflags = 0x2; // reserved bit, must be set
+        _ = try kvm.ioctl(self.fd, kvm.SET_REGS, @intFromPtr(&regs));
+    }
+
+    /// Set up 32-bit flat protected mode and enter at `eip` with EBX = `ebx`
+    /// (the PVH ABI: EBX points at hvm_start_info). Paging is off; `gdt_base`
+    /// must already hold a null/code/data GDT.
+    pub fn setProtectedMode(self: *Vcpu, eip: u64, ebx: u64, gdt_base: u64) Error!void {
+        var sregs: kvm.Sregs = undefined;
+        _ = try kvm.ioctl(self.fd, kvm.GET_SREGS, @intFromPtr(&sregs));
+
+        const code = kvm.Segment{
+            .base = 0,
+            .limit = 0xfffff,
+            .selector = 0x08,
+            .type_ = 0xb, // execute/read, accessed
+            .present = 1,
+            .dpl = 0,
+            .db = 1, // 32-bit
+            .s = 1,
+            .l = 0,
+            .g = 1, // 4 KiB granularity -> 4 GiB
+            .avl = 0,
+            .unusable = 0,
+            .padding = 0,
+        };
+        var data = code;
+        data.selector = 0x10;
+        data.type_ = 0x3; // read/write, accessed
+
+        sregs.cs = code;
+        sregs.ds = data;
+        sregs.es = data;
+        sregs.ss = data;
+        sregs.fs = data;
+        sregs.gs = data;
+        sregs.gdt.base = gdt_base;
+        sregs.gdt.limit = 23; // 3 entries
+        sregs.cr0 = 0x1; // PE set, paging off
+        sregs.cr2 = 0;
+        sregs.cr3 = 0;
+        sregs.cr4 = 0;
+        sregs.efer = 0;
+        _ = try kvm.ioctl(self.fd, kvm.SET_SREGS, @intFromPtr(&sregs));
+
+        var regs: kvm.Regs = std.mem.zeroes(kvm.Regs);
+        regs.rip = eip;
+        regs.rbx = ebx;
+        regs.rflags = 0x2;
         _ = try kvm.ioctl(self.fd, kvm.SET_REGS, @intFromPtr(&regs));
     }
 

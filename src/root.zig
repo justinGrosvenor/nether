@@ -19,6 +19,8 @@ pub const MmioDevice = io.MmioDevice;
 pub const memmap = @import("memmap.zig");
 pub const irqchip = @import("irqchip.zig");
 pub const acpi = @import("acpi.zig");
+pub const elf = @import("elf.zig");
+pub const pvh = @import("pvh.zig");
 
 const power = @import("power.zig");
 pub const Power = power.Power;
