@@ -15,7 +15,7 @@ pub const Serial = struct {
     const data_reg = base + 0;
     const lsr_reg = base + 5; // line status register
 
-    pub fn device(self: *Serial) io.Device {
+    pub fn device(self: *Serial) io.PioDevice {
         return .{
             .ptr = self,
             .base = base,

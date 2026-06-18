@@ -13,7 +13,10 @@ pub const Error = vm.Error;
 
 pub const io = @import("io.zig");
 pub const Bus = io.Bus;
-pub const Device = io.Device;
+pub const PioDevice = io.PioDevice;
+pub const MmioDevice = io.MmioDevice;
+
+pub const memmap = @import("memmap.zig");
 
 pub const Serial = @import("serial.zig").Serial;
 

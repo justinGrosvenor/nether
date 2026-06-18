@@ -5,7 +5,7 @@
 const std = @import("std");
 const nether = @import("root.zig");
 
-const GUEST_RAM_SIZE = 0x20000; // 128 KiB, ample for Phase 0
+const GUEST_RAM_SIZE = 16 * nether.memmap.mib; // ample for Phase 0
 const CODE_LOAD_ADDR = 0x1000;
 
 const message = "Nether lives. Phase 0: real-mode guest over COM1.\n";
@@ -37,13 +37,18 @@ pub fn main() !void {
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
 
-    const mem = try vm.addMemory(0, 0, GUEST_RAM_SIZE);
+    // The memory map is the single source of truth; register every RAM region
+    // it produces. Low RAM holds the boot blob.
+    const layout = nether.memmap.Layout.compute(GUEST_RAM_SIZE);
+    const low = try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
+    if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
+
     const blob = comptime buildBlob(message);
-    @memcpy(mem[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
+    @memcpy(low[CODE_LOAD_ADDR .. CODE_LOAD_ADDR + blob.len], blob[0..]);
 
     var serial = nether.Serial{};
     var bus = nether.Bus{};
-    try bus.add(serial.device());
+    try bus.addPio(serial.device());
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();

@@ -154,11 +154,7 @@ pub const Vcpu = struct {
                 kvm.EXIT_HLT => return .halted,
                 kvm.EXIT_SHUTDOWN => return .shutdown,
                 kvm.EXIT_IO => self.dispatchIo(bus),
-                kvm.EXIT_MMIO => {
-                    const m = self.run_page.exit.mmio;
-                    std.debug.print("[nether] unhandled MMIO @0x{x} write={d} len={d}\n", .{ m.phys_addr, m.is_write, m.len });
-                    return error.UnhandledMmio;
-                },
+                kvm.EXIT_MMIO => self.dispatchMmio(bus),
                 kvm.EXIT_FAIL_ENTRY => return error.FailEntry,
                 kvm.EXIT_INTERNAL_ERROR => return error.InternalError,
                 else => {
@@ -178,10 +174,20 @@ pub const Vcpu = struct {
             const off = @as(usize, i) * len;
             const slot = data[off .. off + len];
             if (e.direction == kvm.EXIT_IO_OUT) {
-                bus.out(e.port, e.size, readValue(slot));
+                bus.pioOut(e.port, e.size, readValue(slot));
             } else {
-                writeValue(slot, bus.in(e.port, e.size));
+                writeValue(slot, bus.pioIn(e.port, e.size));
             }
+        }
+    }
+
+    fn dispatchMmio(self: *Vcpu, bus: *io.Bus) void {
+        const m = &self.run_page.exit.mmio;
+        const data = m.data[0..m.len];
+        if (m.is_write != 0) {
+            bus.mmioWrite(m.phys_addr, data);
+        } else {
+            bus.mmioRead(m.phys_addr, data); // fills data in the run page in place
         }
     }
 };
