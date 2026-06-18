@@ -23,6 +23,15 @@ Pick (a). It's the difference between Phase 2 being a milestone and being a
 maintenance liability. fw_cfg is therefore part of the firmware floor, not an
 optional extra.
 
+In progress: `fw_cfg.zig` implements the traditional PIO interface (selector,
+data, file directory); `acpi.zig` generates the fixed-placement table set
+(RSDP/XSDT/FADT/FACS/MADT/MCFG/DSDT) with real checksums. Two pieces remain to
+make stock OVMF consume them: the **ACPI linker/loader** (`etc/table-loader`
+ROMFILE_ALLOC / ADD_POINTER / ADD_CHECKSUM commands) plus serving the table blob
+and `etc/acpi/rsdp` over fw_cfg, and the **fw_cfg DMA** interface (optional;
+OVMF falls back to PIO without it). The same `acpi.zig` output feeds the PVH
+direct-boot path, where the RSDP address is handed to the kernel instead.
+
 ## D2 - Which devices go out-of-process
 
 **Status:** open · **Recommendation:** per-device split below
