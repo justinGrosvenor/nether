@@ -64,12 +64,14 @@ pub fn main() !void {
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
     var reset = nether.Reset{ .power = &power };
+    var fw = nether.FwCfg{};
 
     var bus = nether.Bus{};
     try bus.addPio(serial.device());
     try bus.addPio(rtc.device());
     try bus.addPio(pm.device());
     try bus.addPio(reset.device());
+    try bus.addPio(fw.device());
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();

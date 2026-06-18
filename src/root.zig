@@ -18,6 +18,7 @@ pub const MmioDevice = io.MmioDevice;
 
 pub const memmap = @import("memmap.zig");
 pub const irqchip = @import("irqchip.zig");
+pub const acpi = @import("acpi.zig");
 
 const power = @import("power.zig");
 pub const Power = power.Power;
@@ -27,6 +28,7 @@ pub const Serial = @import("serial.zig").Serial;
 pub const Rtc = @import("rtc.zig").Rtc;
 pub const Pm = @import("pm.zig").Pm;
 pub const Reset = @import("reset.zig").Reset;
+pub const FwCfg = @import("fw_cfg.zig").FwCfg;
 
 test {
     @import("std").testing.refAllDecls(@This());
