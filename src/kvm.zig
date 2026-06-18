@@ -3,7 +3,7 @@
 //! Hand-rolled `extern struct` layouts and comptime-derived ioctl numbers for
 //! exactly the surface the skeleton needs: create VM/vCPU, register one memory
 //! region, set real-mode entry state, and run. This deliberately avoids
-//! `@cImport("linux/kvm.h")` for now — see docs/decisions.md (D7): cImport pulls
+//! `@cImport("linux/kvm.h")` for now; see docs/decisions.md (D7): cImport pulls
 //! kernel uapi headers that aren't present when cross-compiling from a non-Linux
 //! host, which would break `zig build` on macOS. The layouts below match the
 //! kernel's and are checked against KVM's published ioctl numbers in a test.
