@@ -112,3 +112,11 @@ in `src/kvm.zig` are the safety net for either path.
 firecracker/cloud-hypervisor, gives clean MSI routing via `KVM_SET_GSI_ROUTING` +
 irqfd, and keeps the modern-only design honest. Full in-kernel irqchip is the
 more legacy-flavored path; not chosen.
+
+Implemented in `irqchip.zig`: the cap is enabled (24 GSIs) before vCPU creation,
+plus eventfd, irqfd, ioeventfd, and direct MSI injection (`KVM_SIGNAL_MSI`). The
+cost of split is that the **userspace IOAPIC** (redirection table, EOI via
+`KVM_EXIT_IOAPIC_EOI`) and `KVM_SET_GSI_ROUTING` for MSI-over-irqfd are now ours
+to write. Deferred until a guest first programs the IOAPIC (OVMF) or virtio-pci
+needs MSI-X routing; the run loop tolerates `EXIT_IOAPIC_EOI` as a no-op until
+then.

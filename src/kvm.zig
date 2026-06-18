@@ -43,7 +43,21 @@ pub const SET_REGS = iow(0x82, Regs);
 pub const GET_SREGS = ior(0x83, Sregs);
 pub const SET_SREGS = iow(0x84, Sregs);
 
+pub const CHECK_EXTENSION = io(0x03);
+pub const ENABLE_CAP = iow(0xa3, EnableCap);
+pub const IRQFD = iow(0x76, Irqfd);
+pub const IOEVENTFD = iow(0x79, Ioeventfd);
+pub const SIGNAL_MSI = iow(0xa5, Msi);
+
 pub const API_VERSION = 12;
+
+// --- capabilities and interrupt flags --------------------------------------
+
+pub const CAP_SPLIT_IRQCHIP = 121;
+
+pub const IOEVENTFD_FLAG_DATAMATCH = 1 << 0;
+pub const IOEVENTFD_FLAG_PIO = 1 << 1;
+pub const IRQFD_FLAG_RESAMPLE = 1 << 1;
 
 // --- exit reasons ----------------------------------------------------------
 
@@ -57,6 +71,8 @@ pub const EXIT_INTERNAL_ERROR = 17;
 
 pub const EXIT_IO_IN = 0;
 pub const EXIT_IO_OUT = 1;
+
+pub const EXIT_IOAPIC_EOI = 26;
 
 // --- structures (must match kernel layout) ---------------------------------
 
@@ -167,6 +183,41 @@ pub const Run = extern struct {
     },
 };
 
+// --- interrupt / capability structures -------------------------------------
+
+pub const EnableCap = extern struct {
+    cap: u32,
+    flags: u32,
+    args: [4]u64,
+    pad: [64]u8,
+};
+
+pub const Irqfd = extern struct {
+    fd: u32,
+    gsi: u32,
+    flags: u32,
+    resamplefd: u32,
+    pad: [16]u8,
+};
+
+pub const Ioeventfd = extern struct {
+    datamatch: u64,
+    addr: u64,
+    len: u32,
+    fd: i32,
+    flags: u32,
+    pad: [36]u8,
+};
+
+pub const Msi = extern struct {
+    address_lo: u32,
+    address_hi: u32,
+    data: u32,
+    flags: u32,
+    devid: u32,
+    pad: [12]u8,
+};
+
 // --- ioctl wrapper ---------------------------------------------------------
 
 pub const Error = error{IoctlFailed};
@@ -207,4 +258,19 @@ test "struct sizes match kernel" {
     try std.testing.expectEqual(@as(usize, 312), @sizeOf(Sregs));
     // The exit union begins at offset 32 in kvm_run.
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(Run, "exit"));
+}
+
+test "interrupt struct sizes match kernel" {
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(EnableCap));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Irqfd));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Ioeventfd));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Msi));
+}
+
+test "interrupt ioctl numbers match KVM ABI" {
+    try std.testing.expectEqual(@as(u32, 0xAE03), CHECK_EXTENSION);
+    try std.testing.expectEqual(@as(u32, 0x4068AEA3), ENABLE_CAP);
+    try std.testing.expectEqual(@as(u32, 0x4020AE76), IRQFD);
+    try std.testing.expectEqual(@as(u32, 0x4040AE79), IOEVENTFD);
+    try std.testing.expectEqual(@as(u32, 0x4020AEA5), SIGNAL_MSI);
 }

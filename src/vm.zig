@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const kvm = @import("kvm.zig");
 const io = @import("io.zig");
 const pwr = @import("power.zig");
+const irqchip = @import("irqchip.zig");
 
 const PROT_RW = linux.PROT.READ | linux.PROT.WRITE;
 const max_regions = 8;
@@ -93,6 +94,12 @@ pub const Vm = struct {
         return slice;
     }
 
+    /// Enable the split irqchip (in-kernel LAPIC, userspace IOAPIC/PIC). Must be
+    /// called before creating vCPUs.
+    pub fn enableSplitIrqchip(self: *Vm) Error!void {
+        try irqchip.enableSplit(self.vm_fd, irqchip.default_gsis);
+    }
+
     pub fn createVcpu(self: *Vm, id: u32) Error!Vcpu {
         return Vcpu.init(self.kvm_fd, self.vm_fd, id);
     }
@@ -157,6 +164,7 @@ pub const Vcpu = struct {
                 kvm.EXIT_SHUTDOWN => return .shutdown,
                 kvm.EXIT_IO => self.dispatchIo(bus),
                 kvm.EXIT_MMIO => self.dispatchMmio(bus),
+                kvm.EXIT_IOAPIC_EOI => {}, // userspace IOAPIC not yet implemented
                 kvm.EXIT_FAIL_ENTRY => return error.FailEntry,
                 kvm.EXIT_INTERNAL_ERROR => return error.InternalError,
                 else => {

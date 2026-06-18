@@ -46,6 +46,9 @@ pub fn main() !void {
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
 
+    // Split irqchip: in-kernel LAPIC, userspace IOAPIC/PIC. Before any vCPU.
+    try vm.enableSplitIrqchip();
+
     // The memory map is the single source of truth; register every RAM region
     // it produces. Low RAM holds the boot blob.
     const layout = nether.memmap.Layout.compute(GUEST_RAM_SIZE);
