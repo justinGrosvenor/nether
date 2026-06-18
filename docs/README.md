@@ -13,10 +13,13 @@ isolation substrate of a *govern · isolate · meter · edge* platform.
 - **[decisions.md](decisions.md)** - open architectural decisions worth settling
   before they calcify (OVMF/fw_cfg coupling, device out-of-process split,
   config-plane locking, virtio-gpu scope, test harness, irqchip model).
+- **[running-on-kvm.md](running-on-kvm.md)** - turnkey path from a fresh KVM host
+  to a live boot: verify /dev/kvm, install Zig, run tests + the smoke test, then
+  build a PVH kernel + initramfs and boot Linux.
 
 ## Start here
 
-The thesis ([thesis.md](thesis.md)) says *why*. The next concrete step is Phase 0
-- the `KVM_RUN` loop to serial-out (already scaffolded) - followed by the Phase
-1.5 substrate, which is where the project actually gets hard. See
+The thesis ([thesis.md](thesis.md)) says *why*. The Phase 1.5 substrate and the
+PVH boot path are built; the next step is a live boot on a KVM host (see
+[running-on-kvm.md](running-on-kvm.md)) and then virtio-blk. See
 [roadmap.md](roadmap.md).
