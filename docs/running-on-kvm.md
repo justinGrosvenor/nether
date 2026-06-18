@@ -14,18 +14,14 @@ grep -Eo 'vmx|svm' /proc/cpuinfo | head -1   # vmx (Intel) or svm (AMD)
 If `/dev/kvm` is missing on a cloud VM, nested virt is not enabled (AWS: use a
 `*.metal` instance; GCP: `--enable-nested-virtualization`; Azure: a v3+ family).
 
-## 1. Install Zig (0.16 dev)
+## 1. Install Zig 0.16.0
 
 ```sh
-curl -fSL https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.tar.xz -o zig.tar.xz \
-  || curl -fSL "$(curl -s https://ziglang.org/download/index.json | grep -o 'https[^"]*x86_64-linux[^"]*\.tar\.xz' | head -1)" -o zig.tar.xz
+curl -fSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
 mkdir -p zig && tar -xf zig.tar.xz -C zig --strip-components=1
 export PATH="$PWD/zig:$PATH"
-zig version
+zig version   # 0.16.0
 ```
-
-The repo is developed against `0.16.0-dev.2135`. A newer master may have std API
-drift; expect a few small fixes (the build errors point straight at them).
 
 ## 2. Build and run the test suite
 

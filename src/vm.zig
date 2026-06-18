@@ -10,7 +10,7 @@ const io = @import("io.zig");
 const pwr = @import("power.zig");
 const irqchip = @import("irqchip.zig");
 
-const PROT_RW = linux.PROT.READ | linux.PROT.WRITE;
+const PROT_RW: linux.PROT = .{ .READ = true, .WRITE = true };
 const max_regions = 8;
 
 pub const Error = error{

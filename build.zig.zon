@@ -2,7 +2,7 @@
     .name = .nether,
     .version = "0.0.0",
     .fingerprint = 0xd6f61515c118b12c,
-    .minimum_zig_version = "0.16.0-dev",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

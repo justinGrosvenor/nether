@@ -76,4 +76,4 @@ src/main.zig       thin binary wrapper over the core
 docs/              thesis.md · design.md · roadmap.md · decisions.md
 ```
 
-Requires a recent Zig (developed against 0.16.0-dev).
+Requires Zig 0.16.0.
