@@ -11,10 +11,11 @@ const CODE_LOAD_ADDR = 0x1000;
 const message = "Nether lives. Phase 0: real-mode guest over COM1.\n";
 
 /// Comptime-assemble a 16-bit real-mode program that prints `msg` byte by byte
-/// to COM1, then halts. No loops or memory operands (just `mov al, c; out dx,
-/// al` per character), so it is trivially correct.
-fn buildBlob(comptime msg: []const u8) [3 + msg.len * 3 + 1]u8 {
-    var buf: [3 + msg.len * 3 + 1]u8 = undefined;
+/// to COM1, then triggers ACPI S5 soft-off. No loops or memory operands (just
+/// `mov al, c; out dx, al` per character), so it is trivially correct. The S5
+/// write drives the PM block end to end, so the run loop returns `.shutdown`.
+fn buildBlob(comptime msg: []const u8) [3 + msg.len * 3 + 8]u8 {
+    var buf: [3 + msg.len * 3 + 8]u8 = undefined;
     buf[0] = 0xBA; // mov dx, 0x3f8
     buf[1] = 0xF8;
     buf[2] = 0x03;
@@ -25,7 +26,15 @@ fn buildBlob(comptime msg: []const u8) [3 + msg.len * 3 + 1]u8 {
         buf[i + 2] = 0xEE; // out dx, al
         i += 3;
     }
-    buf[i] = 0xF4; // hlt
+    // ACPI S5 soft-off: write SLP_EN | (SLP_TYP=5) to PM1a_CNT (port 0x604).
+    buf[i] = 0xBA; // mov dx, 0x604
+    buf[i + 1] = 0x04;
+    buf[i + 2] = 0x06;
+    buf[i + 3] = 0xB8; // mov ax, 0x3400  (SLP_EN=0x2000 | 5<<10)
+    buf[i + 4] = 0x00;
+    buf[i + 5] = 0x34;
+    buf[i + 6] = 0xEF; // out dx, ax
+    buf[i + 7] = 0xF4; // hlt (fallback if shutdown does not fire)
     return buf;
 }
 

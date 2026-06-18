@@ -39,7 +39,7 @@ Expected output on a KVM host:
 
 ```
 Nether lives. Phase 0: real-mode guest over COM1.
-[nether] guest halted. Phase 0 complete.
+[nether] guest shutdown. Phase 0 complete.
 ```
 
 ## Layout
