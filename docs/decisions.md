@@ -110,6 +110,14 @@ A VMM is the worst place to have no test story. Three layers, stood up early:
   in-process virtqueue/config parser - built the moment that parser exists, not
   at Phase 6.
 
+In progress: the fuzz-smoke layer is stood up (`src/fuzz.zig`), an always-on
+deterministic smoke that runs with `zig build test`. It feeds thousands of
+random byte streams to the two guest-facing parsers that exist today, the
+vendored VT parser (`src/vt/`) and the virtqueue (`src/virtq.zig`), asserting
+each always terminates in bounds and never panics. Pattern borrowed from the
+jbsh harness (same toolchain, owned). A full AFL-style `zig build fuzz` target
+and the kvm-unit-tests / serial-golden layers remain to build.
+
 ## D7 - KVM bindings: hand-rolled vs @cImport
 
 **Status:** RESOLVED (provisional) → hand-rolled for now

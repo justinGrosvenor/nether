@@ -57,4 +57,6 @@ test {
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");
     _ = @import("vt/osc.zig");
+    // Always-on fuzz-smoke for the guest-facing parsers (vt + virtqueue).
+    _ = @import("fuzz.zig");
 }
