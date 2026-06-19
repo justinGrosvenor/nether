@@ -6,8 +6,9 @@ has: an embeddable core decoupled from its host, and a single library exposed to
 both Zig and C consumers. This file records the patterns worth borrowing and
 where they live, so we do not re-derive them.
 
-Reference checkout: `~/ghostty` (shallow clone of ghostty-org/ghostty). File
-paths below are relative to `~/ghostty/`.
+Reference checkout: `~/ghostty` (full clone of ghostty-org/ghostty, with tags).
+File paths below are relative to `~/ghostty/`. See "Using the clone" at the bottom
+for the toolchain split and how to build the VT library.
 
 There is also a real seam where Ghostty could become a dependency, not just an
 example: its terminal core is a standalone VT library (pattern 2). That is the
@@ -202,3 +203,51 @@ own grid and does not help there.
 | 4. libxev event loop | I/O thread past blocking read | 2nd host input source |
 | 5. comptime VT table | server-side console / D5 grid tests | console engine is real |
 | 6. paged/ref-counted store | snapshot-fork device state | snapshot work starts |
+
+---
+
+## Using the clone
+
+**No git submodules.** Dependencies are Zig packages (`build.zig.zon`, mostly
+`lazy`) plus C libs vendored under `pkg/`. Prime the package cache with
+`zig build --fetch` (already done; ~270M in `~/.cache/zig/p`).
+
+**Toolchain split (important).** Ghostty pins **Zig 0.15.2** (see `flake.nix`),
+Nether targets **0.16.0 stable**. They are not interchangeable: 0.16 changed
+`std.Io.Dir.readFileAlloc` (3 -> 4 args, breaks Ghostty's `build.zig`), `PROT`,
+and the `Mutex` location. 0.15.2 is installed at `~/Library/zig/0.15.2`; build
+Ghostty with it, Nether with `~/Library/zig/0.16.0`.
+
+**The split does NOT block consumption.** `libghostty-vt` is a C library
+(`.a`/`.dylib` + headers) with a C ABI, so Nether (built with 0.16.0) can link it
+regardless of the Zig version that produced it. Build Ghostty once with 0.15.2,
+link the resulting C library into Nether.
+
+**Build the VT library (macOS):**
+
+```sh
+DEVELOPER_DIR=/Library/Developer/CommandLineTools \
+  ~/Library/zig/0.15.2/zig build -Demit-lib-vt -Demit-xcframework=false
+# -> zig-out/lib/libghostty-vt.{a,dylib}, zig-out/include/ghostty/vt/*.h
+```
+
+`DEVELOPER_DIR=...CommandLineTools` is needed so the Zig build runner links
+libSystem (with Xcode.app selected it fails to). `-Demit-xcframework=false` skips
+the XCFramework so the full Xcode/iOS SDK is not required. The full macOS *app*,
+by contrast, does need Xcode.app + `xcodebuild`.
+
+**The console-seam C API** (`zig-out/include/ghostty/vt/`, the entry point for a
+server-side console, console-state snapshot, or D5 grid tests):
+
+- `ghostty_terminal_new(const GhosttyAllocator*, ...)` / `ghostty_terminal_free`
+  - the allocator is injected across the C boundary, matching Nether's
+    allocator-injection contract.
+- `ghostty_terminal_vt_write(t, bytes, len)` - feed guest serial output in.
+- `ghostty_terminal_resize`, `_reset`, `_mode_get/set`, `_scroll_viewport`.
+- `ghostty_cell_get`, `ghostty_grid_ref_*` - read the screen grid out (cells,
+  styles, graphemes, hyperlinks) to ship to a frontend or assert on.
+
+`src/terminal/c/AGENTS.md` documents the C ABI discipline (opaque pointers for
+long-lived objects, sized structs with `GHOSTTY_INIT_SIZED`, `TaggedUnion`
+conversion). That is the concrete reference for pattern 2 when Nether exposes its
+own C ABI.
