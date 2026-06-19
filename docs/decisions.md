@@ -130,6 +130,12 @@ to write. Deferred until a guest first programs the IOAPIC (OVMF) or virtio-pci
 needs MSI-X routing; the run loop tolerates `EXIT_IOAPIC_EOI` as a no-op until
 then.
 
+Update: the **userspace IOAPIC is now built** (`ioapic.zig`). Without it the guest
+read all-ones from 0xFEC00000 and disabled legacy IRQ routing, so serial (IRQ4)
+interrupts never fired and the tty console stalled after 16 FIFO bytes. The
+IOAPIC translates a redirection entry to an MSI on `raise(gsi)` and injects via
+`signalMsi`; serial raises IRQ4 on THR-empty/RX-ready. Live verification pending.
+
 ## D8 - PVH bring-up gotchas (resolved, verified on KVM)
 
 Nether boots Linux 6.12 to a userspace shell via PVH on a bare-metal KVM host.
