@@ -147,9 +147,10 @@ done-line.
   vendored parser plus a Nether-authored screen grid (`Screen.zig`, with UTF-8),
   both fuzz-smoked, and the **console tee is wired** (the serial device mirrors
   guest output into a `Screen`, so the VMM holds a live render; dumped on exit
-  under trace). That unlocks console-state snapshots and grid-level golden tests.
-  Remaining: ship the grid to a frontend (web console) and grow the grid
-  (scrollback, alternate screen). See
+  under trace) with **scrollback** (a ring of evicted rows; the exit dump shows
+  the full boot log). That unlocks console-state snapshots and grid-level golden
+  tests. Remaining: ship the grid to a frontend (web console) and the alternate
+  screen / scroll regions for full-screen TUIs. See
   [references/ghostty-patterns.md](references/ghostty-patterns.md) (2, 5) and
   [decisions.md](decisions.md) D5.
 - **PVH / direct-boot fast path** beside OVMF. Linux-only edge guests boot via

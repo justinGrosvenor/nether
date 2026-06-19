@@ -184,12 +184,14 @@ can be shared copy-on-write.
 it wants device/guest state that is fixed-size, pool-allocated, ref-countable,
 and serializable by construction, from Phase 3 forward rather than retrofitted.
 Ghostty's storage layer is a worked example of that discipline. Nether's own
-`src/vt/Screen.zig` already follows the fixed-size, pointer-free, serializable
-half of it; paging, ref-counted styles, and scrollback are the growth path when
-scrollback or snapshot size pressure makes them worth it.
+`src/vt/Screen.zig` follows it: a fixed-size, pointer-free live grid plus a
+scrollback ring of evicted rows, all serializable by copy. Ghostty's heavier
+machinery (true paging of the scrollback, ref-counted styles) is the further
+growth path if memory pressure (very deep scrollback, many forked snapshots)
+makes the flat ring too costly.
 
-**Adopt:** started (the grid is serializable-by-construction). Add paging/
-ref-counting when snapshot-aware device models or scrollback need it.
+**Adopt:** done for v1 (serializable grid + scrollback ring). Add paging /
+ref-counted styles only under real memory pressure.
 
 ---
 
@@ -210,7 +212,7 @@ own grid and does not help there.
 | 3. mailbox concurrency | D3 evolution past per-device locks | lock pain / device count |
 | 4. libxev event loop | I/O thread past blocking read | 2nd host input source |
 | 5. comptime VT table | server-side console / D5 grid tests | done: parser vendored + grid v1 (src/vt/) |
-| 6. paged/ref-counted store | snapshot-fork device state | started (grid is serializable); paging when needed |
+| 6. paged/ref-counted store | snapshot-fork device state | grid + scrollback ring done; ref-counting under memory pressure |
 
 ---
 

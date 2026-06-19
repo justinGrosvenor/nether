@@ -10,12 +10,12 @@
 //! patterns.md): a screen snapshot is just the dims, cursor, pen, and cell
 //! bytes.
 //!
-//! Scope (v1): printable text incl. UTF-8 (decoded ahead of the byte parser in
-//! ground state), deferred autowrap, the C0 controls and the CSI/SGR/ED/EL/
-//! cursor sequences a shell and getty emit. Deliberately NOT yet handled (grow
-//! as needed): scrollback, the alternate screen, scroll regions (DECSTBM), and
-//! wide characters (every codepoint is treated as one column wide, so CJK/
-//! double-width glyphs misalign).
+//! Scope: printable text incl. UTF-8 (decoded ahead of the byte parser in
+//! ground state), deferred autowrap, scrollback (a ring of evicted rows), and
+//! the C0 controls and CSI/SGR/ED/EL/cursor sequences a shell and getty emit.
+//! Deliberately NOT yet handled (grow as needed): the alternate screen, scroll
+//! regions (DECSTBM), and wide characters (every codepoint is one column wide,
+//! so CJK/double-width glyphs misalign).
 
 const Screen = @This();
 
@@ -84,15 +84,35 @@ u8_buf: [4]u8 = undefined,
 u8_have: u3 = 0,
 u8_need: u3 = 0,
 
+/// Scrollback: a ring of rows evicted off the top of the live screen. The live
+/// screen stays the flat `cells` buffer (so all cursor/print/erase logic is
+/// unchanged); a row is archived here just before it scrolls out. Still
+/// pointer-free, so the whole screen + history serializes by copy.
+sb_cells: []Cell, // sb_cap * cols, ring of rows
+sb_cap: usize, // max history rows (0 = scrollback disabled)
+sb_start: usize = 0, // ring index of the oldest stored row
+sb_count: usize = 0, // rows currently stored (<= sb_cap)
+
+pub const default_scrollback = 1000;
+
 pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) !Screen {
+    return initCapacity(alloc, rows, cols, default_scrollback);
+}
+
+pub fn initCapacity(alloc: std.mem.Allocator, rows: u16, cols: u16, scrollback: usize) !Screen {
     std.debug.assert(rows > 0 and cols > 0);
     const cells = try alloc.alloc(Cell, @as(usize, rows) * cols);
+    errdefer alloc.free(cells);
     @memset(cells, .{});
+    const sb = try alloc.alloc(Cell, scrollback * cols);
+    @memset(sb, .{});
     return .{
         .alloc = alloc,
         .rows = rows,
         .cols = cols,
         .cells = cells,
+        .sb_cells = sb,
+        .sb_cap = scrollback,
         .parser = Parser.init(),
     };
 }
@@ -100,6 +120,7 @@ pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) !Screen {
 pub fn deinit(self: *Screen) void {
     self.parser.deinit();
     self.alloc.free(self.cells);
+    self.alloc.free(self.sb_cells);
 }
 
 fn idx(self: *const Screen, row: u16, col: u16) usize {
@@ -112,17 +133,38 @@ pub fn cellAt(self: *const Screen, row: u16, col: u16) Cell {
     return self.cells[self.idx(row, col)];
 }
 
-/// Encode a row's codepoints as UTF-8 into `buf` (which must be >= cols*4) and
-/// return the slice. Trailing blanks are included; callers that want a trimmed
-/// line can std.mem.trimRight the result. Handy for golden tests and rendering.
-pub fn rowText(self: *const Screen, row: u16, buf: []u8) []const u8 {
+fn encodeCells(cells: []const Cell, buf: []u8) []const u8 {
     var n: usize = 0;
-    var c: u16 = 0;
-    while (c < self.cols) : (c += 1) {
-        const cp = self.cellAt(row, c).cp;
-        n += std.unicode.utf8Encode(cp, buf[n..]) catch 0;
-    }
+    for (cells) |cl| n += std.unicode.utf8Encode(cl.cp, buf[n..]) catch 0;
     return buf[0..n];
+}
+
+/// Encode a live row's codepoints as UTF-8 into `buf` (which must be >= cols*4)
+/// and return the slice. Trailing blanks are included; callers that want a
+/// trimmed line can std.mem.trimEnd the result. Handy for golden tests.
+pub fn rowText(self: *const Screen, row: u16, buf: []u8) []const u8 {
+    if (row >= self.rows) return buf[0..0];
+    return encodeCells(self.cells[@as(usize, row) * self.cols ..][0..self.cols], buf);
+}
+
+/// Number of scrolled-back rows currently retained.
+pub fn scrollbackLen(self: *const Screen) usize {
+    return self.sb_count;
+}
+
+/// Total rows in the combined scrollback+live surface (what a pager or web
+/// console would scroll through).
+pub fn viewRows(self: *const Screen) usize {
+    return self.sb_count + self.rows;
+}
+
+/// UTF-8 of row `i` of the combined surface: 0..scrollbackLen()-1 are the
+/// scrollback rows (oldest first), then the `rows` live rows. `buf` >= cols*4.
+pub fn viewRow(self: *const Screen, i: usize, buf: []u8) []const u8 {
+    if (i < self.sb_count) return encodeCells(self.sbRowCells(i), buf);
+    const r = i - self.sb_count;
+    if (r >= self.rows) return buf[0..0];
+    return encodeCells(self.cells[r * self.cols ..][0..self.cols], buf);
 }
 
 /// Feed guest output bytes through the parser and apply the resulting actions.
@@ -236,10 +278,29 @@ fn tab(self: *Screen) void {
 }
 
 fn scrollUp(self: *Screen) void {
+    self.archiveRow(self.cells[0..self.cols]); // retain the row leaving the top
     // Move every row up by one and blank the last row.
     const stride = self.cols;
     std.mem.copyForwards(Cell, self.cells[0 .. self.cells.len - stride], self.cells[stride..]);
     @memset(self.cells[self.cells.len - stride ..], .{});
+}
+
+/// Append a row to the scrollback ring, evicting the oldest when full.
+fn archiveRow(self: *Screen, src: []const Cell) void {
+    if (self.sb_cap == 0) return;
+    const slot = (self.sb_start + self.sb_count) % self.sb_cap;
+    @memcpy(self.sb_cells[slot * self.cols ..][0..self.cols], src);
+    if (self.sb_count < self.sb_cap) {
+        self.sb_count += 1;
+    } else {
+        self.sb_start = (self.sb_start + 1) % self.sb_cap; // overwrote the oldest
+    }
+}
+
+/// Cells of the n-th oldest scrollback row (0 = oldest).
+fn sbRowCells(self: *const Screen, n: usize) []const Cell {
+    const slot = (self.sb_start + n) % self.sb_cap;
+    return self.sb_cells[slot * self.cols ..][0..self.cols];
 }
 
 // --- escape / CSI ----------------------------------------------------------
@@ -255,6 +316,13 @@ fn reset(self: *Screen) void {
     self.cursor = .{};
     self.pen = .{};
     self.pending_wrap = false;
+    self.clearScrollback();
+}
+
+/// Drop all scrollback history.
+pub fn clearScrollback(self: *Screen) void {
+    self.sb_start = 0;
+    self.sb_count = 0;
 }
 
 fn csi(self: *Screen, c: Parser.Action.CSI) void {
@@ -294,7 +362,10 @@ fn eraseDisplay(self: *Screen, mode: u16) void {
     switch (mode) {
         0 => @memset(self.cells[cur..], .{}), // cursor..end
         1 => @memset(self.cells[0 .. cur + 1], .{}), // start..cursor
-        2, 3 => @memset(self.cells, .{}), // whole screen (3 also drops scrollback, which we lack)
+        2, 3 => {
+            @memset(self.cells, .{}); // whole screen
+            if (mode == 3) self.clearScrollback(); // ED 3 also drops scrollback
+        },
         else => {},
     }
 }
@@ -526,6 +597,50 @@ test "UTF-8 truncated by an escape still parses the escape" {
     s.write("\x1b[1;5HX");
     try testing.expectEqual(@as(u21, 0xfffd), s.cellAt(0, 0).cp); // truncated -> replacement
     try testing.expectEqual(@as(u21, 'X'), s.cellAt(0, 4).cp); // CSI still worked
+}
+
+test "scrollback retains rows evicted off the top" {
+    var s = try Screen.initCapacity(testing.allocator, 2, 8, 4);
+    defer s.deinit();
+    s.write("L0\r\nL1\r\nL2\r\nL3");
+    try testing.expectEqual(@as(usize, 2), s.scrollbackLen());
+    try testing.expectEqual(@as(usize, 4), s.viewRows());
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("L0", std.mem.trimEnd(u8, s.viewRow(0, &buf), " "));
+    try testing.expectEqualStrings("L1", std.mem.trimEnd(u8, s.viewRow(1, &buf), " "));
+    try testing.expectEqualStrings("L2", std.mem.trimEnd(u8, s.viewRow(2, &buf), " "));
+    try testing.expectEqualStrings("L3", std.mem.trimEnd(u8, s.viewRow(3, &buf), " "));
+    try expectRow(&s, 0, "L2"); // live screen unchanged
+    try expectRow(&s, 1, "L3");
+}
+
+test "scrollback ring evicts the oldest when full" {
+    var s = try Screen.initCapacity(testing.allocator, 1, 4, 2);
+    defer s.deinit();
+    s.write("a\r\nb\r\nc\r\nd"); // 'a' falls out of a 2-row ring
+    try testing.expectEqual(@as(usize, 2), s.scrollbackLen());
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("b", std.mem.trimEnd(u8, s.viewRow(0, &buf), " "));
+    try testing.expectEqualStrings("c", std.mem.trimEnd(u8, s.viewRow(1, &buf), " "));
+    try testing.expectEqualStrings("d", std.mem.trimEnd(u8, s.viewRow(2, &buf), " "));
+}
+
+test "scrollback disabled keeps only the live screen" {
+    var s = try Screen.initCapacity(testing.allocator, 1, 4, 0);
+    defer s.deinit();
+    s.write("a\r\nb\r\nc");
+    try testing.expectEqual(@as(usize, 0), s.scrollbackLen());
+    try testing.expectEqual(@as(usize, 1), s.viewRows());
+    try expectRow(&s, 0, "c");
+}
+
+test "ED 3 clears scrollback" {
+    var s = try Screen.initCapacity(testing.allocator, 2, 8, 4);
+    defer s.deinit();
+    s.write("L0\r\nL1\r\nL2\r\nL3");
+    try testing.expect(s.scrollbackLen() > 0);
+    s.write("\x1b[3J");
+    try testing.expectEqual(@as(usize, 0), s.scrollbackLen());
 }
 
 test "a realistic colored prompt renders" {

@@ -155,11 +155,12 @@ pub fn main() !void {
 /// Print the teed console grid (non-empty rows) to stderr. Gated by trace so it
 /// is opt-in; the grid is always maintained, this just surfaces it on exit.
 fn dumpConsole(scr: *nether.vt.Screen) void {
-    std.debug.print("[nether] final console {d}x{d}:\n", .{ scr.rows, scr.cols });
+    const total = scr.viewRows();
+    std.debug.print("[nether] console {d}x{d}, {d} scrollback rows:\n", .{ scr.rows, scr.cols, scr.scrollbackLen() });
     var buf: [4096]u8 = undefined;
-    var row: u16 = 0;
-    while (row < scr.rows) : (row += 1) {
-        const line = std.mem.trimEnd(u8, scr.rowText(row, &buf), " ");
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const line = std.mem.trimEnd(u8, scr.viewRow(i, &buf), " ");
         if (line.len > 0) std.debug.print("  {s}\n", .{line});
     }
 }
