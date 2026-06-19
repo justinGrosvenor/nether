@@ -132,6 +132,14 @@ done-line.
   [references/ghostty-patterns.md](references/ghostty-patterns.md) (1, 2).
 - **vsock promoted to the spine** (lands with the virtio work in Phase 3+).
   The swerver↔guest channel, integrated via swerver's park-and-resume pattern.
+  The pure protocol engine is in-tree (`src/virtio_vsock.zig`): the 44-byte
+  header codec, the per-connection state machine (REQUEST/RESPONSE/RW/SHUTDOWN/
+  RST and credit), and credit-based flow control, with a fixed-pool connection
+  table and outbound staging ring (snapshot-friendly by construction) and a
+  host-facing event/`send`/`connect`/`close` API decoupled from the transport.
+  It is unit- and fuzz-tested offline (the guest's TX packets are
+  attacker-controlled). Still pending: the device wiring (RX/TX virtqueue glue,
+  the `virtio.Backend`, guest_cid device config) and the swerver-side listener.
 - **Snapshot-aware device models from Phase 3.** Don't ship a device whose state
   can't be serialized; snapshot-fork (boot once → clone per request) is the edge
   product, so the Phase 6 "snapshot" work is really a constraint applied early.

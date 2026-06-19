@@ -89,6 +89,7 @@ src/virtio.zig     virtio-pci-modern transport (config, BAR, MSI-X)
 src/virtq.zig      split virtqueue (bounds-checked descriptor walk)
 src/virtio_blk.zig virtio-blk backend (read/write/flush)
 src/virtio_rng.zig virtio-rng backend
+src/virtio_vsock.zig virtio-vsock protocol engine (swerver<->guest channel)
 src/elf.zig        ELF64 loader + PVH entry note
 src/pvh.zig        PVH direct boot: start_info, modules, orchestration
 src/trace.zig      marker-file-gated device tracing

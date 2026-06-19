@@ -44,6 +44,8 @@ pub const virtq = @import("virtq.zig");
 pub const virtio = @import("virtio.zig");
 pub const VirtioRng = @import("virtio_rng.zig").Rng;
 pub const VirtioBlk = @import("virtio_blk.zig").Blk;
+pub const vsock = @import("virtio_vsock.zig");
+pub const Vsock = vsock.Vsock;
 
 const power = @import("power.zig");
 pub const Power = power.Power;
@@ -63,6 +65,7 @@ test {
     _ = @import("vt/osc.zig");
     _ = @import("vt/Screen.zig");
     _ = @import("webconsole.zig");
-    // Always-on fuzz-smoke for the guest-facing parsers (vt + virtqueue).
+    _ = @import("virtio_vsock.zig");
+    // Always-on fuzz-smoke for the guest-facing parsers (vt + virtqueue + vsock).
     _ = @import("fuzz.zig");
 }

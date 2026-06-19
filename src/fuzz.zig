@@ -14,6 +14,7 @@ const std = @import("std");
 const Parser = @import("vt/Parser.zig");
 const Screen = @import("vt/Screen.zig");
 const virtq = @import("virtq.zig");
+const vsock = @import("virtio_vsock.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -145,4 +146,63 @@ test "virtqueue survives all-ones and all-zero memory" {
     feedVirtq(&zero);
     var ones = [_]u8{0xff} ** 1024;
     feedVirtq(&ones);
+}
+
+// --- vsock protocol engine -------------------------------------------------
+
+// The packets a guest writes to its TX queue are attacker-controlled. The
+// engine decodes a 44-byte header and reads at most the bytes that actually
+// followed it, so any byte string must process without a safety trip. Reuse one
+// engine across inputs (with a listened port) so the connection table, credit
+// accounting, and staging ring interleave. The staging ring is drained each
+// round so a flood of refusals cannot make peekOut/popOut diverge.
+fn feedVsock(vs: *vsock.Vsock, bytes: []const u8) void {
+    vs.rx(bytes);
+    while (vs.peekOut()) |pkt| {
+        std.mem.doNotOptimizeAway(pkt.len);
+        vs.popOut();
+    }
+}
+
+test "vsock engine survives random packets" {
+    var vs = vsock.Vsock{ .guest_cid = 3 };
+    _ = vs.listen(1024);
+    var prng = std.Random.DefaultPrng.init(0x5E550CC);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        var buf: [128]u8 = undefined;
+        const n = rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        feedVsock(&vs, buf[0..n]);
+    }
+}
+
+test "vsock engine survives header-shaped fuzz" {
+    // Bias toward well-formed-ish packets: real ops/ports/cids in the header so
+    // the connection state machine is driven deep (REQUEST/RW/SHUTDOWN/credit),
+    // not just rejected at decode.
+    var vs = vsock.Vsock{ .guest_cid = 3 };
+    _ = vs.listen(7);
+    var prng = std.Random.DefaultPrng.init(0xACED5E5);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        var buf: [vsock.HDR_LEN + 64]u8 = undefined;
+        const payload = rand.uintLessThan(usize, 64);
+        const h = vsock.Hdr{
+            .src_cid = 3,
+            .dst_cid = vsock.HOST_CID,
+            .src_port = rand.uintLessThan(u32, 4),
+            .dst_port = if (rand.boolean()) 7 else rand.uintLessThan(u32, 4),
+            .len = rand.uintLessThan(u32, 4096),
+            .op = rand.uintLessThan(u16, 9),
+            .flags = rand.uintLessThan(u32, 4),
+            .buf_alloc = rand.uintLessThan(u32, 1 << 16),
+            .fwd_cnt = rand.uintLessThan(u32, 1 << 16),
+        };
+        h.encode(buf[0..vsock.HDR_LEN]);
+        rand.bytes(buf[vsock.HDR_LEN..][0..payload]);
+        feedVsock(&vs, buf[0 .. vsock.HDR_LEN + payload]);
+    }
 }
