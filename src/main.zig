@@ -60,6 +60,12 @@ pub fn main() !void {
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
     var power = nether.Power{};
     var serial = nether.Serial{};
+    // Route host stdin to the serial RX. Non-blocking so the vCPU never stalls
+    // polling it; the guest's serial driver picks bytes up via its poll timer.
+    const nonblock = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    const fl = linux.fcntl(0, linux.F.GETFL, 0);
+    _ = linux.fcntl(0, linux.F.SETFL, fl | @as(usize, nonblock));
+    serial.in_fd = 0;
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
     var reset = nether.Reset{ .power = &power };

@@ -10,6 +10,8 @@ const io = @import("io.zig");
 
 pub const Serial = struct {
     out_fd: i32 = 1,
+    in_fd: i32 = -1, // host fd polled for input; -1 = none. Must be non-blocking.
+    rx: ?u8 = null, // byte read from in_fd, pending an RBR read
 
     ier: u8 = 0,
     lcr: u8 = 0,
@@ -99,12 +101,28 @@ pub const Serial = struct {
             self.loop_full = false;
             return self.loop_byte;
         }
+        self.pollInput();
+        if (self.rx) |b| {
+            self.rx = null;
+            return b;
+        }
         return 0;
     }
 
+    /// Non-blocking peek at in_fd into the single-byte rx latch. Loopback mode
+    /// uses loop_byte instead, so input is suppressed there.
+    fn pollInput(self: *Serial) void {
+        if (self.rx != null or self.mcr & mcr_loop != 0) return;
+        var b: [1]u8 = undefined;
+        const n = linux.read(self.in_fd, &b, 1);
+        if (linux.errno(n) == .SUCCESS and n == 1) self.rx = b[0];
+    }
+
     fn lsr(self: *Serial) u8 {
-        // THRE (0x20) + TEMT (0x40) always; DR (0x01) if loopback data waiting.
-        return 0x60 | @as(u8, if (self.loop_full) 0x01 else 0x00);
+        // THRE (0x20) + TEMT (0x40) always; DR (0x01) when a byte is waiting.
+        self.pollInput();
+        const dr: u8 = if (self.loop_full or self.rx != null) 0x01 else 0x00;
+        return 0x60 | dr;
     }
 
     fn msr(self: *Serial) u8 {
