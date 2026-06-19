@@ -7,18 +7,29 @@ See [`docs/`](docs/README.md) for design, roadmap, and decisions.
 
 ## Status
 
-Phase 1.5 substrate is in place: a VM/vCPU core with allocator injection, a
-single-source-of-truth memory map, a port + MMIO exit dispatcher, the firmware
-floor (16550 serial, RTC, ACPI PM block, 0xCF9 reset), the split irqchip with
-eventfd/MSI plumbing, a fw_cfg device, and a minimal static ACPI generator.
+**Verified on a bare-metal KVM host: Nether PVH-boots Linux 6.12 to an
+interactive shell over virtio-pci.** The Phase 1.5 substrate is in place (a
+VM/vCPU core with allocator injection, a single-source-of-truth memory map, a
+port + MMIO exit dispatcher, the firmware floor, the split irqchip with
+eventfd/MSI plumbing, fw_cfg, and a minimal static ACPI generator), and on top of
+it:
 
-**PVH direct boot** is wired end to end: it loads a PVH-capable `vmlinux` (and an
-optional `initramfs`), places the ACPI tables and `hvm_start_info` in guest RAM,
-and enters the kernel in 32-bit protected mode. The 16550 is complete enough for
-the Linux 8250 driver to use `ttyS0`, so a booted kernel prints over serial.
+- **PVH direct boot** end to end: loads a PVH-capable `vmlinux` (and optional
+  `initramfs`), places the ACPI tables and `hvm_start_info` in guest RAM, enters
+  the kernel in 32-bit protected mode.
+- **Userspace IOAPIC** routing serial IRQ4, so the `ttyS0` console runs
+  interactively instead of stalling at the 16550 FIFO.
+- **virtio-blk reads and writes** end to end: the guest enumerates the device
+  over the ACPI PCIe host bridge, claims its BAR, and reads/writes `/dev/vda`
+  with MSI-X completions; writes land on the host disk image.
+- **Continuous interactive stdin**: a host I/O thread feeds the serial RX and
+  raises IRQ4 so an idle shell still receives input (offline-built and
+  unit-tested; live verification pending the next box).
 
 If no `vmlinux` is present the binary runs a comptime real-mode blob that prints
-over COM1 and triggers ACPI S5, as a smoke test.
+over COM1 and triggers ACPI S5, as a smoke test. See
+[`docs/bringup-notes.md`](docs/bringup-notes.md) for the hard-won KVM/PVH/virtio
+gotchas behind all of the above.
 
 ## Build & run
 
@@ -64,16 +75,31 @@ src/vm.zig         Vm + Vcpu: memory, KVM_RUN loop, I/O dispatch, boot entry
 src/io.zig         Bus: port + MMIO device dispatch spine
 src/memmap.zig     guest physical memory map (single source of truth)
 src/irqchip.zig    split irqchip: irqfd, ioeventfd, MSI injection
-src/serial.zig     16550A UART (full register file, ttyS0)
+src/ioapic.zig     userspace IOAPIC: redirection table -> MSI translation
+src/lock.zig       per-device spin lock (the D3 concurrency primitive)
+src/serial.zig     16550A UART (full register file, ttyS0, RX FIFO)
 src/rtc.zig        MC146818 RTC/CMOS
 src/pm.zig         ACPI PM block: S5 soft-off, PM timer
 src/reset.zig      0xCF9 reset control
+src/power.zig      power-transition signal (reset/shutdown)
 src/fw_cfg.zig     QEMU fw_cfg device (PIO)
-src/acpi.zig       minimal static ACPI table generator
+src/acpi.zig       minimal static ACPI table generator (+ dsdt.asl/.aml)
+src/pci.zig        PCIe ECAM host bridge + config space
+src/virtio.zig     virtio-pci-modern transport (config, BAR, MSI-X)
+src/virtq.zig      split virtqueue (bounds-checked descriptor walk)
+src/virtio_blk.zig virtio-blk backend (read/write/flush)
+src/virtio_rng.zig virtio-rng backend
 src/elf.zig        ELF64 loader + PVH entry note
 src/pvh.zig        PVH direct boot: start_info, modules, orchestration
+src/trace.zig      marker-file-gated device tracing
 src/main.zig       thin binary wrapper over the core
-docs/              thesis.md · design.md · roadmap.md · decisions.md
+docs/              thesis · design · roadmap · decisions · bringup-notes
+docs/references/   ghostty-patterns (embeddable-core / concurrency inspiration)
 ```
 
-Requires Zig 0.16.0.
+## Toolchain
+
+Targets **Zig 0.16.0 stable**. Note that the API diverges across 0.16 dev
+nightlies (e.g. `std.os.linux.PROT` shape, `std.Thread.Mutex` location), so a
+nightly in `PATH` will fail to build. Pin `zig` to a 0.16.0 stable install. See
+[`docs/bringup-notes.md`](docs/bringup-notes.md) ("Pin the stable toolchain").

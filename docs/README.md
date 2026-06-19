@@ -15,11 +15,19 @@ isolation substrate of a *govern · isolate · meter · edge* platform.
   config-plane locking, virtio-gpu scope, test harness, irqchip model).
 - **[running-on-kvm.md](running-on-kvm.md)** - turnkey path from a fresh KVM host
   to a live boot: verify /dev/kvm, install Zig, run tests + the smoke test, then
-  build a PVH kernel + initramfs and boot Linux.
+  build a PVH kernel + initramfs, boot Linux, and attach a virtio-blk disk.
+- **[bringup-notes.md](bringup-notes.md)** - the hard-won, hardware-only gotchas
+  found taking Nether from a `KVM_RUN` skeleton to an interactive Linux shell
+  (segment limits, CPUID, PVH magic, the serial stall, IOAPIC, ACPI, the
+  toolchain pin). Read before debugging a live boot.
+- **[references/ghostty-patterns.md](references/ghostty-patterns.md)** - Ghostty
+  as an architecture reference: patterns borrowed for the embeddable core,
+  concurrency model, and a future server-side console.
 
 ## Start here
 
-The thesis ([thesis.md](thesis.md)) says *why*. The Phase 1.5 substrate and the
-PVH boot path are built; the next step is a live boot on a KVM host (see
-[running-on-kvm.md](running-on-kvm.md)) and then virtio-blk. See
-[roadmap.md](roadmap.md).
+The thesis ([thesis.md](thesis.md)) says *why*. **Nether PVH-boots Linux 6.12 to
+an interactive shell with working virtio-blk read/write on a bare-metal KVM
+host** (verified); see [roadmap.md](roadmap.md) for what is done and what is next.
+To reproduce a live boot, follow [running-on-kvm.md](running-on-kvm.md) with
+[bringup-notes.md](bringup-notes.md) on hand.

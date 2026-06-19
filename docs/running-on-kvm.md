@@ -50,7 +50,14 @@ a small one with the PVH entry, plus a busybox initramfs.
 curl -fSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz -o linux.tar.xz
 tar -xf linux.tar.xz && cd linux-6.12
 make x86_64_defconfig
-./scripts/config -e PVH -e SERIAL_8250 -e SERIAL_8250_CONSOLE -e BLK_DEV_INITRD -e ACPI
+# PVH + serial console + initramfs + devtmpfs, and the virtio-pci/MSI stack the
+# virtio-blk path needs. Missing any of the virtio/PCI options boots fine but
+# leaves no /dev/vda.
+./scripts/config -e PVH \
+  -e SERIAL_8250 -e SERIAL_8250_CONSOLE \
+  -e BLK_DEV_INITRD -e DEVTMPFS -e DEVTMPFS_MOUNT \
+  -e ACPI -e KVM_GUEST -e PARAVIRT \
+  -e PCI -e PCI_MSI -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK
 make olddefconfig
 make -j"$(nproc)"            # vmlinux (ELF, with the PVH note) lands in the build root
 cp vmlinux ../vmlinux && cd ..
@@ -82,11 +89,38 @@ zig build run
 ```
 
 Expected: kernel boot log over `ttyS0`, ending at a `/ #` shell prompt driven
-entirely through Nether's serial. That is first light: a real OS under Nether.
+entirely through Nether's serial, and interactive (type into the shell). That is
+first light: a real OS under Nether.
+
+## 4. virtio-blk disk
+
+If a `disk.img` is present in the working directory, Nether presents it as
+`/dev/vda` (PCI 0:1.0, MSI-X completions). Create one and confirm it from the
+guest shell:
+
+```sh
+# host: a 16 MiB image with a recognizable marker at the front
+dd if=/dev/zero of=disk.img bs=1M count=16
+printf 'NETHER-DISK' | dd of=disk.img conv=notrunc
+zig build run        # vmlinux + initramfs + disk.img all picked up automatically
+```
+
+```sh
+# guest shell:
+head -c 11 /dev/vda            # -> NETHER-DISK  (read path)
+echo hello | dd of=/dev/vda bs=512 seek=1   # write path
+# back on the host, the bytes are visible in disk.img (writes are shared mmap)
+```
 
 ## Notes
 
-- The cmdline is `console=ttyS0 earlyprintk=ttyS0` (see main.zig). Guest RAM is
-  256 MiB. The initramfs is placed near the top of low RAM.
-- No block device yet, so the shell lives in the initramfs. virtio-blk for a real
-  disk image is the next phase.
+- The cmdline (see `main.zig`) is
+  `console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr no_timer_check`.
+  `no_timer_check` is required once the userspace IOAPIC exists but there is no
+  i8254 PIT, or the kernel panics in its IO-APIC+timer routing check. Guest RAM
+  is 256 MiB; the initramfs is placed near the top of low RAM.
+- The host terminal is put in raw mode for an interactive console; it is restored
+  on exit. With raw mode, Ctrl-C reaches the guest, so exit Nether by powering off
+  the guest (a SIGKILL would leave the terminal raw; recover with `reset`).
+- Full bring-up gotchas (segment limits, CPUID, PVH magic, the 16-byte serial
+  stall, IOAPIC, ACPI) are in [bringup-notes.md](bringup-notes.md).

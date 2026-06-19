@@ -126,11 +126,28 @@ done-line.
 - **Embeddable core from Phase 0.** Library + thin binary, allocator injected,
   no process-global state, device I/O expressed as fds. Costs ~nothing now;
   enables swerver to host Nether later. (Already true of the Phase 0 scaffold.)
+  Make the host boundary a hard *compile-time* seam (not a convention) and plan
+  the core to export both a Zig API and a C ABI from one build. See the apprt and
+  one-library-two-ABIs patterns in
+  [references/ghostty-patterns.md](references/ghostty-patterns.md) (1, 2).
 - **vsock promoted to the spine** (lands with the virtio work in Phase 3+).
   The swerver↔guest channel, integrated via swerver's park-and-resume pattern.
 - **Snapshot-aware device models from Phase 3.** Don't ship a device whose state
   can't be serialized; snapshot-fork (boot once → clone per request) is the edge
   product, so the Phase 6 "snapshot" work is really a constraint applied early.
+  Target fixed-size, pool-allocated, ref-countable, serializable-by-construction
+  state; see the paged-storage pattern in
+  [references/ghostty-patterns.md](references/ghostty-patterns.md) (6).
+- **Concurrency model: per-device lock now, message-passing later.** D3 is
+  resolved with per-device locks (first instances: serial RX, IOAPIC raise). The
+  scaling path is a mailbox/SPSC-queue model and a libxev event-loop I/O thread;
+  see [references/ghostty-patterns.md](references/ghostty-patterns.md) (3, 4),
+  adopted when lock contention or a second host input source forces it.
+- **Server-side console (later).** A web console, console-state snapshot, or
+  grid-level golden tests would want a server-side VT engine; Ghostty's terminal
+  core is the candidate. See
+  [references/ghostty-patterns.md](references/ghostty-patterns.md) (2, 5) and
+  [decisions.md](decisions.md) D5.
 - **PVH / direct-boot fast path** beside OVMF. Linux-only edge guests boot via
   PVH (fast, no UEFI); OVMF stays for general/Windows guests. Slots alongside
   Phase 2-3 rather than replacing them.

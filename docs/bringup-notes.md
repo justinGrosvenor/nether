@@ -46,21 +46,21 @@ Almost every item here cost a live debug cycle to find. Keep this current.
    interrupt. The 16-byte stall is the tell. Need IRQ4 (THRE + RX-data) via the
    IOAPIC. Implement IER/IIR so the driver's ISR can identify the source.
 
-9. **HLT with in-kernel LAPIC (split irqchip) does not exit to userspace** — KVM
+9. **HLT with in-kernel LAPIC (split irqchip) does not exit to userspace** - KVM
    blocks the vCPU in-kernel until an interrupt. Good: a running OS HLTs
    constantly; do NOT treat `KVM_EXIT_HLT` as "guest done" once an OS is booting.
    (The real-mode smoke test uses HLT as "done"; an OS does not.)
 
 10. **MSI-X needs no IOAPIC** (messages go straight to the LAPIC). virtio-blk
     completion via MSI-X worked before the IOAPIC existed. `signalMsi` returns 1
-    if delivered, 0 if dropped — log it; a 0 means a destination/vector mismatch.
+    if delivered, 0 if dropped - log it; a 0 means a destination/vector mismatch.
 
 11. **IOAPIC redirection -> MSI translation**: `addr = 0xFEE00000 | (dest<<12) |
     (dest_mode<<2)`, `data = vector | (delivery<<8) | (trigger<<15) | (trigger<<14)`.
     Level entries: clear remote IRR on `KVM_EXIT_IOAPIC_EOI`.
 
 12. **ACPI minimal set is enough**: RSDP/XSDT/FADT/FACS/MADT/MCFG/DSDT. The PM
-    timer (FADT PM_TMR) carries TSC calibration — the kernel's quick-PIT
+    timer (FADT PM_TMR) carries TSC calibration - the kernel's quick-PIT
     calibration fails and falls back to PMTIMER, so no i8254 is needed to boot.
 
 13. **PCIe BARs**: author the host bridge `_SB.PCI0` with a `_CRS` (bus range +
@@ -72,7 +72,7 @@ Almost every item here cost a live debug cycle to find. Keep this current.
     all-ones, writes drop). A print per unclaimed access floods the console and
     starves the guest during device probing (the kernel hammers absent ports).
 
-15. **virtio-blk "writes not submitted" was a red herring** — `/init` was
+15. **virtio-blk "writes not submitted" was a red herring** - `/init` was
     stalling on the 16-byte console before it could issue the write. Once the
     console worked (IOAPIC), reads AND writes worked end to end (guest write
     lands on the mmap'd host disk image).
@@ -154,7 +154,7 @@ the guest is idle. Notes:
   (defaults are far lower): on-demand `L-1216C47A`, spot `L-34B43A08`, region
   us-west-2. Spot `c5.metal` ~$1-1.5/hr vs ~$4 on-demand.
 - Metal takes 5-15 min to boot; SSH/`/dev/kvm` aren't up immediately.
-- **zsh does not word-split unquoted `$VAR`** — `$SSH "cmd"` runs the whole string
+- **zsh does not word-split unquoted `$VAR`** - `$SSH "cmd"` runs the whole string
   as one command. Use an array (`ssh "${SSHK[@]}" ...`) or inline ssh.
 - Kernel: `x86_64_defconfig` + `scripts/config -e PVH SERIAL_8250_CONSOLE
   BLK_DEV_INITRD DEVTMPFS DEVTMPFS_MOUNT KVM_GUEST PARAVIRT PCI PCI_MSI VIRTIO

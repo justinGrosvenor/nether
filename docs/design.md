@@ -58,20 +58,35 @@ The no-old-hardware cut line:
 
 ## Zig approach
 
-- `@cImport` on `linux/kvm.h` and the VFIO headers. No bindgen.
+- **Hand-rolled KVM ABI** (`extern struct` layouts + comptime-derived ioctl
+  numbers, validated in unit tests), not `@cImport`. `kvm.h` is a kernel uapi
+  header not bundled with Zig, so `@cImport` breaks cross-compiling from a non
+  Linux dev host (this repo is driven from macOS). Reversible once dev/CI is
+  reliably Linux; see [decisions](decisions.md#d7-kvm-bindings-hand-rolled-vs-cimport).
+  VFIO bindings will face the same choice.
 - `extern struct`/`extern union` for `kvm_run` and device register layouts.
 - comptime generation of fixed binary structures: static ACPI tables, PCI config
-  space, virtio config.
+  space, virtio config, ioctl numbers, the memory map.
 - Zero-alloc hot path for virtqueue processing and MMIO exit handling. Explicit
   allocators throughout, Swerver discipline.
-- Threading: one host thread per vCPU, each in its own `KVM_RUN` loop. One I/O
-  thread on epoll over eventfds (irqfd, ioeventfd). No async runtime.
+- Threading: one host thread per vCPU, each in its own `KVM_RUN` loop, plus a
+  host I/O thread (today a blocking stdin reader feeding the serial RX; the
+  target is one epoll/io_uring loop over eventfds: irqfd, ioeventfd, stdin,
+  vsock). No async runtime.
+- **Embeddable core as a compile-time boundary.** The host (swerver, or the thin
+  default binary) is selected behind a seam, not referenced by the core; the core
+  is planned to export both a Zig API and a C ABI from one build. See the apprt
+  and one-library-two-ABIs patterns in
+  [references/ghostty-patterns.md](references/ghostty-patterns.md).
 
 > The datapath is zero-alloc and lock-free per the above. The **config plane is
 > not** - vCPU threads write device state (PCI config, MSI-X tables, virtio
-> config) on MMIO/PIO exits while the I/O thread processes virtqueues against the
-> same state. That cross-thread state needs an explicit locking discipline; see
-> [decisions](decisions.md#d3-config-plane-concurrency).
+> config) on MMIO/PIO exits while a host thread touches the same state. The
+> discipline is **resolved** ([decisions D3](decisions.md#d3-config-plane-concurrency)):
+> a per-device lock, one global lock order, and no lock held across a syscall.
+> First instances are the serial RX FIFO and the IOAPIC redirection table. The
+> scaling path (message-passing mailboxes, an event-loop I/O thread) is in
+> [references/ghostty-patterns.md](references/ghostty-patterns.md).
 
 ## Security posture
 
@@ -97,6 +112,11 @@ vhost-user where practical.
 - **zvisor** (b0bleet): minimal KVM ioctl loop and memory setup skeleton.
 - **cloud-hypervisor + rust-vmm**: architecture reference for the modern-only
   envelope. ACPI/PCI/VFIO design decisions.
+- **Ghostty** (terminal emulator in Zig): not VMM prior art, but the reference
+  for an embeddable Zig core decoupled from its host and exposed to both Zig and C
+  consumers. Patterns borrowed in
+  [references/ghostty-patterns.md](references/ghostty-patterns.md). Its terminal
+  core is also the candidate engine for a future server-side console.
 
 ## Naming
 
