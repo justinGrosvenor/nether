@@ -163,7 +163,10 @@ comptime-generates ioctl numbers (`src/kvm.zig`) and the memory map
 (`src/memmap.zig`). The DEC parser is small and well-specified, a weekend not a
 project.
 
-**Adopt:** when D5 VT-aware assertions or a console engine is real.
+**Adopt:** done for the parser. The parser slice (`Parser.zig` + `parse_table.zig`)
+is vendored and ported to 0.16 in `src/vt/` (see `src/vt/PORTING.md`); the chosen
+strategy is "port the parser, own the grid." The screen-grid model is the
+remaining piece, to be built ourselves rather than vendored.
 
 ## 6. Paged + ref-counted + pool-allocated storage -> snapshot-fork discipline
 
@@ -201,7 +204,7 @@ own grid and does not help there.
 | 2. one core, Zig + C ABI | swerver-native + foreign-host embed | now (decide + stub) |
 | 3. mailbox concurrency | D3 evolution past per-device locks | lock pain / device count |
 | 4. libxev event loop | I/O thread past blocking read | 2nd host input source |
-| 5. comptime VT table | server-side console / D5 grid tests | console engine is real |
+| 5. comptime VT table | server-side console / D5 grid tests | parser vendored (src/vt/); grid next |
 | 6. paged/ref-counted store | snapshot-fork device state | snapshot work starts |
 
 ---

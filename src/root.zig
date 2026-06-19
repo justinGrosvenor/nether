@@ -27,6 +27,14 @@ pub const PciHost = pci.Host;
 pub const IoApic = @import("ioapic.zig").IoApic;
 
 pub const Lock = @import("lock.zig").Lock;
+
+/// Vendored VT parser (from ghostty, ported to 0.16). The state-machine heart
+/// of a future server-side console / VT-aware golden tests. See src/vt/PORTING.md.
+pub const vt = struct {
+    pub const Parser = @import("vt/Parser.zig");
+    pub const osc = @import("vt/osc.zig");
+};
+
 pub const trace = @import("trace.zig");
 pub const virtq = @import("virtq.zig");
 pub const virtio = @import("virtio.zig");
@@ -45,4 +53,8 @@ pub const FwCfg = @import("fw_cfg.zig").FwCfg;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    // Pull in the vendored VT files so their tests run too.
+    _ = @import("vt/Parser.zig");
+    _ = @import("vt/parse_table.zig");
+    _ = @import("vt/osc.zig");
 }

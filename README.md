@@ -92,6 +92,7 @@ src/virtio_rng.zig virtio-rng backend
 src/elf.zig        ELF64 loader + PVH entry note
 src/pvh.zig        PVH direct boot: start_info, modules, orchestration
 src/trace.zig      marker-file-gated device tracing
+src/vt/            vendored VT parser (from ghostty, ported to 0.16; see PORTING.md)
 src/main.zig       thin binary wrapper over the core
 docs/              thesis · design · roadmap · decisions · bringup-notes
 docs/references/   ghostty-patterns (embeddable-core / concurrency inspiration)
