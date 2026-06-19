@@ -59,14 +59,10 @@ fn writeGas(b: []u8, off: usize, space: u8, width: u8, access: u8, addr: u64) vo
     w64(b, off + 4, addr);
 }
 
-// _S5 package: Name (_S5_, Package (4) { 5, 5, 0, 0 }). SLP_TYP 5 matches pm.zig.
-const dsdt_aml = [_]u8{
-    0x08, '_', 'S', '5', '_', // NameOp, "_S5_"
-    0x12, 0x08, 0x04, // PackageOp, PkgLength=8, NumElements=4
-    0x0A, 0x05, // Byte 5  (SLP_TYPa)
-    0x0A, 0x05, // Byte 5  (SLP_TYPb)
-    0x00, 0x00, // Zero, Zero
-};
+// Full DSDT (header + AML) compiled from dsdt.asl by iasl: S5 plus a PCIe host
+// bridge with a _CRS bus range and MMIO window. Embedded verbatim; it carries
+// its own valid header and checksum.
+const dsdt_table = @embedFile("dsdt.aml");
 
 fn writeFacs(b: []u8) usize {
     @memcpy(b[0..4], "FACS");
@@ -76,11 +72,8 @@ fn writeFacs(b: []u8) usize {
 }
 
 fn writeDsdt(b: []u8) usize {
-    writeHeader(b, "DSDT", 2);
-    @memcpy(b[36 .. 36 + dsdt_aml.len], &dsdt_aml);
-    const len = 36 + dsdt_aml.len;
-    finalizeSdt(b, len);
-    return len;
+    @memcpy(b[0..dsdt_table.len], dsdt_table);
+    return dsdt_table.len;
 }
 
 fn writeFadt(b: []u8, dsdt_addr: u64, facs_addr: u64) usize {

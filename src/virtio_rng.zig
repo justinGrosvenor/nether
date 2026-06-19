@@ -41,7 +41,7 @@ pub const Rng = struct {
             }
             vq.complete(mem, head, written);
         }
-        dev.raiseInterrupt();
+        dev.interruptQueue(q);
     }
 
     fn fill(self: *Rng, s: []u8) void {

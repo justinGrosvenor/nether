@@ -56,7 +56,7 @@ pub const Blk = struct {
             const written = self.handle(mem, vq, head);
             vq.complete(mem, head, written);
         }
-        dev.raiseInterrupt();
+        dev.interruptQueue(q);
     }
 
     fn handle(self: *Blk, mem: virtq.GuestMem, vq: *virtq.Virtqueue, head: u16) u32 {

@@ -9,6 +9,7 @@
 const std = @import("std");
 const io = @import("io.zig");
 const memmap = @import("memmap.zig");
+const trace = @import("trace.zig");
 
 pub const max_functions = 16;
 
@@ -57,7 +58,10 @@ pub const Host = struct {
             const dev: u5 = @intCast((offset >> 15) & 0x1f);
             const func: u3 = @intCast((offset >> 12) & 0x7);
             const reg: u16 = @intCast(offset & 0xfff);
-            if (self.find(dev, func)) |f| value = f.read(f.ptr, reg, @intCast(data.len));
+            if (self.find(dev, func)) |f| {
+                value = f.read(f.ptr, reg, @intCast(data.len));
+                trace.log("cfg rd {d}.{d} reg=0x{x} -> 0x{x}", .{ dev, func, reg, value });
+            }
         }
         putLE(data, value);
     }
@@ -69,7 +73,11 @@ pub const Host = struct {
         const dev: u5 = @intCast((offset >> 15) & 0x1f);
         const func: u3 = @intCast((offset >> 12) & 0x7);
         const reg: u16 = @intCast(offset & 0xfff);
-        if (self.find(dev, func)) |f| f.write(f.ptr, reg, @intCast(data.len), getLE(data));
+        if (self.find(dev, func)) |f| {
+            const value = getLE(data);
+            trace.log("cfg wr {d}.{d} reg=0x{x} <- 0x{x}", .{ dev, func, reg, value });
+            f.write(f.ptr, reg, @intCast(data.len), value);
+        }
     }
 };
 

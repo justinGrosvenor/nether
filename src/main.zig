@@ -45,6 +45,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    nether.trace.init(); // device tracing on if a `nether-trace` file is present
+
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
 
