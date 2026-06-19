@@ -93,6 +93,7 @@ src/elf.zig        ELF64 loader + PVH entry note
 src/pvh.zig        PVH direct boot: start_info, modules, orchestration
 src/trace.zig      marker-file-gated device tracing
 src/vt/            VT subsystem: vendored parser + Nether-authored screen grid
+src/webconsole.zig read-only web console (renders the live grid to HTML)
 src/fuzz.zig       always-on fuzz-smoke for the guest-facing parsers
 src/main.zig       thin binary wrapper over the core
 docs/              thesis · design · roadmap · decisions · bringup-notes

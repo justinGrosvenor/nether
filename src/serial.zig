@@ -17,10 +17,11 @@ pub const Serial = struct {
     gsi: u8 = 4, // COM1 -> IRQ4
     /// Optional console tee: every transmitted byte is also fed to this screen,
     /// so the VMM keeps a live render of the guest console (for snapshots, a web
-    /// console, or an on-exit dump). Touched only on the vCPU thread (the TX
-    /// path), so it is single-writer and needs no lock; a future reader on
-    /// another thread would (D3).
+    /// console, or an on-exit dump). The vCPU thread writes it on the TX path;
+    /// if a reader runs on another thread (the web console), set `mirror_lock`
+    /// so the two coordinate (D3). Without a reader, the lock can be left null.
     mirror: ?*Screen = null,
+    mirror_lock: ?*Lock = null,
 
     // The RX FIFO is filled by the host I/O thread (pushRx) and drained by the
     // vCPU thread (register reads), so all register state is under `mutex` (the
@@ -107,7 +108,11 @@ pub const Serial = struct {
         if (emit) |b| {
             const buf = [1]u8{b};
             if (self.out_fd >= 0) _ = linux.write(self.out_fd, &buf, 1); // -1 = headless
-            if (self.mirror) |scr| scr.write(&buf); // tee into the console grid
+            if (self.mirror) |scr| { // tee into the console grid
+                if (self.mirror_lock) |lk| lk.lock();
+                scr.write(&buf);
+                if (self.mirror_lock) |lk| lk.unlock();
+            }
         }
         if (raise) self.raiseIrq();
     }

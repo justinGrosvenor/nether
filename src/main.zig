@@ -72,7 +72,9 @@ pub fn main() !void {
     // snapshot / web console). 80x24 standard, single-writer on the vCPU thread.
     var console = try nether.vt.Screen.init(allocator, 24, 80);
     defer console.deinit();
+    var console_lock = nether.Lock{}; // guards the console between the tee and the web reader
     serial.mirror = &console;
+    serial.mirror_lock = &console_lock;
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
     var reset = nether.Reset{ .power = &power };
@@ -143,6 +145,23 @@ pub fn main() !void {
     }
     defer if (saved_termios) |s| restoreTermios(0, s);
 
+    // Web console: opt-in via a `nether-web` marker file (like trace). Serves the
+    // live console grid over HTTP on a detached thread. `web` is a stack local
+    // that outlives run; the thread is reclaimed at process exit.
+    var web_buf: []u8 = &.{};
+    defer if (web_buf.len > 0) allocator.free(web_buf);
+    var web: nether.WebConsole = undefined;
+    if (webEnabled()) {
+        web_buf = try allocator.alloc(u8, 256 * 1024);
+        web = .{ .screen = &console, .lock = &console_lock, .port = 9000, .buf = web_buf };
+        if (std.Thread.spawn(.{}, nether.WebConsole.run, .{&web})) |t| {
+            t.detach();
+            std.debug.print("[nether] web console: http://0.0.0.0:9000\n", .{});
+        } else |err| {
+            std.debug.print("[nether] web console failed: {s}\n", .{@errorName(err)});
+        }
+    }
+
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         if (nether.trace.on()) dumpConsole(&console);
@@ -150,6 +169,14 @@ pub fn main() !void {
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
     if (nether.trace.on()) dumpConsole(&console);
+}
+
+/// True if a `nether-web` marker file is present in the working directory.
+fn webEnabled() bool {
+    const fd = linux.open("nether-web", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    _ = linux.close(@intCast(fd));
+    return true;
 }
 
 /// Print the teed console grid (non-empty rows) to stderr. Gated by trace so it

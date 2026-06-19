@@ -36,6 +36,9 @@ pub const vt = struct {
     pub const Screen = @import("vt/Screen.zig");
 };
 
+pub const webconsole = @import("webconsole.zig");
+pub const WebConsole = webconsole.Server;
+
 pub const trace = @import("trace.zig");
 pub const virtq = @import("virtq.zig");
 pub const virtio = @import("virtio.zig");
@@ -59,6 +62,7 @@ test {
     _ = @import("vt/parse_table.zig");
     _ = @import("vt/osc.zig");
     _ = @import("vt/Screen.zig");
+    _ = @import("webconsole.zig");
     // Always-on fuzz-smoke for the guest-facing parsers (vt + virtqueue).
     _ = @import("fuzz.zig");
 }

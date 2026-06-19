@@ -163,12 +163,13 @@ comptime-generates ioctl numbers (`src/kvm.zig`) and the memory map
 (`src/memmap.zig`). The DEC parser is small and well-specified, a weekend not a
 project.
 
-**Adopt:** done. The parser slice (`Parser.zig` + `parse_table.zig`) is vendored
-and ported to 0.16 in `src/vt/` (see `src/vt/PORTING.md`), and the grid is owned:
-`src/vt/Screen.zig` is a Nether-authored screen model on top of the parser
-(fixed-size, pointer-free cells, deferred autowrap, the CSI/SGR/ED/EL/cursor set
-a shell emits). Both are fuzz-smoked. Remaining grid work is scrollback and the
-alternate screen, deferred until a real need (see pattern 6).
+**Adopt:** done, and the server-side console seam this pattern pointed at is
+realized. The parser slice (`Parser.zig` + `parse_table.zig`) is vendored and
+ported to 0.16 in `src/vt/`; the grid is owned (`src/vt/Screen.zig`: full enough
+for shells and TUIs, with UTF-8, scrollback, alt screen, and scroll regions);
+and `src/webconsole.zig` renders the live grid to HTML over a minimal HTTP
+server. We never needed Ghostty's terminal lib as a dependency: owning the parser
+plus a purpose-built grid covered the whole console use case.
 
 ## 6. Paged + ref-counted + pool-allocated storage -> snapshot-fork discipline
 
