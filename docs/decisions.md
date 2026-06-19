@@ -129,3 +129,28 @@ cost of split is that the **userspace IOAPIC** (redirection table, EOI via
 to write. Deferred until a guest first programs the IOAPIC (OVMF) or virtio-pci
 needs MSI-X routing; the run loop tolerates `EXIT_IOAPIC_EOI` as a no-op until
 then.
+
+## D8 - PVH bring-up gotchas (resolved, verified on KVM)
+
+Nether boots Linux 6.12 to a userspace shell via PVH on a bare-metal KVM host.
+Four bugs sat between "kernel loads" and "Run /init", each only findable on real
+hardware. Recorded so they are never re-debugged:
+
+1. **Segment limit is byte-granular in the VMCS.** A flat 4 GiB segment needs
+   `kvm_segment.limit = 0xFFFFFFFF`, not the 20-bit descriptor value `0xFFFFF`.
+   With `0xFFFFF` the limit is literally 1 MiB; the kernel text at 16 MiB is past
+   it, so the first instruction fetch #GPs into a triple fault. KVM does not
+   re-expand the limit by the G bit.
+2. **CPUID must be programmed.** `KVM_GET_SUPPORTED_CPUID` ->
+   `KVM_SET_CPUID2` on the vCPU. Without it the guest sees no long-mode bit and
+   the kernel's `EFER.LME` `wrmsr` #GPs.
+3. **PVH magic is `0x336ec578`** (`XEN_HVM_START_MAGIC_VALUE`). A wrong value
+   trips `xen_prepare_pvh`'s `BUG()` (`ud2` -> triple fault with no IDT).
+4. **Unclaimed-access logging must be silent on the hot path.** A print per
+   unclaimed PIO/MMIO drowns the serial console and starves the guest during PIT
+   probing. Unclaimed reads float high (all-ones), writes drop, no logging.
+
+What the minimal platform got right: our static ACPI parsed, the ACPI PM timer
+carried TSC calibration (the kernel's PIT calibration fails and falls back to
+PMTIMER, so no i8254 is needed for boot), and the absent userspace IOAPIC is
+handled gracefully ("I/O APIC ... registers return all ones, skipping").

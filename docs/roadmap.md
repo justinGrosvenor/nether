@@ -1,5 +1,11 @@
 # Nether - Roadmap
 
+**Status (verified on a bare-metal KVM host):** the substrate runs live, and
+Nether **PVH-boots Linux 6.12 to a userspace shell** (kernel -> our ACPI/PM
+timer/serial console -> initramfs -> `/init`). Remaining for the Phase 3 win
+condition proper: virtio-blk for a real disk image, and interactive serial
+stdin. See [decisions.md](decisions.md) D8 for the PVH bring-up gotchas.
+
 Re-cut from the original six-phase plan. Two changes from the first draft:
 
 1. A **platform-substrate phase (1.5)** is pulled out of "OVMF boots." That line
