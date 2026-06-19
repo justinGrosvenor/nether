@@ -2,17 +2,20 @@
 //!
 //! The grid (src/vt/Screen.zig) already emulates the terminal server-side, so
 //! the browser does not need a terminal emulator: we render the live screen to
-//! styled HTML and the page just displays it, polling for updates. Two parts:
+//! styled HTML and the page just displays it, polling for updates. Parts:
 //!
 //!   - renderGrid: pure, fully tested, turns a Screen into an HTML fragment.
 //!   - Server: a minimal HTTP/1.1 server over raw linux syscalls (matching the
 //!     rest of Nether, which avoids std.Io), Linux-only. Cross-compiles on any
-//!     host; runs on the KVM box.
+//!     host; runs on the KVM box. GET / serves the page, GET /grid the fragment,
+//!     POST /input forwards keystrokes.
+//!   - Input: the page maps key presses to terminal byte sequences and POSTs
+//!     them; the server hands them to an `on_input` sink (wired to the serial RX).
 //!
 //! Concurrency (D3): the server thread reads the Screen while the serial tee
 //! writes it on the vCPU thread, so the integration owns a Lock shared by both.
-//! The Screen itself stays pure. Input (browser -> guest) is a later addition;
-//! this is read-only.
+//! The Screen itself stays pure. Input goes to the serial RX, whose pushRx is
+//! already internally locked, so it is safe to call from the web thread.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -164,7 +167,8 @@ const base16 = [16][3]u8{
     .{ 0x5c, 0x5c, 0xff }, .{ 0xff, 0x00, 0xff }, .{ 0x00, 0xff, 0xff }, .{ 0xff, 0xff, 0xff },
 };
 
-/// The page shell: polls /grid and swaps in the fragment. Self-contained.
+/// The page shell: polls /grid and swaps in the fragment, and forwards key
+/// presses (mapped to terminal byte sequences) to /input. Self-contained.
 const page =
     \\<!doctype html><html><head><meta charset="utf-8"><title>nether console</title>
     \\<style>html,body{margin:0;background:#000}.t{font:14px/1.2 ui-monospace,monospace;
@@ -172,6 +176,16 @@ const page =
     \\<body><pre id="s" class="t">connecting...</pre><script>
     \\async function tick(){try{const r=await fetch("/grid");
     \\document.getElementById("s").outerHTML=await r.text();}catch(e){}setTimeout(tick,250)}
+    \\function key(e){
+    \\if(e.ctrlKey&&e.key.length===1){const c=e.key.toUpperCase().charCodeAt(0);
+    \\if(c>=64&&c<=95)return String.fromCharCode(c-64);}
+    \\switch(e.key){case"Enter":return"\r";case"Backspace":return"\x7f";case"Tab":return"\t";
+    \\case"Escape":return"\x1b";case"ArrowUp":return"\x1b[A";case"ArrowDown":return"\x1b[B";
+    \\case"ArrowRight":return"\x1b[C";case"ArrowLeft":return"\x1b[D";case"Home":return"\x1b[H";
+    \\case"End":return"\x1b[F";case"Delete":return"\x1b[3~";}
+    \\if(e.key.length===1&&!e.ctrlKey&&!e.metaKey)return e.key;return null}
+    \\addEventListener("keydown",e=>{const s=key(e);
+    \\if(s!==null){e.preventDefault();fetch("/input",{method:"POST",body:s});}});
     \\tick();</script></body></html>
 ;
 
@@ -184,6 +198,12 @@ pub const Server = struct {
     /// Scratch buffer for rendering one response. Caller-owned; size it for the
     /// worst-case grid (~256 KiB is ample for 80x24).
     buf: []u8,
+    /// Optional sink for browser keystrokes (POST /input), wired to the serial
+    /// RX. Decoupled via a callback so this module needn't depend on Serial. The
+    /// callback may be invoked from this (the web) thread; the serial RX is
+    /// already safe to push from another thread.
+    on_input: ?*const fn (*anyopaque, []const u8) void = null,
+    on_input_ctx: ?*anyopaque = null,
 
     /// Bind, listen, and serve forever. Returns on a fatal setup error (e.g.
     /// the port is taken), so the caller can run it on a detached thread.
@@ -210,12 +230,15 @@ pub const Server = struct {
     }
 
     fn handle(self: *Server, conn: i32) void {
-        var req: [2048]u8 = undefined;
+        var req: [4096]u8 = undefined;
         const n = linux.read(conn, &req, req.len);
         if (linux.errno(n) != .SUCCESS or n == 0) return;
         const path = parsePath(req[0..n]);
 
-        if (std.mem.eql(u8, path, "/grid")) {
+        if (std.mem.eql(u8, path, "/input")) {
+            self.deliverInput(conn, &req, n);
+            respondEmpty(conn);
+        } else if (std.mem.eql(u8, path, "/grid")) {
             var b = Buf{ .data = self.buf };
             self.lock.lock();
             renderGrid(self.screen, &b);
@@ -225,7 +248,42 @@ pub const Server = struct {
             respond(conn, page);
         }
     }
+
+    /// Forward a POST /input body to the input sink. `req[0..n]` is what we have
+    /// read so far; we read the rest of the body if it has not all arrived.
+    fn deliverInput(self: *Server, conn: i32, req: []u8, n_read: usize) void {
+        const cb = self.on_input orelse return;
+        const ctx = self.on_input_ctx orelse return;
+        const sep = std.mem.indexOf(u8, req[0..n_read], "\r\n\r\n") orelse return;
+        const body_start = sep + 4;
+        const want = contentLength(req[0..body_start]);
+        var have = n_read - body_start;
+        while (have < want and body_start + have < req.len) {
+            const m = linux.read(conn, req.ptr + body_start + have, req.len - (body_start + have));
+            if (linux.errno(m) != .SUCCESS or m == 0) break;
+            have += m;
+        }
+        const body_len = @min(have, want);
+        if (body_len > 0) cb(ctx, req[body_start .. body_start + body_len]);
+    }
 };
+
+/// Parse the Content-Length header value (0 if absent/unparseable).
+fn contentLength(req: []const u8) usize {
+    var it = std.mem.splitScalar(u8, req, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const v = std.mem.trim(u8, line["content-length:".len..], " ");
+            return std.fmt.parseInt(usize, v, 10) catch 0;
+        }
+    }
+    return 0;
+}
+
+fn respondEmpty(conn: i32) void {
+    writeAll(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
 
 fn parsePath(req: []const u8) []const u8 {
     const s = std.mem.indexOfScalar(u8, req, ' ') orelse return "/";
@@ -337,6 +395,17 @@ test "parsePath extracts the request target" {
     try testing.expectEqualStrings("/grid", parsePath("GET /grid HTTP/1.1\r\n"));
     try testing.expectEqualStrings("/", parsePath("GET / HTTP/1.1\r\n"));
     try testing.expectEqualStrings("/", parsePath("garbage-no-spaces"));
+}
+
+test "contentLength parses the header case-insensitively" {
+    try testing.expectEqual(@as(usize, 5), contentLength("POST /input HTTP/1.1\r\nContent-Length: 5\r\n\r\n"));
+    try testing.expectEqual(@as(usize, 12), contentLength("POST / HTTP/1.1\r\ncontent-length:12\r\n\r\n"));
+    try testing.expectEqual(@as(usize, 0), contentLength("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+}
+
+test "page carries the keydown forwarder" {
+    try testing.expect(std.mem.indexOf(u8, page, "keydown") != null);
+    try testing.expect(std.mem.indexOf(u8, page, "/input") != null);
 }
 
 test "render truncates instead of overflowing a small buffer" {

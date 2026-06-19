@@ -127,4 +127,6 @@ echo hello | dd of=/dev/vda bs=512 seek=1   # write path
 - **Web console**: `touch nether-web` before `zig build run` to serve the live
   console grid over HTTP on port 9000 (the guest's serial output, rendered to
   HTML, polled by the page). Browse `http://<box-ip>:9000` (open the port / use an
-  SSH tunnel). Read-only for now. Without the marker, no port is bound.
+  SSH tunnel). It is interactive: keystrokes in the page are mapped to terminal
+  byte sequences and POSTed to the guest's serial RX. Without the marker, no port
+  is bound.

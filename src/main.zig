@@ -153,7 +153,14 @@ pub fn main() !void {
     var web: nether.WebConsole = undefined;
     if (webEnabled()) {
         web_buf = try allocator.alloc(u8, 256 * 1024);
-        web = .{ .screen = &console, .lock = &console_lock, .port = 9000, .buf = web_buf };
+        web = .{
+            .screen = &console,
+            .lock = &console_lock,
+            .port = 9000,
+            .buf = web_buf,
+            .on_input = webInput,
+            .on_input_ctx = &serial,
+        };
         if (std.Thread.spawn(.{}, nether.WebConsole.run, .{&web})) |t| {
             t.detach();
             std.debug.print("[nether] web console: http://0.0.0.0:9000\n", .{});
@@ -169,6 +176,14 @@ pub fn main() !void {
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
     if (nether.trace.on()) dumpConsole(&console);
+}
+
+/// Web console input sink: deliver browser keystrokes to the serial RX (the same
+/// path the stdin thread uses). pushRx is internally locked, so calling it from
+/// the web thread is safe.
+fn webInput(ctx: *anyopaque, bytes: []const u8) void {
+    const serial: *nether.Serial = @ptrCast(@alignCast(ctx));
+    serial.pushRx(bytes);
 }
 
 /// True if a `nether-web` marker file is present in the working directory.

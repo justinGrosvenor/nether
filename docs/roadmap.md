@@ -150,11 +150,11 @@ done-line.
   under trace) with **scrollback** (a ring of evicted rows; the exit dump shows
   the full boot log). That unlocks console-state snapshots and grid-level golden
   tests. The grid handles the alternate screen and scroll regions, so full-screen
-  TUIs (vim/less/htop) render correctly, and a **read-only web console** is wired
-  (`src/webconsole.zig`: the server renders the live grid to HTML and a polling
-  page displays it; opt-in via a `nether-web` marker, port 9000). Remaining:
-  browser-to-guest input (a POST to the serial RX), and the small DECOM /
-  wide-character bits. See
+  TUIs (vim/less/htop) render correctly, and an **interactive web console** is
+  wired (`src/webconsole.zig`: the server renders the live grid to HTML, a polling
+  page displays it, and key presses POST to `/input` which feeds the serial RX;
+  opt-in via a `nether-web` marker, port 9000). The console subsystem is
+  feature-complete; only the small DECOM / wide-character grid bits remain. See
   [references/ghostty-patterns.md](references/ghostty-patterns.md) (2, 5) and
   [decisions.md](decisions.md) D5.
 - **PVH / direct-boot fast path** beside OVMF. Linux-only edge guests boot via
