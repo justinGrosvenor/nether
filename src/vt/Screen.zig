@@ -11,11 +11,12 @@
 //! bytes.
 //!
 //! Scope: printable text incl. UTF-8 (decoded ahead of the byte parser in
-//! ground state), deferred autowrap, scrollback (a ring of evicted rows), and
-//! the C0 controls and CSI/SGR/ED/EL/cursor sequences a shell and getty emit.
-//! Deliberately NOT yet handled (grow as needed): the alternate screen, scroll
-//! regions (DECSTBM), and wide characters (every codepoint is one column wide,
-//! so CJK/double-width glyphs misalign).
+//! ground state), deferred autowrap, scrollback (a ring of evicted rows), the
+//! alternate screen (1049/47), scroll regions (DECSTBM) with index/reverse-
+//! index, and the C0 controls and CSI/SGR/ED/EL/cursor sequences a shell, getty,
+//! and full-screen TUIs emit. Deliberately NOT yet handled (grow as needed):
+//! DEC origin mode (DECOM, so CUP stays absolute), and wide characters (every
+//! codepoint is one column wide, so CJK/double-width glyphs misalign).
 
 const Screen = @This();
 
@@ -63,9 +64,22 @@ pub const Cursor = struct {
 alloc: std.mem.Allocator,
 rows: u16,
 cols: u16,
+/// The active buffer: aliases `main_cells` normally, or `alt_cells` while the
+/// alternate screen is in use. All rendering/cursor logic indexes this.
 cells: []Cell, // rows*cols, row-major
+main_cells: []Cell, // the primary screen (has scrollback)
+alt_cells: []Cell, // the alternate screen (full-screen TUIs; no scrollback)
+on_alt: bool = false,
+/// Cursor/pen saved when entering the alternate screen (1049), restored on exit.
+saved_cursor: Cursor = .{},
+saved_pen: Style = .{},
 cursor: Cursor = .{},
 pen: Style = .{}, // style applied to newly printed cells
+/// Scrolling region (DECSTBM), inclusive 0-based rows. Defaults to the whole
+/// screen. Line feeds scroll only within [scroll_top, scroll_bottom]; scrollback
+/// is fed only when the region is the full primary screen.
+scroll_top: u16 = 0,
+scroll_bottom: u16,
 /// DEC deferred autowrap: set after printing in the last column. The wrap
 /// happens on the next printable, so a glyph in the last column does not scroll
 /// prematurely.
@@ -101,16 +115,23 @@ pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) !Screen {
 
 pub fn initCapacity(alloc: std.mem.Allocator, rows: u16, cols: u16, scrollback: usize) !Screen {
     std.debug.assert(rows > 0 and cols > 0);
-    const cells = try alloc.alloc(Cell, @as(usize, rows) * cols);
-    errdefer alloc.free(cells);
-    @memset(cells, .{});
+    const n = @as(usize, rows) * cols;
+    const main = try alloc.alloc(Cell, n);
+    errdefer alloc.free(main);
+    @memset(main, .{});
+    const alt = try alloc.alloc(Cell, n);
+    errdefer alloc.free(alt);
+    @memset(alt, .{});
     const sb = try alloc.alloc(Cell, scrollback * cols);
     @memset(sb, .{});
     return .{
         .alloc = alloc,
         .rows = rows,
         .cols = cols,
-        .cells = cells,
+        .cells = main,
+        .main_cells = main,
+        .alt_cells = alt,
+        .scroll_bottom = rows - 1,
         .sb_cells = sb,
         .sb_cap = scrollback,
         .parser = Parser.init(),
@@ -119,7 +140,9 @@ pub fn initCapacity(alloc: std.mem.Allocator, rows: u16, cols: u16, scrollback: 
 
 pub fn deinit(self: *Screen) void {
     self.parser.deinit();
-    self.alloc.free(self.cells);
+    // Free the backing buffers by name, not `cells` (which aliases one of them).
+    self.alloc.free(self.main_cells);
+    self.alloc.free(self.alt_cells);
     self.alloc.free(self.sb_cells);
 }
 
@@ -267,7 +290,22 @@ fn control(self: *Screen, b: u8) void {
 
 fn lineFeed(self: *Screen) void {
     self.pending_wrap = false;
-    if (self.cursor.row + 1 >= self.rows) self.scrollUp() else self.cursor.row += 1;
+    if (self.cursor.row == self.scroll_bottom) {
+        self.scrollRegionUp();
+    } else if (self.cursor.row + 1 < self.rows) {
+        self.cursor.row += 1;
+    }
+}
+
+/// Reverse index (RI / ESC M): move up one row, scrolling the region down if at
+/// the top margin.
+fn reverseIndex(self: *Screen) void {
+    self.pending_wrap = false;
+    if (self.cursor.row == self.scroll_top) {
+        self.scrollRegionDown();
+    } else if (self.cursor.row > 0) {
+        self.cursor.row -= 1;
+    }
 }
 
 fn tab(self: *Screen) void {
@@ -277,12 +315,39 @@ fn tab(self: *Screen) void {
     self.pending_wrap = false;
 }
 
-fn scrollUp(self: *Screen) void {
-    self.archiveRow(self.cells[0..self.cols]); // retain the row leaving the top
-    // Move every row up by one and blank the last row.
-    const stride = self.cols;
-    std.mem.copyForwards(Cell, self.cells[0 .. self.cells.len - stride], self.cells[stride..]);
-    @memset(self.cells[self.cells.len - stride ..], .{});
+/// Scroll the active region up by one row, blanking the bottom margin. When the
+/// region is the full primary screen, the departing top row is archived to
+/// scrollback first; partial regions and the alternate screen do not feed it.
+fn scrollRegionUp(self: *Screen) void {
+    const top = self.scroll_top;
+    const bot = self.scroll_bottom;
+    if (!self.on_alt and top == 0 and bot == self.rows - 1) {
+        self.archiveRow(self.cells[0..self.cols]);
+    }
+    var r = top;
+    while (r < bot) : (r += 1) {
+        @memcpy(self.rowSlice(r), self.rowSliceConst(r + 1));
+    }
+    @memset(self.rowSlice(bot), .{});
+}
+
+/// Scroll the active region down by one row, blanking the top margin. Never
+/// feeds scrollback.
+fn scrollRegionDown(self: *Screen) void {
+    const top = self.scroll_top;
+    const bot = self.scroll_bottom;
+    var r = bot;
+    while (r > top) : (r -= 1) {
+        @memcpy(self.rowSlice(r), self.rowSliceConst(r - 1));
+    }
+    @memset(self.rowSlice(top), .{});
+}
+
+fn rowSlice(self: *Screen, row: u16) []Cell {
+    return self.cells[self.idx(row, 0)..][0..self.cols];
+}
+fn rowSliceConst(self: *const Screen, row: u16) []const Cell {
+    return self.cells[self.idx(row, 0)..][0..self.cols];
 }
 
 /// Append a row to the scrollback ring, evicting the oldest when full.
@@ -306,16 +371,27 @@ fn sbRowCells(self: *const Screen, n: usize) []const Cell {
 // --- escape / CSI ----------------------------------------------------------
 
 fn escape(self: *Screen, esc: Parser.Action.ESC) void {
-    // Only RIS (full reset) is handled; charset selection and the rest are
-    // ignored for a serial console.
-    if (esc.intermediates.len == 0 and esc.final == 'c') self.reset();
+    if (esc.intermediates.len != 0) return; // charset selection etc. ignored
+    switch (esc.final) {
+        'c' => self.reset(), // RIS
+        'D' => self.lineFeed(), // IND: index
+        'E' => { // NEL: next line
+            self.cursor.col = 0;
+            self.lineFeed();
+        },
+        'M' => self.reverseIndex(), // RI
+        else => {},
+    }
 }
 
 fn reset(self: *Screen) void {
+    if (self.on_alt) self.exitAlt();
     @memset(self.cells, .{});
     self.cursor = .{};
     self.pen = .{};
     self.pending_wrap = false;
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows - 1;
     self.clearScrollback();
 }
 
@@ -326,8 +402,13 @@ pub fn clearScrollback(self: *Screen) void {
 }
 
 fn csi(self: *Screen, c: Parser.Action.CSI) void {
-    // Private sequences (e.g. DEC modes "?25h") carry intermediates; we do not
-    // interpret them. The common cursor/erase/SGR commands have none.
+    // DEC private sequences carry a '?' intermediate. We handle the alternate
+    // screen modes and ignore the rest (cursor visibility, bracketed paste, ...).
+    if (c.intermediates.len == 1 and c.intermediates[0] == '?') {
+        if (c.final == 'h' or c.final == 'l') self.decPrivateMode(c.params, c.final == 'h');
+        return;
+    }
+    // Other intermediate forms are not interpreted.
     if (c.intermediates.len != 0) return;
 
     const p0 = paramOr(c.params, 0, 1);
@@ -346,8 +427,62 @@ fn csi(self: *Screen, c: Parser.Action.CSI) void {
         'J' => self.eraseDisplay(paramOr(c.params, 0, 0)),
         'K' => self.eraseLine(paramOr(c.params, 0, 0)),
         'm' => self.sgr(c.params),
+        'r' => self.setScrollRegion(c.params), // DECSTBM
         else => {}, // unhandled CSI commands are ignored
     }
+}
+
+/// DEC private mode set (`?...h`) / reset (`?...l`). Only the alternate-screen
+/// modes are acted on; others (cursor visibility, mouse, bracketed paste) are
+/// recognized as private but ignored.
+fn decPrivateMode(self: *Screen, params: []const u16, set: bool) void {
+    for (params) |p| switch (p) {
+        47, 1047, 1049 => if (set) self.enterAlt() else self.exitAlt(),
+        else => {},
+    };
+}
+
+/// DECSTBM: set the scrolling region to rows [top, bottom] (1-based params).
+/// Invalid or absent params reset it to the full screen. Homes the cursor.
+fn setScrollRegion(self: *Screen, params: []const u16) void {
+    const top = paramOr(params, 0, 1) -| 1;
+    const bot = paramOr(params, 1, self.rows) -| 1;
+    if (bot > top and bot < self.rows) {
+        self.scroll_top = top;
+        self.scroll_bottom = bot;
+    } else {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+    }
+    self.moveTo(0, 0);
+}
+
+/// Switch to the alternate screen (1049): save the cursor/pen, clear the alt
+/// buffer, home the cursor, reset margins. No-op if already there.
+fn enterAlt(self: *Screen) void {
+    if (self.on_alt) return;
+    self.saved_cursor = self.cursor;
+    self.saved_pen = self.pen;
+    self.on_alt = true;
+    self.cells = self.alt_cells;
+    @memset(self.cells, .{});
+    self.cursor = .{};
+    self.pen = .{};
+    self.pending_wrap = false;
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows - 1;
+}
+
+/// Switch back to the primary screen: restore the cursor/pen, reset margins.
+fn exitAlt(self: *Screen) void {
+    if (!self.on_alt) return;
+    self.on_alt = false;
+    self.cells = self.main_cells;
+    self.cursor = self.saved_cursor;
+    self.pen = self.saved_pen;
+    self.pending_wrap = false;
+    self.scroll_top = 0;
+    self.scroll_bottom = self.rows - 1;
 }
 
 /// Clamp to the grid and clear pending wrap. All cursor motion goes through here.
@@ -640,6 +775,56 @@ test "ED 3 clears scrollback" {
     s.write("L0\r\nL1\r\nL2\r\nL3");
     try testing.expect(s.scrollbackLen() > 0);
     s.write("\x1b[3J");
+    try testing.expectEqual(@as(usize, 0), s.scrollbackLen());
+}
+
+test "scroll region confines a line feed" {
+    var s = try Screen.initCapacity(testing.allocator, 4, 8, 4);
+    defer s.deinit();
+    s.write("\x1b[1;1HR0"); // row 0
+    s.write("\x1b[4;1HR3"); // row 3
+    s.write("\x1b[2;3r"); // region = rows 2..3 (0-based 1..2)
+    s.write("\x1b[2;1Ha"); // row 1 = "a"
+    s.write("\x1b[3;1Hb"); // row 2 = "b"
+    s.write("\x1b[3;1H\n"); // LF at the bottom margin: scroll the region up
+    try expectRow(&s, 0, "R0"); // outside the region: untouched
+    try expectRow(&s, 3, "R3");
+    try expectRow(&s, 1, "b"); // region scrolled
+    try expectRow(&s, 2, "");
+    try testing.expectEqual(@as(usize, 0), s.scrollbackLen()); // partial region: no scrollback
+}
+
+test "reverse index scrolls the region down" {
+    var s = try Screen.init(testing.allocator, 4, 8);
+    defer s.deinit();
+    s.write("\x1b[2;3r"); // region rows 1..2
+    s.write("\x1b[2;1Hx"); // row 1 = "x"
+    s.write("\x1b[3;1Hy"); // row 2 = "y"
+    s.write("\x1b[2;1H"); // cursor to the top margin
+    s.write("\x1bM"); // RI: scroll region down
+    try expectRow(&s, 1, ""); // top margin blanked
+    try expectRow(&s, 2, "x"); // "x" pushed down ("y" gone)
+}
+
+test "alternate screen saves and restores the primary" {
+    var s = try Screen.init(testing.allocator, 3, 10);
+    defer s.deinit();
+    s.write("main"); // primary, cursor at col 4
+    s.write("\x1b[?1049h"); // enter alt
+    try testing.expect(s.on_alt);
+    s.write("ALT");
+    try expectRow(&s, 0, "ALT"); // alt buffer is live
+    s.write("\x1b[?1049l"); // exit alt
+    try testing.expect(!s.on_alt);
+    try expectRow(&s, 0, "main"); // primary restored
+    try testing.expectEqual(Cursor{ .row = 0, .col = 4 }, s.cursor); // cursor restored
+}
+
+test "alternate screen does not feed scrollback" {
+    var s = try Screen.initCapacity(testing.allocator, 2, 8, 4);
+    defer s.deinit();
+    s.write("\x1b[?1049h");
+    s.write("a\r\nb\r\nc\r\nd"); // scrolls within the alt screen
     try testing.expectEqual(@as(usize, 0), s.scrollbackLen());
 }
 
