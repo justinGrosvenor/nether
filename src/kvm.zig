@@ -44,6 +44,9 @@ pub const GET_SREGS = ior(0x83, Sregs);
 pub const SET_SREGS = iow(0x84, Sregs);
 
 pub const CHECK_EXTENSION = io(0x03);
+// kvm_cpuid2 is variable-length; the ioctl number encodes only the 8-byte header.
+pub const GET_SUPPORTED_CPUID = ioc(IOC_READ | IOC_WRITE, 0x05, 8);
+pub const SET_CPUID2 = ioc(IOC_WRITE, 0x90, 8);
 pub const ENABLE_CAP = iow(0xa3, EnableCap);
 pub const IRQFD = iow(0x76, Irqfd);
 pub const IOEVENTFD = iow(0x79, Ioeventfd);
@@ -207,6 +210,25 @@ pub const Ioeventfd = extern struct {
     fd: i32,
     flags: u32,
     pad: [36]u8,
+};
+
+pub const CpuidEntry = extern struct {
+    function: u32,
+    index: u32,
+    flags: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+    padding: [3]u32 = .{ 0, 0, 0 },
+};
+
+/// kvm_cpuid2 with inline capacity. `nent` is set to the capacity before
+/// GET_SUPPORTED_CPUID and to the populated count before SET_CPUID2.
+pub const Cpuid2 = extern struct {
+    nent: u32,
+    padding: u32 = 0,
+    entries: [128]CpuidEntry = undefined,
 };
 
 pub const Msi = extern struct {

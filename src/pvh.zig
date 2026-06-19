@@ -9,7 +9,7 @@ const elf = @import("elf.zig");
 const acpi = @import("acpi.zig");
 const vmm = @import("vm.zig");
 
-pub const magic = 0x336e4558; // "xEn3"
+pub const magic = 0x336ec578; // XEN_HVM_START_MAGIC_VALUE
 pub const E820_RAM = 1;
 
 // Low-memory layout for boot structures (all below the 1 MiB kernel load).

@@ -116,6 +116,11 @@ pub const Vm = struct {
         @memset(try self.guestSlice(gpa, len), 0);
     }
 
+    /// Copy `buf.len` bytes of guest physical memory at `gpa` into `buf`.
+    pub fn guestReadInto(self: *Vm, gpa: u64, buf: []u8) Error!void {
+        @memcpy(buf, try self.guestSlice(gpa, buf.len));
+    }
+
     /// Enable the split irqchip (in-kernel LAPIC, userspace IOAPIC/PIC). Must be
     /// called before creating vCPUs.
     pub fn enableSplitIrqchip(self: *Vm) Error!void {
@@ -137,6 +142,12 @@ pub const Vcpu = struct {
     fn init(kvm_fd: i32, vm_fd: i32, id: u32) Error!Vcpu {
         const fd: i32 = @intCast(try kvm.ioctl(vm_fd, kvm.CREATE_VCPU, id));
         errdefer _ = linux.close(fd);
+
+        // CPUID: without it the guest sees no features (e.g. long mode), so the
+        // kernel's EFER.LME write would fault. Copy KVM's supported set through.
+        var cpuid = kvm.Cpuid2{ .nent = 128 };
+        _ = try kvm.ioctl(kvm_fd, kvm.GET_SUPPORTED_CPUID, @intFromPtr(&cpuid));
+        _ = try kvm.ioctl(fd, kvm.SET_CPUID2, @intFromPtr(&cpuid));
 
         const size = try kvm.ioctl(kvm_fd, kvm.GET_VCPU_MMAP_SIZE, 0);
         const addr = try sys(linux.mmap(
@@ -184,7 +195,7 @@ pub const Vcpu = struct {
 
         const code = kvm.Segment{
             .base = 0,
-            .limit = 0xfffff,
+            .limit = 0xffffffff, // byte-granular limit in the VMCS: full 4 GiB
             .selector = 0x08,
             .type_ = 0xb, // execute/read, accessed
             .present = 1,
@@ -231,7 +242,10 @@ pub const Vcpu = struct {
             _ = try kvm.ioctl(self.fd, kvm.RUN, 0);
             switch (self.run_page.exit_reason) {
                 kvm.EXIT_HLT => return .halted,
-                kvm.EXIT_SHUTDOWN => return .shutdown,
+                kvm.EXIT_SHUTDOWN => {
+                    self.dumpState("shutdown");
+                    return .shutdown;
+                },
                 kvm.EXIT_IO => self.dispatchIo(bus),
                 kvm.EXIT_MMIO => self.dispatchMmio(bus),
                 kvm.EXIT_IOAPIC_EOI => {}, // userspace IOAPIC not yet implemented
@@ -264,6 +278,22 @@ pub const Vcpu = struct {
                 writeValue(slot, bus.pioIn(e.port, e.size));
             }
         }
+    }
+
+    fn dumpState(self: *Vcpu, why: []const u8) void {
+        var regs: kvm.Regs = undefined;
+        var sregs: kvm.Sregs = undefined;
+        _ = kvm.ioctl(self.fd, kvm.GET_REGS, @intFromPtr(&regs)) catch {};
+        _ = kvm.ioctl(self.fd, kvm.GET_SREGS, @intFromPtr(&sregs)) catch {};
+        std.debug.print(
+            "[nether] {s}: rip=0x{x} rsp=0x{x} cr0=0x{x} cr2=0x{x} cr3=0x{x} cr4=0x{x} efer=0x{x}\n",
+            .{ why, regs.rip, regs.rsp, sregs.cr0, sregs.cr2, sregs.cr3, sregs.cr4, sregs.efer },
+        );
+        const cs = sregs.cs;
+        std.debug.print(
+            "[nether]   cs: base=0x{x} limit=0x{x} sel=0x{x} type=0x{x} present={d} s={d} dpl={d} db={d} l={d} g={d}\n",
+            .{ cs.base, cs.limit, cs.selector, cs.type_, cs.present, cs.s, cs.dpl, cs.db, cs.l, cs.g },
+        );
     }
 
     fn dispatchMmio(self: *Vcpu, bus: *io.Bus) void {

@@ -84,7 +84,7 @@ pub fn main() !void {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
         defer if (initramfs) |fs| allocator.free(fs);
-        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0 earlyprintk=ttyS0", initramfs) catch |err| {
+        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr", initramfs) catch |err| {
             std.debug.print("[nether] PVH boot failed: {s}\n", .{@errorName(err)});
             return err;
         };

@@ -60,14 +60,12 @@ pub const Bus = struct {
                 return;
             }
         }
-        std.debug.print("[nether] unclaimed PIO out port=0x{x} size={d}\n", .{ port, size });
     }
 
     pub fn pioIn(self: *Bus, port: u16, size: u8) u32 {
         for (self.pio[0..self.pio_count]) |d| {
             if (d.contains(port)) return d.in_fn(d.ptr, port, size);
         }
-        std.debug.print("[nether] unclaimed PIO in port=0x{x} size={d}\n", .{ port, size });
         return 0xFFFFFFFF;
     }
 
@@ -78,7 +76,6 @@ pub const Bus = struct {
                 return;
             }
         }
-        std.debug.print("[nether] unclaimed MMIO write @0x{x} len={d}\n", .{ addr, data.len });
     }
 
     pub fn mmioRead(self: *Bus, addr: u64, data: []u8) void {
@@ -89,7 +86,6 @@ pub const Bus = struct {
             }
         }
         @memset(data, 0xFF);
-        std.debug.print("[nether] unclaimed MMIO read @0x{x} len={d}\n", .{ addr, data.len });
     }
 };
 
