@@ -16,6 +16,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const kvm = @import("kvm.zig");
+const trace = @import("trace.zig");
 
 pub const Error = error{SyscallFailed} || kvm.Error;
 
@@ -88,5 +89,6 @@ pub fn signalMsi(vm_fd: i32, addr: u64, data: u32) Error!void {
         .devid = 0,
         .pad = [_]u8{0} ** 12,
     };
-    _ = try kvm.ioctl(vm_fd, kvm.SIGNAL_MSI, @intFromPtr(&m));
+    const r = try kvm.ioctl(vm_fd, kvm.SIGNAL_MSI, @intFromPtr(&m));
+    trace.log("signalMsi r={d} addr=0x{x} data=0x{x}", .{ r, addr, data });
 }

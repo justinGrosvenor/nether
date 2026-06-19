@@ -147,6 +147,17 @@ pub const Vcpu = struct {
         // kernel's EFER.LME write would fault. Copy KVM's supported set through.
         var cpuid = kvm.Cpuid2{ .nent = 128 };
         _ = try kvm.ioctl(kvm_fd, kvm.GET_SUPPORTED_CPUID, @intFromPtr(&cpuid));
+        // GET_SUPPORTED_CPUID leaks the host core's APIC ID; rewrite it to this
+        // vCPU's LAPIC id so MSI destinations match (otherwise completions drop).
+        var ci: usize = 0;
+        while (ci < cpuid.nent) : (ci += 1) {
+            const e = &cpuid.entries[ci];
+            switch (e.function) {
+                1 => e.ebx = (e.ebx & 0x00ffffff) | (id << 24),
+                0xb, 0x1f => e.edx = id,
+                else => {},
+            }
+        }
         _ = try kvm.ioctl(fd, kvm.SET_CPUID2, @intFromPtr(&cpuid));
 
         const size = try kvm.ioctl(kvm_fd, kvm.GET_VCPU_MMAP_SIZE, 0);

@@ -9,6 +9,7 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
+const trace = @import("trace.zig");
 
 pub const Blk = struct {
     disk: []u8,
@@ -53,6 +54,7 @@ pub const Blk = struct {
         const mem = dev.memory();
         const vq = dev.queue(q);
         while (vq.next(mem)) |head| {
+            trace.log("blk head={d}", .{head});
             const written = self.handle(mem, vq, head);
             vq.complete(mem, head, written);
         }
@@ -119,6 +121,7 @@ pub const Blk = struct {
         }
 
         if (mem.slice(status.addr, 1)) |s| s[0] = if (ok) S_OK else S_IOERR;
+        trace.log("blk type={d} sector={d} bufs={d} written={d} ok={}", .{ req_type, sector, n, data_written, ok });
         return data_written + 1; // device-written bytes: data + status
     }
 };
