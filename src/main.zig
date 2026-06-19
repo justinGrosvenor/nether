@@ -67,6 +67,12 @@ pub fn main() !void {
     serial.irq = &ioapic;
     // Host stdin is driven into the serial RX by a dedicated I/O thread (set up
     // below, once we know a kernel is booting), not polled on the vCPU thread.
+    // Console tee: mirror the guest's serial output into a screen grid so the VMM
+    // holds a live render (dumped on exit under trace; the basis for a future
+    // snapshot / web console). 80x24 standard, single-writer on the vCPU thread.
+    var console = try nether.vt.Screen.init(allocator, 24, 80);
+    defer console.deinit();
+    serial.mirror = &console;
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
     var reset = nether.Reset{ .power = &power };
@@ -139,9 +145,23 @@ pub fn main() !void {
 
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
+        if (nether.trace.on()) dumpConsole(&console);
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+    if (nether.trace.on()) dumpConsole(&console);
+}
+
+/// Print the teed console grid (non-empty rows) to stderr. Gated by trace so it
+/// is opt-in; the grid is always maintained, this just surfaces it on exit.
+fn dumpConsole(scr: *nether.vt.Screen) void {
+    std.debug.print("[nether] final console {d}x{d}:\n", .{ scr.rows, scr.cols });
+    var buf: [4096]u8 = undefined;
+    var row: u16 = 0;
+    while (row < scr.rows) : (row += 1) {
+        const line = std.mem.trimEnd(u8, scr.rowText(row, &buf), " ");
+        if (line.len > 0) std.debug.print("  {s}\n", .{line});
+    }
 }
 
 /// Delivers a virtio MSI-X completion by injecting it through KVM.

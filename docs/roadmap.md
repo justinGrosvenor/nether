@@ -143,11 +143,13 @@ done-line.
   scaling path is a mailbox/SPSC-queue model and a libxev event-loop I/O thread;
   see [references/ghostty-patterns.md](references/ghostty-patterns.md) (3, 4),
   adopted when lock contention or a second host input source forces it.
-- **Server-side console.** The VT engine now exists in-tree (`src/vt/`): the
-  vendored parser plus a Nether-authored screen grid (`Screen.zig`), both
-  fuzz-smoked. That unlocks console-state snapshots and grid-level golden tests;
-  a web console is the remaining wiring (feed the guest's serial RX into a Screen
-  and ship the grid). See
+- **Server-side console.** The VT engine exists in-tree (`src/vt/`): the
+  vendored parser plus a Nether-authored screen grid (`Screen.zig`, with UTF-8),
+  both fuzz-smoked, and the **console tee is wired** (the serial device mirrors
+  guest output into a `Screen`, so the VMM holds a live render; dumped on exit
+  under trace). That unlocks console-state snapshots and grid-level golden tests.
+  Remaining: ship the grid to a frontend (web console) and grow the grid
+  (scrollback, alternate screen). See
   [references/ghostty-patterns.md](references/ghostty-patterns.md) (2, 5) and
   [decisions.md](decisions.md) D5.
 - **PVH / direct-boot fast path** beside OVMF. Linux-only edge guests boot via

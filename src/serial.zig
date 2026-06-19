@@ -9,11 +9,18 @@ const linux = std.os.linux;
 const io = @import("io.zig");
 const ioapic = @import("ioapic.zig");
 const Lock = @import("lock.zig").Lock;
+const Screen = @import("vt/Screen.zig");
 
 pub const Serial = struct {
     out_fd: i32 = 1,
     irq: ?*ioapic.IoApic = null, // raised on TX-empty/RX-ready when enabled
     gsi: u8 = 4, // COM1 -> IRQ4
+    /// Optional console tee: every transmitted byte is also fed to this screen,
+    /// so the VMM keeps a live render of the guest console (for snapshots, a web
+    /// console, or an on-exit dump). Touched only on the vCPU thread (the TX
+    /// path), so it is single-writer and needs no lock; a future reader on
+    /// another thread would (D3).
+    mirror: ?*Screen = null,
 
     // The RX FIFO is filled by the host I/O thread (pushRx) and drained by the
     // vCPU thread (register reads), so all register state is under `mutex` (the
@@ -99,7 +106,8 @@ pub const Serial = struct {
         // order is serial -> ioapic, so it must not be held here).
         if (emit) |b| {
             const buf = [1]u8{b};
-            _ = linux.write(self.out_fd, &buf, 1);
+            if (self.out_fd >= 0) _ = linux.write(self.out_fd, &buf, 1); // -1 = headless
+            if (self.mirror) |scr| scr.write(&buf); // tee into the console grid
         }
         if (raise) self.raiseIrq();
     }
@@ -324,6 +332,19 @@ test "concurrent producer/consumer preserves FIFO order with no duplication" {
     }
     try std.testing.expect(received >= 1); // made progress
     try std.testing.expect(received <= count); // no duplication
+}
+
+test "console tee mirrors transmitted bytes into a screen" {
+    var screen = try Screen.init(std.testing.allocator, 4, 20);
+    defer screen.deinit();
+    // out_fd = -1 so the physical write is a harmless no-op in the test; the tee
+    // still captures every byte.
+    var s = Serial{ .out_fd = -1, .mirror = &screen };
+    const d = s.device();
+    for ("hi\r\nthere") |c| out(d, 0, c);
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", std.mem.trimEnd(u8, screen.rowText(0, &buf), " "));
+    try std.testing.expectEqualStrings("there", std.mem.trimEnd(u8, screen.rowText(1, &buf), " "));
 }
 
 test "loopback routes transmit to receive" {

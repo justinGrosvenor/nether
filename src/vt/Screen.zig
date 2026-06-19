@@ -10,12 +10,12 @@
 //! patterns.md): a screen snapshot is just the dims, cursor, pen, and cell
 //! bytes.
 //!
-//! Scope (v1): printable ASCII, deferred autowrap, the C0 controls and the
-//! CSI/SGR/ED/EL/cursor sequences a shell and getty emit. Deliberately NOT yet
-//! handled (grow as needed): scrollback, the alternate screen, scroll regions
-//! (DECSTBM), and UTF-8 multibyte / wide characters. UTF-8 needs a decoder
-//! ahead of the byte parser; until then high bytes are not rendered. Cells store
-//! a u21 codepoint so that addition is forward-compatible.
+//! Scope (v1): printable text incl. UTF-8 (decoded ahead of the byte parser in
+//! ground state), deferred autowrap, the C0 controls and the CSI/SGR/ED/EL/
+//! cursor sequences a shell and getty emit. Deliberately NOT yet handled (grow
+//! as needed): scrollback, the alternate screen, scroll regions (DECSTBM), and
+//! wide characters (every codepoint is treated as one column wide, so CJK/
+//! double-width glyphs misalign).
 
 const Screen = @This();
 
@@ -76,6 +76,14 @@ title_len: usize = 0,
 
 parser: Parser,
 
+/// Incremental UTF-8 decode state, used only in the parser's ground state.
+/// Multibyte sequences are decoded to one codepoint and printed directly; the
+/// parser itself only ever sees ASCII/control bytes. `u8_need` is 0 when not
+/// mid-sequence.
+u8_buf: [4]u8 = undefined,
+u8_have: u3 = 0,
+u8_need: u3 = 0,
+
 pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) !Screen {
     std.debug.assert(rows > 0 and cols > 0);
     const cells = try alloc.alloc(Cell, @as(usize, rows) * cols);
@@ -118,11 +126,56 @@ pub fn rowText(self: *const Screen, row: u16, buf: []u8) []const u8 {
 }
 
 /// Feed guest output bytes through the parser and apply the resulting actions.
+/// In the parser's ground state, high bytes are decoded as UTF-8 and printed as
+/// a single codepoint (modern UTF-8 mode: C1 controls are not honored). Escape
+/// and control sequences are pure ASCII, so they go straight to the parser.
 pub fn write(self: *Screen, bytes: []const u8) void {
     for (bytes) |b| {
+        // Continuation of an in-progress UTF-8 sequence.
+        if (self.u8_need != 0) {
+            if (b & 0xc0 == 0x80) {
+                self.u8_buf[self.u8_have] = b;
+                self.u8_have += 1;
+                if (self.u8_have == self.u8_need) self.flushUtf8();
+                continue;
+            }
+            // Invalid: the sequence was truncated. Emit a replacement and fall
+            // through to reprocess this byte from scratch.
+            self.putChar(0xfffd);
+            self.u8_need = 0;
+            self.u8_have = 0;
+        }
+
+        // Start a UTF-8 sequence only in ground state; elsewhere bytes are ASCII.
+        if (self.parser.state == .ground and b >= 0x80) {
+            const need: u3 = if (b & 0xe0 == 0xc0)
+                2
+            else if (b & 0xf0 == 0xe0)
+                3
+            else if (b & 0xf8 == 0xf0)
+                4
+            else
+                0;
+            if (need == 0) {
+                self.putChar(0xfffd); // stray continuation or invalid lead byte
+            } else {
+                self.u8_buf[0] = b;
+                self.u8_have = 1;
+                self.u8_need = need;
+            }
+            continue;
+        }
+
         const actions = self.parser.next(b);
         for (actions) |maybe| if (maybe) |a| self.apply(a);
     }
+}
+
+fn flushUtf8(self: *Screen) void {
+    const cp = std.unicode.utf8Decode(self.u8_buf[0..self.u8_need]) catch 0xfffd;
+    self.u8_need = 0;
+    self.u8_have = 0;
+    self.putChar(cp);
 }
 
 fn apply(self: *Screen, action: Parser.Action) void {
@@ -446,6 +499,33 @@ test "ESC c resets the screen" {
     try expectRow(&s, 0, "");
     try testing.expectEqual(Cursor{}, s.cursor);
     try testing.expectEqual(Color.default, s.pen.fg);
+}
+
+test "decodes 2- and 3-byte UTF-8 to single codepoints" {
+    var s = try Screen.init(testing.allocator, 2, 10);
+    defer s.deinit();
+    s.write("é→"); // U+00E9 (C3 A9), U+2192 (E2 86 92)
+    try testing.expectEqual(@as(u21, 0x00e9), s.cellAt(0, 0).cp);
+    try testing.expectEqual(@as(u21, 0x2192), s.cellAt(0, 1).cp);
+    try testing.expectEqual(@as(u16, 2), s.cursor.col);
+}
+
+test "invalid UTF-8 becomes the replacement character" {
+    var s = try Screen.init(testing.allocator, 2, 10);
+    defer s.deinit();
+    s.write(&[_]u8{ 0xff, 'a' }); // 0xff is not a valid lead byte
+    try testing.expectEqual(@as(u21, 0xfffd), s.cellAt(0, 0).cp);
+    try testing.expectEqual(@as(u21, 'a'), s.cellAt(0, 1).cp);
+}
+
+test "UTF-8 truncated by an escape still parses the escape" {
+    var s = try Screen.init(testing.allocator, 2, 10);
+    defer s.deinit();
+    // A 3-byte lead, then only one continuation, then a CSI cursor move + print.
+    s.write(&[_]u8{ 0xe2, 0x86 });
+    s.write("\x1b[1;5HX");
+    try testing.expectEqual(@as(u21, 0xfffd), s.cellAt(0, 0).cp); // truncated -> replacement
+    try testing.expectEqual(@as(u21, 'X'), s.cellAt(0, 4).cp); // CSI still worked
 }
 
 test "a realistic colored prompt renders" {
