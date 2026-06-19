@@ -33,6 +33,7 @@ pub const Lock = @import("lock.zig").Lock;
 pub const vt = struct {
     pub const Parser = @import("vt/Parser.zig");
     pub const osc = @import("vt/osc.zig");
+    pub const Screen = @import("vt/Screen.zig");
 };
 
 pub const trace = @import("trace.zig");
@@ -57,6 +58,7 @@ test {
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");
     _ = @import("vt/osc.zig");
+    _ = @import("vt/Screen.zig");
     // Always-on fuzz-smoke for the guest-facing parsers (vt + virtqueue).
     _ = @import("fuzz.zig");
 }

@@ -21,6 +21,7 @@ Nether's needs, rather than vendoring Ghostty's ~46k-LOC grid.
 | `parse_table.zig` | Ghostty `src/terminal/parse_table.zig`, verbatim (no changes) |
 | `Parser.zig` | Ghostty `src/terminal/Parser.zig`, with the small edits below |
 | `osc.zig` | **Nether-authored.** NOT Ghostty's. A minimal zero-alloc OSC parser |
+| `Screen.zig` | **Nether-authored.** The "own the grid" half: a screen model on the parser |
 
 ## Changes from upstream (`Parser.zig`)
 

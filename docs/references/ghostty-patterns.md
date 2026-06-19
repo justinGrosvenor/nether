@@ -163,10 +163,12 @@ comptime-generates ioctl numbers (`src/kvm.zig`) and the memory map
 (`src/memmap.zig`). The DEC parser is small and well-specified, a weekend not a
 project.
 
-**Adopt:** done for the parser. The parser slice (`Parser.zig` + `parse_table.zig`)
-is vendored and ported to 0.16 in `src/vt/` (see `src/vt/PORTING.md`); the chosen
-strategy is "port the parser, own the grid." The screen-grid model is the
-remaining piece, to be built ourselves rather than vendored.
+**Adopt:** done. The parser slice (`Parser.zig` + `parse_table.zig`) is vendored
+and ported to 0.16 in `src/vt/` (see `src/vt/PORTING.md`), and the grid is owned:
+`src/vt/Screen.zig` is a Nether-authored screen model on top of the parser
+(fixed-size, pointer-free cells, deferred autowrap, the CSI/SGR/ED/EL/cursor set
+a shell emits). Both are fuzz-smoked. Remaining grid work is scrollback and the
+alternate screen, deferred until a real need (see pattern 6).
 
 ## 6. Paged + ref-counted + pool-allocated storage -> snapshot-fork discipline
 
@@ -181,10 +183,13 @@ can be shared copy-on-write.
 (boot once, clone per request) is the edge product ([thesis](../thesis.md)), and
 it wants device/guest state that is fixed-size, pool-allocated, ref-countable,
 and serializable by construction, from Phase 3 forward rather than retrofitted.
-Ghostty's storage layer is a worked example of that discipline.
+Ghostty's storage layer is a worked example of that discipline. Nether's own
+`src/vt/Screen.zig` already follows the fixed-size, pointer-free, serializable
+half of it; paging, ref-counted styles, and scrollback are the growth path when
+scrollback or snapshot size pressure makes them worth it.
 
-**Adopt:** when snapshot-aware device models start (roadmap Phase 6 pulled
-forward as a Phase 3 constraint).
+**Adopt:** started (the grid is serializable-by-construction). Add paging/
+ref-counting when snapshot-aware device models or scrollback need it.
 
 ---
 
@@ -204,8 +209,8 @@ own grid and does not help there.
 | 2. one core, Zig + C ABI | swerver-native + foreign-host embed | now (decide + stub) |
 | 3. mailbox concurrency | D3 evolution past per-device locks | lock pain / device count |
 | 4. libxev event loop | I/O thread past blocking read | 2nd host input source |
-| 5. comptime VT table | server-side console / D5 grid tests | parser vendored (src/vt/); grid next |
-| 6. paged/ref-counted store | snapshot-fork device state | snapshot work starts |
+| 5. comptime VT table | server-side console / D5 grid tests | done: parser vendored + grid v1 (src/vt/) |
+| 6. paged/ref-counted store | snapshot-fork device state | started (grid is serializable); paging when needed |
 
 ---
 

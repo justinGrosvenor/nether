@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Parser = @import("vt/Parser.zig");
+const Screen = @import("vt/Screen.zig");
 const virtq = @import("virtq.zig");
 
 // --- VT parser -------------------------------------------------------------
@@ -54,6 +55,47 @@ test "vt parser survives random escape-heavy tokens" {
         const n = rand.uintLessThan(usize, buf.len);
         for (buf[0..n]) |*b| b.* = alphabet[rand.uintLessThan(usize, alphabet.len)];
         feedParser(buf[0..n]);
+    }
+}
+
+// --- screen grid -----------------------------------------------------------
+
+// Drive random bytes through the full parse -> grid pipeline. The grid clamps
+// every cursor motion and indexes a fixed buffer, so no input should ever index
+// out of bounds; a safety trip is the only failure mode. Reuse one screen
+// across inputs so scroll/erase/cursor state interleaves.
+test "screen grid survives random escape-heavy bytes" {
+    var s = try Screen.init(std.testing.allocator, 24, 80);
+    defer s.deinit();
+    const alphabet = "\x1b[]P;:0123456789?$ \r\n\x08\x09\x07Hmfcd ABCDJKsuhlABCXYZabcxyz";
+    var prng = std.Random.DefaultPrng.init(0xD15EA5E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        var buf: [256]u8 = undefined;
+        const n = rand.uintLessThan(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = alphabet[rand.uintLessThan(usize, alphabet.len)];
+        s.write(buf[0..n]);
+    }
+    // The grid is still readable and in bounds after the assault.
+    var row: u16 = 0;
+    while (row < s.rows) : (row += 1) {
+        var line: [400]u8 = undefined;
+        std.mem.doNotOptimizeAway(s.rowText(row, &line));
+    }
+}
+
+test "screen grid survives fully random bytes" {
+    var s = try Screen.init(std.testing.allocator, 8, 16);
+    defer s.deinit();
+    var prng = std.Random.DefaultPrng.init(0xF00DBABE);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        var buf: [128]u8 = undefined;
+        const n = rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        s.write(buf[0..n]);
     }
 }
 
