@@ -182,6 +182,7 @@ pub const Run = extern struct {
     exit: extern union {
         io: RunIo,
         mmio: RunMmio,
+        eoi: extern struct { vector: u8 }, // KVM_EXIT_IOAPIC_EOI
         padding: [256]u8,
     },
 };

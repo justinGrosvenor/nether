@@ -60,8 +60,11 @@ pub fn main() !void {
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
 
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
+    var ioapic = nether.IoApic{ .vm_fd = vm.vm_fd };
+
     var power = nether.Power{};
     var serial = nether.Serial{};
+    serial.irq = &ioapic;
     // Route host stdin to the serial RX. Non-blocking so the vCPU never stalls
     // polling it; the guest's serial driver picks bytes up via its poll timer.
     const nonblock = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
@@ -81,6 +84,7 @@ pub fn main() !void {
     try bus.addPio(pm.device());
     try bus.addPio(reset.device());
     try bus.addPio(fw.device());
+    try bus.addMmio(ioapic.mmioDevice()); // userspace IOAPIC at 0xFEC00000
     try bus.addMmio(pci_host.mmioDevice()); // PCIe ECAM
 
     // virtio-blk: present /dev/vda if a disk.img is available. The device is PCI
@@ -120,7 +124,7 @@ pub fn main() !void {
         try vcpu.setRealModeEntry(CODE_LOAD_ADDR);
     }
 
-    const reason = vcpu.run(&bus, &power) catch |err| {
+    const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };

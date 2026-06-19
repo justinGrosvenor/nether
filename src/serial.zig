@@ -7,11 +7,14 @@
 const std = @import("std");
 const linux = std.os.linux;
 const io = @import("io.zig");
+const ioapic = @import("ioapic.zig");
 
 pub const Serial = struct {
     out_fd: i32 = 1,
     in_fd: i32 = -1, // host fd polled for input; -1 = none. Must be non-blocking.
     rx: ?u8 = null, // byte read from in_fd, pending an RBR read
+    irq: ?*ioapic.IoApic = null, // raised on TX-empty/RX-ready when enabled
+    gsi: u8 = 4, // COM1 -> IRQ4
 
     ier: u8 = 0,
     lcr: u8 = 0,
@@ -38,6 +41,8 @@ pub const Serial = struct {
 
     const lcr_dlab = 0x80;
     const mcr_loop = 0x10;
+    const ier_rdi = 0x01; // received-data interrupt enable
+    const ier_thri = 0x02; // THR-empty interrupt enable
 
     pub fn device(self: *Serial) io.PioDevice {
         return .{ .ptr = self, .base = base, .len = span, .out_fn = onOut, .in_fn = onIn };
@@ -66,11 +71,14 @@ pub const Serial = struct {
                 self.dll = v;
             } else {
                 self.transmit(v);
+                if (self.ier & ier_thri != 0) self.raiseIrq(); // THR empty again
             },
             reg_ier => if (self.dlab()) {
                 self.dlm = v;
             } else {
                 self.ier = v & 0x0f;
+                if (self.ier & ier_thri != 0) self.raiseIrq(); // THR is always empty
+                if (self.ier & ier_rdi != 0 and self.rx != null) self.raiseIrq();
             },
             reg_iir_fcr => self.fifo_enabled = v & 0x01 != 0, // FCR
             reg_lcr => self.lcr = v,
@@ -86,7 +94,7 @@ pub const Serial = struct {
         return switch (p - base) {
             reg_data => if (self.dlab()) self.dll else self.receive(),
             reg_ier => if (self.dlab()) self.dlm else self.ier,
-            reg_iir_fcr => if (self.fifo_enabled) 0xc1 else 0x01, // no int pending; FIFO bits
+            reg_iir_fcr => self.iir(),
             reg_lcr => self.lcr,
             reg_mcr => self.mcr,
             reg_lsr => self.lsr(),
@@ -115,7 +123,23 @@ pub const Serial = struct {
         if (self.rx != null or self.mcr & mcr_loop != 0) return;
         var b: [1]u8 = undefined;
         const n = linux.read(self.in_fd, &b, 1);
-        if (linux.errno(n) == .SUCCESS and n == 1) self.rx = b[0];
+        if (linux.errno(n) == .SUCCESS and n == 1) {
+            self.rx = b[0];
+            if (self.ier & ier_rdi != 0) self.raiseIrq();
+        }
+    }
+
+    fn raiseIrq(self: *Serial) void {
+        if (self.irq) |ia| ia.raise(self.gsi);
+    }
+
+    /// Interrupt identification: highest-priority pending source. Reading it is
+    /// how the guest's ISR learns whether to drain RX or refill TX.
+    fn iir(self: *Serial) u32 {
+        const fifo: u8 = if (self.fifo_enabled) 0xc0 else 0x00;
+        if (self.rx != null and self.ier & ier_rdi != 0) return fifo | 0x04; // RX data
+        if (self.ier & ier_thri != 0) return fifo | 0x02; // THR empty
+        return fifo | 0x01; // none pending
     }
 
     fn lsr(self: *Serial) u8 {

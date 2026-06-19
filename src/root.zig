@@ -24,6 +24,7 @@ pub const pvh = @import("pvh.zig");
 
 pub const pci = @import("pci.zig");
 pub const PciHost = pci.Host;
+pub const IoApic = @import("ioapic.zig").IoApic;
 
 pub const trace = @import("trace.zig");
 pub const virtq = @import("virtq.zig");

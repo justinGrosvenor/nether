@@ -9,6 +9,7 @@ const kvm = @import("kvm.zig");
 const io = @import("io.zig");
 const pwr = @import("power.zig");
 const irqchip = @import("irqchip.zig");
+const ioapic = @import("ioapic.zig");
 
 const PROT_RW: linux.PROT = .{ .READ = true, .WRITE = true };
 const max_regions = 8;
@@ -248,7 +249,7 @@ pub const Vcpu = struct {
     /// Enter the guest repeatedly, dispatching I/O exits to `bus`, until the
     /// guest halts or a device requests a power transition via `power`.
     /// Unhandled exits are surfaced as errors.
-    pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power) !StopReason {
+    pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power, apic: ?*ioapic.IoApic) !StopReason {
         while (true) {
             _ = try kvm.ioctl(self.fd, kvm.RUN, 0);
             switch (self.run_page.exit_reason) {
@@ -259,7 +260,7 @@ pub const Vcpu = struct {
                 },
                 kvm.EXIT_IO => self.dispatchIo(bus),
                 kvm.EXIT_MMIO => self.dispatchMmio(bus),
-                kvm.EXIT_IOAPIC_EOI => {}, // userspace IOAPIC not yet implemented
+                kvm.EXIT_IOAPIC_EOI => if (apic) |a| a.eoi(self.run_page.exit.eoi.vector),
                 kvm.EXIT_FAIL_ENTRY => return error.FailEntry,
                 kvm.EXIT_INTERNAL_ERROR => return error.InternalError,
                 else => {
