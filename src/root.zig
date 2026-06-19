@@ -26,6 +26,8 @@ pub const pci = @import("pci.zig");
 pub const PciHost = pci.Host;
 
 pub const virtq = @import("virtq.zig");
+pub const virtio = @import("virtio.zig");
+pub const VirtioRng = @import("virtio_rng.zig").Rng;
 
 const power = @import("power.zig");
 pub const Power = power.Power;
