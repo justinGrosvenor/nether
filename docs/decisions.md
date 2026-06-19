@@ -50,7 +50,7 @@ burden doesn't cover them.
 
 ## D3 - Config-plane concurrency
 
-**Status:** open · **Recommendation:** per-device lock, shard later if needed
+**Status:** RESOLVED → per-device lock, shard later if needed
 
 vCPU threads service MMIO/PIO exits that *write device state* (PCI config, MSI-X
 tables, virtio config registers) while the I/O thread processes virtqueues
@@ -58,10 +58,23 @@ against the same state. That's shared mutable state across threads - QEMU's
 big-lock problem in miniature. The zero-alloc datapath claim is about the queue
 ring, not this.
 
-Decide the discipline before the second device exists: a per-device lock taken on
-config access and on queue processing is the simplest correct option; a coarse
-machine lock is easier still but a known scaling ceiling. Either way, name it and
-hold the line - retrofitting locking onto a racy device model is misery.
+Decided: a **per-device lock** taken on config access and on queue processing. A
+coarse machine lock is easier still but a known scaling ceiling. The discipline
+is named, so it gets held as devices are added rather than retrofitted onto a
+racy model.
+
+First instances landed with the interactive-stdin I/O thread. The host stdin
+thread feeds `Serial.pushRx` while the vCPU thread services serial register
+exits, and the IOAPIC redirection table is read on `raise()` from both threads
+while the guest programs it from the vCPU thread. Each device carries its own
+`Lock` (`src/lock.zig`, a spin lock over `std.atomic.Mutex`, since the critical
+sections are a few field writes). The rules that keep it correct, to be repeated
+for every future device:
+
+- **One lock order, globally:** serial -> ioapic. A device raising an IRQ
+  releases its own lock first, then calls into the IOAPIC.
+- **No lock held across a blocking or slow syscall:** the serial TX `write`, the
+  IRQ `signalMsi`, and the raise itself all happen after the relevant unlock.
 
 ## D4 - virtio-gpu scope
 

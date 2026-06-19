@@ -65,12 +65,8 @@ pub fn main() !void {
     var power = nether.Power{};
     var serial = nether.Serial{};
     serial.irq = &ioapic;
-    // Route host stdin to the serial RX. Non-blocking so the vCPU never stalls
-    // polling it; the guest's serial driver picks bytes up via its poll timer.
-    const nonblock = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
-    const fl = linux.fcntl(0, linux.F.GETFL, 0);
-    _ = linux.fcntl(0, linux.F.SETFL, fl | @as(usize, nonblock));
-    serial.in_fd = 0;
+    // Host stdin is driven into the serial RX by a dedicated I/O thread (set up
+    // below, once we know a kernel is booting), not polled on the vCPU thread.
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
     var reset = nether.Reset{ .power = &power };
@@ -124,6 +120,23 @@ pub fn main() !void {
         try vcpu.setRealModeEntry(CODE_LOAD_ADDR);
     }
 
+    // Interactive console: put the host terminal in raw mode (so each keystroke
+    // reaches the guest, which does its own echo and line editing) and run a
+    // dedicated I/O thread that blocks on stdin and feeds the serial RX. Only for
+    // a real kernel; the demo blob never reads input. Both are best-effort: a
+    // non-tty stdin (pipe) just skips raw mode, and a spawn failure degrades to
+    // an output-only console.
+    var saved_termios: ?linux.termios = null;
+    if (kernel != null) {
+        saved_termios = enableRawMode(0);
+        if (std.Thread.spawn(.{}, stdinPump, .{&serial})) |t| {
+            t.detach(); // blocked on read; reclaimed at process exit
+        } else |err| {
+            std.debug.print("[nether] stdin thread failed: {s}; console is output-only\n", .{@errorName(err)});
+        }
+    }
+    defer if (saved_termios) |s| restoreTermios(0, s);
+
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
@@ -139,6 +152,52 @@ const MsiSink = struct {
         nether.irqchip.signalMsi(self.vm_fd, addr, data) catch {};
     }
 };
+
+/// I/O thread body: block on host stdin and push every chunk into the serial
+/// RX FIFO, which raises IRQ4 so an idle guest wakes to read it. Exits on EOF or
+/// a hard read error; the process owns the lifetime (it is detached).
+fn stdinPump(serial: *nether.Serial) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = linux.read(0, &buf, buf.len);
+        switch (linux.errno(n)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => continue,
+            else => return,
+        }
+        if (n == 0) return; // EOF
+        serial.pushRx(buf[0..n]);
+    }
+}
+
+/// Put `fd` into raw mode (no canonical line editing, no host echo, signals
+/// passed through to the guest) and return the prior settings to restore on
+/// exit. Returns null when `fd` is not a tty (a pipe/file), leaving it untouched.
+fn enableRawMode(fd: i32) ?linux.termios {
+    var t: linux.termios = undefined;
+    if (linux.errno(linux.ioctl(fd, linux.T.CGETS, @intFromPtr(&t))) != .SUCCESS) return null;
+    const saved = t;
+    t.lflag.ICANON = false; // byte-at-a-time, no line buffering
+    t.lflag.ECHO = false; // the guest echoes, not the host
+    t.lflag.ISIG = false; // Ctrl-C/Z reach the guest shell
+    t.lflag.IEXTEN = false;
+    t.iflag.IXON = false; // Ctrl-S/Q reach the guest
+    t.iflag.ICRNL = false; // deliver CR as CR, let the guest map it
+    t.iflag.BRKINT = false;
+    t.iflag.INPCK = false;
+    t.iflag.ISTRIP = false;
+    // Output flags (oflag) are left alone: stdout shares this tty, and the guest
+    // console relies on ONLCR to turn its '\n' into CRLF.
+    t.cc[@intFromEnum(linux.V.MIN)] = 1; // read returns after >= 1 byte
+    t.cc[@intFromEnum(linux.V.TIME)] = 0;
+    _ = linux.ioctl(fd, linux.T.CSETS, @intFromPtr(&t));
+    return saved;
+}
+
+fn restoreTermios(fd: i32, saved: linux.termios) void {
+    var s = saved;
+    _ = linux.ioctl(fd, linux.T.CSETS, @intFromPtr(&s));
+}
 
 /// mmap a file read/write and shared, so guest writes reach the backing image.
 fn mapFile(path: [*:0]const u8) ?[]u8 {

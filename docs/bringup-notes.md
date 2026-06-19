@@ -77,13 +77,30 @@ Almost every item here cost a live debug cycle to find. Keep this current.
     console worked (IOAPIC), reads AND writes worked end to end (guest write
     lands on the mmap'd host disk image).
 
-## Still open
+## Resolved: continuous stdin (I/O thread + per-device lock)
 
-- **Continuous stdin.** RX delivery works (input is received and echoed), but we
-  poll host stdin only on serial register access, so an idle shell stops getting
-  bytes mid-input. Fix: an independent stdin poll — an I/O thread (epoll on
-  stdin + signalMsi for RX) or a timer-driven `KVM_RUN` break (catch EINTR, poll,
-  re-enter). I/O thread introduces vCPU-vs-IO concurrency on device state (D3).
+The old design polled host stdin only on a serial register access, so an idle
+shell stopped getting bytes mid-input. Fixed with a dedicated **I/O thread**
+(`stdinPump` in main.zig) that blocks on stdin and calls `Serial.pushRx`, which
+enqueues into an RX FIFO and raises IRQ4 via the IOAPIC -> `signalMsi`. The
+in-kernel LAPIC wakes the (possibly HLT-blocked) vCPU, so input flows even when
+the guest is idle. Notes:
+
+- `KVM_SIGNAL_MSI` is a vm-fd ioctl and is designed to be called from a thread
+  other than the one in `KVM_RUN`; that is how async interrupts get injected.
+- This is the first real instance of the **D3 per-device lock**. Two devices are
+  now touched from two threads: serial (RX ring) and the IOAPIC (redir table read
+  on raise). Each got a lock. **Lock order is serial -> ioapic**, enforced by
+  raising the IRQ only after releasing the serial lock, and by reading the redir
+  entry under the ioapic lock then releasing it before the `signalMsi` syscall.
+  No lock is ever held across a blocking/slow syscall (the serial TX `write` and
+  the IRQ raise both happen after the serial unlock).
+- Host terminal goes into **raw mode** (termios: clear ICANON/ECHO/ISIG/IEXTEN,
+  IXON/ICRNL; VMIN=1/VTIME=0) so each keystroke reaches the guest and the guest
+  does its own echo. `oflag` is left alone (stdout shares the tty and relies on
+  ONLCR). Restored on exit via `defer`. With ISIG off, Ctrl-C reaches the guest;
+  exit nether by powering off the guest. A SIGKILL leaves the tty raw (`reset`).
+- The thread is detached and reclaimed at process exit (it is blocked in `read`).
 
 ## Methodology that worked
 
@@ -117,6 +134,18 @@ Almost every item here cost a live debug cycle to find. Keep this current.
   `DEVELOPER_DIR=/Library/Developer/CommandLineTools` when xcode-select points
   into Xcode.app. Cross-compile is unaffected. `zig` itself was at
   `/etc/paths.d/zig` (root-owned).
+- **Pin the stable toolchain.** This code targets **0.16.0 stable**
+  (`~/Library/zig/0.16.0/zig`), but several dev nightlies are also installed and
+  `/etc/paths.d/zig` points `zig` at one of them. The APIs diverge in *both*
+  directions, so a wrong toolchain fails to build:
+  - stable: `std.os.linux.PROT` is a **packed struct** (`.{ .READ = true }`);
+    nightly 2135 made it a **namespace of bit constants** (`PROT.READ`).
+  - stable: there is **no `std.Thread.Mutex`** (it moved); only
+    `std.atomic.Mutex` (a `tryLock`-only spinlock primitive) and `std.Io.Mutex`
+    (needs an `Io`). nightly 2135 still has `std.Thread.Mutex`.
+  We use a tiny spin `Lock` (`src/lock.zig`) over `std.atomic.Mutex` so the
+  freestanding device models need neither. Build/test with the stable path
+  explicitly until `/etc/paths.d/zig` is repointed at `~/Library/zig/0.16.0`.
 
 ## AWS box workflow
 

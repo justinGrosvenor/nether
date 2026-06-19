@@ -10,6 +10,7 @@ const io = @import("io.zig");
 const memmap = @import("memmap.zig");
 const irqchip = @import("irqchip.zig");
 const trace = @import("trace.zig");
+const Lock = @import("lock.zig").Lock;
 
 pub const num_gsi = 24;
 
@@ -18,6 +19,11 @@ pub const IoApic = struct {
     ioregsel: u8 = 0,
     id: u32 = 0,
     redir: [num_gsi]u64 = [_]u64{mask_bit} ** num_gsi, // masked until the guest programs them
+    // The register file is written by the vCPU thread (guest MMIO) while devices
+    // assert GSIs from both the vCPU thread (TX) and the host I/O thread (serial
+    // RX), so the table is under `mutex` (the D3 per-device lock). Lock order is
+    // always serial -> ioapic; raise() releases the lock before the MSI syscall.
+    mutex: Lock = .{},
 
     pub const base = memmap.ioapic_base;
     const span = 0x20; // IOREGSEL at 0x00, IOWIN at 0x10
@@ -33,6 +39,8 @@ pub const IoApic = struct {
 
     fn onRead(ptr: *anyopaque, offset: u64, data: []u8) void {
         const self: *IoApic = @ptrCast(@alignCast(ptr));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const v: u32 = switch (offset) {
             0x00 => self.ioregsel,
             0x10 => self.readReg(self.ioregsel),
@@ -43,6 +51,8 @@ pub const IoApic = struct {
 
     fn onWrite(ptr: *anyopaque, offset: u64, data: []const u8) void {
         const self: *IoApic = @ptrCast(@alignCast(ptr));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         switch (offset) {
             0x00 => self.ioregsel = @truncate(getLE(data)),
             0x10 => self.writeReg(self.ioregsel, getLE(data)),
@@ -90,7 +100,9 @@ pub const IoApic = struct {
     /// inject it (no-op if masked).
     pub fn raise(self: *IoApic, gsi: u8) void {
         if (gsi >= num_gsi) return;
+        self.mutex.lock();
         const e = self.redir[gsi];
+        self.mutex.unlock();
         if (e & mask_bit != 0) return;
         const m = redirToMsi(e);
         trace.log("ioapic raise gsi={d} -> addr=0x{x} data=0x{x}", .{ gsi, m.addr, m.data });
@@ -99,6 +111,8 @@ pub const IoApic = struct {
 
     /// LAPIC EOI for a level-triggered vector routed here: clear remote IRR.
     pub fn eoi(self: *IoApic, vector: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (&self.redir) |*e| {
             if (e.* & 0xff == vector and (e.* >> 15) & 1 == 1) {
                 e.* &= ~(@as(u64, 1) << 14); // clear remote IRR

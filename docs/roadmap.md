@@ -1,13 +1,16 @@
 # Nether - Roadmap
 
 **Status (verified on a bare-metal KVM host):** the substrate runs live, Nether
-**PVH-boots Linux 6.12 to userspace**, and **virtio-blk reads work end to end** (the
-guest enumerates the device over the ACPI PCIe host bridge, claims its BAR, and
-the kernel reads `/dev/vda` with MSI-X completions). Built and awaiting live
-verification: the userspace IOAPIC (serial IRQ4, to unstall the tty console).
-Open: virtio-blk writes are not submitted by the guest (debug once the console is
-interactive), and interactive serial stdin. See [decisions.md](decisions.md) D8
-for the PVH gotchas and D6 for the irqchip/IOAPIC.
+**PVH-boots Linux 6.12 to an interactive shell**, the userspace IOAPIC routes
+serial IRQ4 (console no longer stalls at 16 bytes), and **virtio-blk reads and
+writes work end to end** (the guest enumerates the device over the ACPI PCIe host
+bridge, claims its BAR, and the kernel reads/writes `/dev/vda` with MSI-X
+completions, writes landing on the host image). Built and unit-tested offline,
+awaiting live verification: **continuous interactive stdin** via a host I/O
+thread that feeds the serial RX and raises IRQ4 so an idle shell still receives
+input (the first concrete [D3](decisions.md) per-device-lock instance). See
+[decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the irqchip/IOAPIC,
+and D3 for the concurrency model.
 
 Re-cut from the original six-phase plan. Two changes from the first draft:
 
