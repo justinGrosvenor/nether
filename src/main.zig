@@ -81,7 +81,24 @@ pub fn main() !void {
     try bus.addPio(pm.device());
     try bus.addPio(reset.device());
     try bus.addPio(fw.device());
-    try bus.addMmio(pci_host.mmioDevice()); // PCIe ECAM (empty bus 0 for now)
+    try bus.addMmio(pci_host.mmioDevice()); // PCIe ECAM
+
+    // virtio-blk: present /dev/vda if a disk.img is available. The device is PCI
+    // function 0:1.0 with its BAR pre-assigned in the pci-mmio32 window (the
+    // guest claims it via the ACPI _CRS), and completions delivered by MSI-X.
+    var blk: nether.VirtioBlk = undefined;
+    var blk_dev: nether.virtio.Device = undefined;
+    var msi_sink = MsiSink{ .vm_fd = vm.vm_fd };
+    if (mapFile("disk.img")) |disk| {
+        blk = .{ .disk = disk };
+        blk_dev = nether.virtio.Device.init(blk.backend(), .{ .bytes = low, .base = layout.ram_low.base });
+        blk_dev.assignBar(nether.memmap.pci_mmio32_base);
+        blk_dev.msi_ptr = &msi_sink;
+        blk_dev.msi_fn = MsiSink.send;
+        try pci_host.addFunction(blk_dev.function(1, 0));
+        try bus.addMmio(blk_dev.mmio());
+        std.debug.print("[nether] virtio-blk: disk.img {d} bytes, BAR 0x{x}\n", .{ disk.len, blk_dev.barBase() });
+    }
 
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
@@ -108,6 +125,30 @@ pub fn main() !void {
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// Delivers a virtio MSI-X completion by injecting it through KVM.
+const MsiSink = struct {
+    vm_fd: i32,
+    fn send(ptr: *anyopaque, addr: u64, data: u32) void {
+        const self: *MsiSink = @ptrCast(@alignCast(ptr));
+        nether.irqchip.signalMsi(self.vm_fd, addr, data) catch {};
+    }
+};
+
+/// mmap a file read/write and shared, so guest writes reach the backing image.
+fn mapFile(path: [*:0]const u8) ?[]u8 {
+    const fd_u = linux.open(path, .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(fd_u) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_u);
+    defer _ = linux.close(fd);
+    const size_r = linux.lseek(fd, 0, linux.SEEK.END);
+    if (linux.errno(size_r) != .SUCCESS or size_r == 0) return null;
+    const size: usize = @intCast(size_r);
+    const addr = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+    if (linux.errno(addr) != .SUCCESS) return null;
+    const ptr: [*]u8 = @ptrFromInt(addr);
+    return ptr[0..size];
 }
 
 /// Read an entire file via raw linux syscalls (avoids the std.Io/args churn).
