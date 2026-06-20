@@ -227,9 +227,11 @@ The build-out arc (offline-first chunks):
    vCPUs), placed clear of the UART/RAM, and its base is queried from the
    framework and written into the DTB. Trapped system-register accesses (EC 0x18)
    are emulated RAZ/WI. The kernel reaches `Run /init`, runs Alpine init, and
-   drops to the initramfs recovery shell (it only lacks Alpine boot media).
-   Remaining polish: wire host stdin -> PL011 RX for interactivity, and a proper
-   rootfs/initramfs; then virtio on aarch64 (step 5).
+   drops to the initramfs recovery shell (it only lacks Alpine boot media). The
+   shell is **interactive**: host stdin feeds the PL011 RX, which raises its SPI
+   through the GIC (`hv_gic_set_spi`) so the guest tty reads it - typing a command
+   runs it and prints back. Remaining polish: a proper rootfs/initramfs; then
+   virtio on aarch64 (step 5).
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
    net/vsock/rng light up on the new arch.
 

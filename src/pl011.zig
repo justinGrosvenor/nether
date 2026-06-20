@@ -23,9 +23,20 @@ pub const Pl011 = struct {
     out_ctx: ?*anyopaque = null,
     out_fn: ?*const fn (ctx: *anyopaque, byte: u8) void = null,
 
+    // Interrupt line to the GIC (level: asserted while a masked source is
+    // pending). The host raises/lowers an SPI through this; null = no interrupts.
+    imsc: u32 = 0, // interrupt mask (IMSC)
+    irq_level: bool = false, // last level we reported
+    irq_ctx: ?*anyopaque = null,
+    irq_fn: ?*const fn (ctx: *anyopaque, level: bool) void = null,
+
     // Register offsets.
     const DR = 0x000; // data
     const FR = 0x018; // flag
+    const IMSC = 0x038; // interrupt mask set/clear
+    const RIS = 0x03C; // raw interrupt status
+    const MIS = 0x040; // masked interrupt status
+    const ICR = 0x044; // interrupt clear
     const PERIPH_ID0 = 0xFE0; // AMBA PrimeCell id (4 bytes) ...
     const PCELL_ID0 = 0xFF0; // ... then the PrimeCell id (4 bytes)
 
@@ -33,6 +44,10 @@ pub const Pl011 = struct {
     const FR_RXFE = 1 << 4; // RX FIFO empty
     const FR_TXFF = 1 << 5; // TX FIFO full
     const FR_TXFE = 1 << 7; // TX FIFO empty
+
+    // Interrupt bits (RX and receive-timeout share the RX-data condition here).
+    const INT_RX = 1 << 4; // RXRIS / RXIM
+    const INT_RT = 1 << 6; // RTRIS / RTIM
 
     // AMBA ids: peripheral 0x00041011, PrimeCell 0xB105F00D, one byte per word.
     const periph_id = [4]u8{ 0x11, 0x10, 0x14, 0x00 };
@@ -44,11 +59,21 @@ pub const Pl011 = struct {
 
     fn writeThunk(ptr: *anyopaque, offset: u64, data: []const u8) void {
         const self: *Pl011 = @ptrCast(@alignCast(ptr));
-        if (offset == DR and data.len > 0) {
-            if (self.out_fn) |f| f(self.out_ctx.?, data[0]);
+        switch (offset) {
+            DR => if (data.len > 0) {
+                if (self.out_fn) |f| f(self.out_ctx.?, data[0]);
+            },
+            IMSC => {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.imsc = leValue(data);
+                self.refreshIrqLocked();
+            },
+            // ICR clears interrupts, but our RX source is level (follows the FIFO),
+            // so it re-asserts until the guest drains DR; nothing to do. Other
+            // control/baud registers are accepted and ignored.
+            else => {},
         }
-        // Control/baud/interrupt-mask registers are accepted and ignored; we run
-        // no real line discipline and (yet) no interrupts.
     }
 
     fn readThunk(ptr: *anyopaque, offset: u64, data: []const u8) void {
@@ -65,10 +90,29 @@ pub const Pl011 = struct {
         return switch (offset) {
             DR => self.popRx(),
             FR => self.flags(),
+            IMSC => self.imsc,
+            RIS => self.rawIrq(),
+            MIS => self.rawIrq() & self.imsc,
             PERIPH_ID0, PERIPH_ID0 + 4, PERIPH_ID0 + 8, PERIPH_ID0 + 12 => periph_id[(offset - PERIPH_ID0) / 4],
             PCELL_ID0, PCELL_ID0 + 4, PCELL_ID0 + 8, PCELL_ID0 + 12 => pcell_id[(offset - PCELL_ID0) / 4],
             else => 0,
         };
+    }
+
+    /// Raw interrupt status: RX and receive-timeout asserted while RX has data.
+    fn rawIrq(self: *Pl011) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.rx_head != self.rx_tail) (INT_RX | INT_RT) else 0;
+    }
+
+    /// Recompute the interrupt line and notify the GIC on a change. Lock held.
+    fn refreshIrqLocked(self: *Pl011) void {
+        const pending = self.rx_head != self.rx_tail and (self.imsc & (INT_RX | INT_RT)) != 0;
+        if (pending != self.irq_level) {
+            self.irq_level = pending;
+            if (self.irq_fn) |f| f(self.irq_ctx.?, pending);
+        }
     }
 
     fn flags(self: *Pl011) u32 {
@@ -85,11 +129,13 @@ pub const Pl011 = struct {
         if (self.rx_head == self.rx_tail) return 0;
         const b = self.rx_buf[self.rx_head % self.rx_buf.len];
         self.rx_head += 1;
+        self.refreshIrqLocked(); // line drops once the FIFO drains
         return b;
     }
 
-    /// Queue host input for the guest to read from DR. Safe to call from another
-    /// thread (the RX ring is lock-guarded). Drops bytes when the ring is full.
+    /// Queue host input for the guest to read from DR, raising the RX interrupt.
+    /// Safe to call from another thread (the RX ring is lock-guarded). Drops
+    /// bytes when the ring is full.
     pub fn pushRx(self: *Pl011, bytes: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -98,8 +144,17 @@ pub const Pl011 = struct {
             self.rx_buf[self.rx_tail % self.rx_buf.len] = b;
             self.rx_tail += 1;
         }
+        self.refreshIrqLocked();
     }
 };
+
+fn leValue(data: []const u8) u32 {
+    var v: u32 = 0;
+    for (data, 0..) |b, i| {
+        if (i < 4) v |= @as(u32, b) << @intCast(i * 8);
+    }
+    return v;
+}
 
 // --- tests -----------------------------------------------------------------
 
@@ -159,4 +214,37 @@ test "AMBA PrimeCell ids match the pl011 driver's expected peripheral id" {
     }
     // Linux matches amba_id 0x00041011 under mask 0x000fffff (revision masked).
     try std.testing.expectEqual(@as(u32, 0x00041011), pid & 0x000fffff);
+}
+
+test "RX interrupt asserts when masked-in and clears when the FIFO drains" {
+    const Irq = struct {
+        level: bool = false,
+        edges: u32 = 0,
+        fn set(ctx: *anyopaque, level: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.level = level;
+            self.edges += 1;
+        }
+    };
+    var irq = Irq{};
+    var uart = Pl011{ .irq_ctx = &irq, .irq_fn = Irq.set };
+    const dev = uart.device(0x0900_0000);
+
+    // Data arrives but RX interrupt not yet unmasked: line stays low.
+    uart.pushRx("a");
+    try std.testing.expect(!irq.level);
+
+    // Driver unmasks RX (IMSC.RXIM): with data already pending, the line asserts.
+    dev.write_fn(dev.ptr, 0x038, &[_]u8{ 0x10, 0, 0, 0 });
+    try std.testing.expect(irq.level);
+    // MIS reflects the masked RX source.
+    var mis = [_]u8{ 0, 0, 0, 0 };
+    dev.read_fn(dev.ptr, 0x040, &mis);
+    try std.testing.expect(mis[0] & 0x10 != 0);
+
+    // Guest drains DR -> FIFO empty -> line clears.
+    var dr = [_]u8{0};
+    dev.read_fn(dev.ptr, 0x000, &dr);
+    try std.testing.expectEqual(@as(u8, 'a'), dr[0]);
+    try std.testing.expect(!irq.level);
 }

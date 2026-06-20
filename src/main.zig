@@ -542,10 +542,22 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var uart = nether.Pl011{};
     uart.out_fn = uartOut;
     uart.out_ctx = &uart;
+    uart.irq_fn = armUartIrq; // RX data raises the PL011 SPI through the GIC
+    uart.irq_ctx = &uart;
     var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
+
+    // Interactive console: raw-mode host tty (keystrokes pass straight through;
+    // the guest echoes) plus a thread that feeds host stdin into the PL011 RX.
+    const saved_termios = armEnableRawMode();
+    defer if (saved_termios) |s| armRestoreTermios(s);
+    if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| {
+        t.detach();
+    } else |err| {
+        std.debug.print("[nether] stdin thread failed: {s}; console is output-only\n", .{@errorName(err)});
+    }
 
     std.debug.print("[nether] booting arm64 Image: kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.run(&bus, &power) catch |err| {
@@ -621,6 +633,52 @@ fn uartOut(ctx: *anyopaque, byte: u8) void {
     _ = ctx;
     const b = [1]u8{byte};
     _ = std.c.write(1, &b, 1);
+}
+
+/// The PL011's SPI interrupt id: SPIs start at GIC INTID 32, and the DTB places
+/// the UART at SPI `uart_spi`.
+const ARM_UART_INTID: u32 = 32 + nether.memmap_arm.uart_spi;
+
+/// PL011 interrupt line -> GIC SPI (level). Called from both the vCPU thread
+/// (on DR drain) and the stdin thread (on RX); hv_gic_set_spi is global.
+fn armUartIrq(ctx: *anyopaque, level: bool) void {
+    _ = ctx;
+    const hvf = @import("hvf.zig");
+    _ = hvf.hv_gic_set_spi(ARM_UART_INTID, level);
+}
+
+/// I/O thread: block on host stdin and push each chunk into the PL011 RX, which
+/// raises the UART interrupt so the guest's tty driver reads it.
+fn armStdinPump(uart: *nether.Pl011) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = libc.read(0, &buf, buf.len);
+        if (n <= 0) return; // EOF or error
+        uart.pushRx(buf[0..@intCast(n)]);
+    }
+}
+
+/// Put the host tty in raw mode so keystrokes reach the guest unbuffered and
+/// unechoed (the guest echoes). Returns the prior settings, or null for a
+/// non-tty stdin (a pipe), which is left untouched.
+fn armEnableRawMode() ?std.posix.termios {
+    var t = std.posix.tcgetattr(0) catch return null;
+    const saved = t;
+    t.lflag.ICANON = false; // byte-at-a-time
+    t.lflag.ECHO = false; // the guest echoes, not the host
+    t.lflag.ISIG = false; // Ctrl-C/Z reach the guest
+    t.lflag.IEXTEN = false;
+    t.iflag.IXON = false; // Ctrl-S/Q reach the guest
+    t.iflag.ICRNL = false; // deliver CR as CR
+    t.iflag.BRKINT = false;
+    t.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    t.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(0, .NOW, t) catch {};
+    return saved;
+}
+
+fn armRestoreTermios(saved: std.posix.termios) void {
+    std.posix.tcsetattr(0, .NOW, saved) catch {};
 }
 
 // aarch64 instruction encoders (just what the blob needs).
