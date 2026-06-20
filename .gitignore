@@ -4,3 +4,7 @@ zig-out/
 .venv/
 .idea/
 kernels/
+nether-trace
+nether-web
+nether-vsock
+nether-net
