@@ -62,6 +62,7 @@ pub const FwCfg = @import("fw_cfg.zig").FwCfg;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
     // Pull in the vendored VT files so their tests run too.
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");

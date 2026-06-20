@@ -192,3 +192,39 @@ What the minimal platform got right: our static ACPI parsed, the ACPI PM timer
 carried TSC calibration (the kernel's PIT calibration fails and falls back to
 PMTIMER, so no i8254 is needed for boot), and the absent userspace IOAPIC is
 handled gracefully ("I/O APIC ... registers return all ones, skipping").
+
+## D9 - Hypervisor backend seam (KVM + Apple HVF)
+
+**Status:** RESOLVED -> comptime backend selected by host OS
+
+The dev host is Apple Silicon, where Linux/KVM cannot run (no nested x86 virt,
+and HVF only virtualizes the host arch). Rather than tether all live work to a
+remote x86 box, Nether grows a second hypervisor backend: Apple
+Hypervisor.framework, which makes the Mac a first-class live host - for aarch64
+guests. That pulls the deferred aarch64 platform forward (justified: Graviton/ARM
+servers make it a real production target), so the project becomes multi-arch,
+multi-hypervisor.
+
+Decided: a **hard compile-time seam**, not a runtime vtable - the backend follows
+the host OS, which also fixes the guest arch, and the two are never mixed in one
+binary. `vm.zig` is the hypervisor-agnostic wrapper (guest-RAM region table +
+memory accessors, the parts that are pure host-slice work); everything
+hypervisor-specific (region mapping, IRQ controller setup, vCPU create, the run
+loop, boot entry) is a backend module. `backend.zig` selects `kvm_backend.zig` on
+Linux and `hvf_backend.zig` on macOS via `builtin.os.tag`; shared leaf types
+(`StopReason`, `Error`, LE marshalling) live in `hvtypes.zig` to avoid an import
+cycle. This matches the embeddable-core thesis (a compile-time seam, not a
+convention) and the ghostty apprt comptime-swap pattern in
+[references/ghostty-patterns.md](references/ghostty-patterns.md) (1).
+
+Consequences and rules going forward:
+- The shared `Vm` exposes the backend handle as `vm.hv` so x86-only host code
+  (IOAPIC, MSI) can reach the KVM `vm_fd`; aarch64 host wiring will reach its own
+  backend fields. Arch-specific modules (PVH loader, IOAPIC) stay compiled but
+  unused on the other backend; HVF keeps inert x86 boot-entry stubs so the shared
+  `Vcpu` type and the PVH loader compile on macOS.
+- KVM stays the reference backend (the one with a live-verified boot). HVF lands
+  as a compiling scaffold first (every op returns Unimplemented), then fills in
+  over the aarch64 arc in [roadmap.md](roadmap.md). Both targets must stay green:
+  `zig build test` (native macOS, HVF path) and `zig build -Dtarget=x86_64-linux`
+  (KVM path + binary).

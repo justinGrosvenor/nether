@@ -79,8 +79,12 @@ Nether lives. Phase 0: real-mode guest over COM1.
 ```
 build.zig          cross-compiles x86_64-linux; tests build for the host
 src/root.zig       library root the host (swerver) consumes
+src/vm.zig         Vm + Vcpu: hypervisor-agnostic wrapper (memory + region table)
+src/backend.zig    comptime hypervisor backend select (KVM on Linux, HVF on macOS)
+src/hvtypes.zig    backend-agnostic shared types (StopReason, Error, LE helpers)
+src/kvm_backend.zig KVM backend: KVM_RUN loop, x86 exit dispatch, boot entry
+src/hvf_backend.zig HVF backend: Apple Hypervisor.framework, aarch64 (scaffold)
 src/kvm.zig        hand-rolled KVM ABI: ioctl numbers, structs, wrapper
-src/vm.zig         Vm + Vcpu: memory, KVM_RUN loop, I/O dispatch, boot entry
 src/io.zig         Bus: port + MMIO device dispatch spine
 src/memmap.zig     guest physical memory map (single source of truth)
 src/irqchip.zig    split irqchip: irqfd, ioeventfd, MSI injection

@@ -181,7 +181,33 @@ done-line.
   [decisions.md D3](decisions.md)) - one swerver worker owns one guest's device
   state, containing the vCPU/I-O race.
 
-## aarch64 (later)
+## aarch64 + Apple HVF (active)
 
-GIC instead of APIC, device tree or ACPI, no fw_cfg. zvm proves the PCI path.
-Deferred until x86-64 is solid.
+Promoted from "later": the dev host is Apple Silicon, where Hypervisor.framework
+runs aarch64 guests, so an HVF backend turns the Mac itself into a live KVM-class
+host (no remote box) - and aarch64 is a real production target (Graviton, ARM
+servers), not throwaway. This is the deferred aarch64 platform pulled forward,
+done as a second hypervisor backend behind the seam.
+
+The build-out arc (offline-first chunks):
+
+1. **Backend seam (done).** `vm.zig` is now a hypervisor-agnostic wrapper (guest
+   memory + region table + accessors); the hypervisor work (region mapping, IRQ
+   setup, vCPU create, the run loop, boot entry) is a backend selected at
+   comptime by host OS - `kvm_backend.zig` (Linux/x86-64) and `hvf_backend.zig`
+   (macOS/aarch64), chosen in `backend.zig`. KVM is the full impl; HVF is a
+   compiling scaffold (every op returns Unimplemented) so the macOS build and the
+   offline test build are green today. See [decisions.md](decisions.md) D9.
+2. **HVF skeleton.** `hv_vm_create` + `hv_vm_map` (guest RAM), `hv_vcpu_create`/
+   run with data-abort (MMIO) decode, an aarch64 blob over a UART. First light on
+   the Mac (the first tooling step: native build, codesign with the
+   `com.apple.security.hypervisor` entitlement).
+3. **aarch64 substrate.** Memory map, the framework GIC (`hv_gic`, the in-kernel
+   LAPIC analog), PL011 UART, the ARM generic timer, PSCI for power.
+4. **aarch64 Linux boot.** Load `Image`, X0 = DTB, a minimal device-tree
+   generator (the DTB analog of the ACPI generator).
+5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
+   net/vsock/rng light up on the new arch.
+
+The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
+(a live networked boot) is independent of this track.

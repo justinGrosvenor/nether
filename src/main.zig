@@ -60,7 +60,7 @@ pub fn main() !void {
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
 
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
-    var ioapic = nether.IoApic{ .vm_fd = vm.vm_fd };
+    var ioapic = nether.IoApic{ .vm_fd = vm.hv.vm_fd };
 
     var power = nether.Power{};
     var serial = nether.Serial{};
@@ -96,7 +96,7 @@ pub fn main() !void {
     // guest claims it via the ACPI _CRS), and completions delivered by MSI-X.
     var blk: nether.VirtioBlk = undefined;
     var blk_dev: nether.virtio.Device = undefined;
-    var msi_sink = MsiSink{ .vm_fd = vm.vm_fd };
+    var msi_sink = MsiSink{ .vm_fd = vm.hv.vm_fd };
     if (mapFile("disk.img")) |disk| {
         blk = .{ .disk = disk };
         blk_dev = nether.virtio.Device.init(blk.backend(), .{ .bytes = low, .base = layout.ram_low.base });
