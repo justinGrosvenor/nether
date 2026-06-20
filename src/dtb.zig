@@ -166,9 +166,16 @@ fn lo(x: u64) u32 {
 /// GIC interrupt id relative to the SPI base, i.e. INTID = 32 + spi).
 pub const VirtioDev = struct { addr: u64, spi: u32 };
 
-/// A generic-ECAM PCIe host bridge: the config window and a 32-bit MMIO window
-/// for BARs (identity-mapped PCI<->CPU).
-pub const PcieConfig = struct { ecam_base: u64, ecam_size: u64, mmio_base: u64, mmio_size: u64 };
+/// A generic-ECAM PCIe host bridge: the config window plus a 32-bit and a 64-bit
+/// MMIO window for BARs (identity-mapped PCI<->CPU).
+pub const PcieConfig = struct {
+    ecam_base: u64,
+    ecam_size: u64,
+    mmio_base: u64,
+    mmio_size: u64,
+    mmio64_base: u64,
+    mmio64_size: u64,
+};
 
 pub const VirtConfig = struct {
     cmdline: []const u8,
@@ -244,6 +251,12 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.propString("compatible", "arm,gic-v3");
     b.propEmpty("interrupt-controller");
     b.propU32("#interrupt-cells", 3);
+    // #address-cells/#size-cells/ranges so a PCIe interrupt-map referencing this
+    // controller as its parent parses correctly (the parent's #address-cells
+    // sizes the address part of each map entry's parent specifier).
+    b.propU32("#address-cells", 2);
+    b.propU32("#size-cells", 2);
+    b.propEmpty("ranges");
     b.propCells("reg", &.{
         hi(arm.gicd_base), lo(arm.gicd_base), hi(cfg.gicd_size), lo(cfg.gicd_size),
         hi(cfg.gicr_base), lo(cfg.gicr_base), hi(cfg.gicr_size), lo(cfg.gicr_size),
@@ -283,17 +296,48 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         b.propU32("#address-cells", 3);
         b.propU32("#size-cells", 2);
         b.propU32("#interrupt-cells", 1);
+        b.propU32("linux,pci-domain", 0);
         b.propCells("reg", &.{ hi(p.ecam_base), lo(p.ecam_base), hi(p.ecam_size), lo(p.ecam_size) });
+        // ECAM is 1 MiB = exactly one bus, so the bus-range must be a single bus
+        // (pci_ecam_create sizes the config space as (bus_max+1) << 20).
         b.propCells("bus-range", &.{ 0, 0 });
-        // 32-bit non-prefetchable MMIO (PCI space code 0x02000000), the window
-        // QEMU's virt board uses for small BARs and the one pci-host-generic
-        // assigns into. PCI address identity-mapped to the CPU.
+        // Two MMIO windows, mirroring QEMU's virt board (both identity-mapped
+        // PCI<->CPU): a 32-bit non-prefetchable window (space 0x02000000; the
+        // host bridge requires one) and a 64-bit window (space 0x03000000) where
+        // the virtio 64-bit BAR is assigned.
         b.propCells("ranges", &.{
-            0x0200_0000, hi(p.mmio_base), lo(p.mmio_base), // PCI addr (space, hi, lo)
-            hi(p.mmio_base),              lo(p.mmio_base), // CPU addr
-            hi(p.mmio_size),              lo(p.mmio_size), // size
+            0x0200_0000, hi(p.mmio_base),   lo(p.mmio_base), // 32-bit: PCI addr
+            hi(p.mmio_base),                lo(p.mmio_base), // CPU addr
+            hi(p.mmio_size),                lo(p.mmio_size), // size
+            0x0300_0000, hi(p.mmio64_base), lo(p.mmio64_base), // 64-bit: PCI addr (matches QEMU virt)
+            hi(p.mmio64_base),              lo(p.mmio64_base), // CPU addr
+            hi(p.mmio64_size),              lo(p.mmio64_size), // size
         });
         b.propEmpty("dma-coherent");
+        // INTx routing: map each (slot, pin) to a GIC SPI (the standard arm64
+        // swizzle, base arm.pci_intx_spi). Without this the kernel can't complete
+        // PCI device setup, which leaves BAR resources unclaimed. The mask selects
+        // the two slot bits (0x1800) and the 3 pin bits (0x07).
+        b.propCells("interrupt-map-mask", &.{ 0x1800, 0, 0, 0x07 });
+        var imap: [4 * 4 * 10]u32 = undefined;
+        var n: usize = 0;
+        var slot: u32 = 0;
+        while (slot < 4) : (slot += 1) {
+            var pin: u32 = 1;
+            while (pin <= 4) : (pin += 1) {
+                const spi = arm.pci_intx_spi + ((slot + pin - 1) % 4);
+                const cells = [_]u32{
+                    slot << 11, 0, 0, // child unit address (slot in [15:11])
+                    pin, // child interrupt pin (INTA..INTD)
+                    GIC_PHANDLE, // interrupt parent
+                    0, 0, // parent address (GIC #address-cells = 2)
+                    0, spi, 0x04, // GIC: SPI, number, level-high
+                };
+                @memcpy(imap[n..][0..cells.len], &cells);
+                n += cells.len;
+            }
+        }
+        b.propCells("interrupt-map", imap[0..n]);
         b.endNode();
     }
 

@@ -543,6 +543,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             .ecam_size = nether.memmap_arm.ecam_size,
             .mmio_base = nether.memmap_arm.pci_mmio_base,
             .mmio_size = nether.memmap_arm.pci_mmio_size,
+            .mmio64_base = nether.memmap_arm.pci_mmio64_base,
+            .mmio64_size = nether.memmap_arm.pci_mmio64_size,
         },
     });
     @memcpy(ram[ARM_DTB_OFF..][0..dtb_len], dtb_buf[0..dtb_len]);
@@ -566,7 +568,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     var rng = nether.VirtioRng{};
     var rng_dev = nether.virtio.Device.init(rng.backend(), gmem);
-    rng_dev.assignBar(nether.memmap_arm.pci_mmio_base); // pre-assign; kernel claims
+    // Don't pre-assign: let the kernel place the 64-bit BAR in the 64-bit window
+    // (like QEMU). A window-wide dispatcher routes accesses to its live base.
     try pci_host.addFunction(rng_dev.function(1, 0)); // PCI 0:1.0
     var rng_bar = PciBarWindow{ .dev = &rng_dev };
     try bus.addMmio(rng_bar.device());
@@ -680,15 +683,15 @@ const PciBarWindow = struct {
     fn device(self: *PciBarWindow) nether.MmioDevice {
         return .{
             .ptr = self,
-            .base = nether.memmap_arm.pci_mmio_base,
-            .len = nether.memmap_arm.pci_mmio_size,
+            .base = nether.memmap_arm.pci_mmio64_base, // the 64-bit BAR window
+            .len = nether.memmap_arm.pci_mmio64_size,
             .read_fn = read,
             .write_fn = write,
         };
     }
     fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
         const self: *PciBarWindow = @ptrCast(@alignCast(ptr));
-        const addr = nether.memmap_arm.pci_mmio_base + offset;
+        const addr = nether.memmap_arm.pci_mmio64_base + offset;
         const bar = self.dev.barBase();
         if (bar != 0 and addr >= bar and addr - bar < nether.virtio.bar_size) {
             const v = self.dev.barRead(addr - bar, @intCast(data.len));
@@ -697,7 +700,7 @@ const PciBarWindow = struct {
     }
     fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
         const self: *PciBarWindow = @ptrCast(@alignCast(ptr));
-        const addr = nether.memmap_arm.pci_mmio_base + offset;
+        const addr = nether.memmap_arm.pci_mmio64_base + offset;
         const bar = self.dev.barBase();
         if (bar != 0 and addr >= bar and addr - bar < nether.virtio.bar_size) {
             var v: u32 = 0;

@@ -248,22 +248,27 @@ The build-out arc (offline-first chunks):
      BAR sized and detected. The virtio BAR was switched to 64-bit
      non-prefetchable (pci-host-generic requires a non-pref window; harmless on
      x86).
-   - **Blocker (precisely characterized).** The complete PCI boot log shows the
-     kernel size BAR0 and then go *straight* to "BAR 0 ...: not claimed; can't
-     enable device" - with **no assignment attempt, no conflict, and no
-     "no space" line in between**. So it is neither an address nor a flags issue:
-     the kernel detects the BAR but never inserts it into the resource tree
-     (`r->parent == NULL`), so `pci_enable_device` returns -EINVAL. Confirmed
-     orthogonal to: prefetchable vs non-prefetchable BAR, 32- vs 64-bit MMIO
-     window, pre-assigned vs kernel-assigned BAR, and `pci=realloc` (~10 combos
-     tried). QEMU's `-kernel` direct boot of the same kernel works, so the gap is
-     a property of QEMU's generated `pcie` node that ours lacks. **Next (not more
-     guessing):** dump a real QEMU virt DTB (`qemu-system-aarch64 -M
-     virt,dumpdtb=...`) and diff the pcie node against `dtb.zig`'s - needs
-     `qemu`/`dtc` installed (neither is on the box yet). Candidate missing
-     properties: `interrupt-map`/`interrupt-map-mask`, `msi-parent`/`msi-map`,
-     and the multi-entry `ranges` (I/O + 32-bit + 64-bit). Then MSI via the
-     framework GIC (v2m) or INTx via a GIC SPI.
+   - **DTB now QEMU-equivalent and `dtc`-clean.** Installed `qemu`/`dtc`, dumped a
+     real `-M virt` DTB, and diffed the `pcie` node against ours - which surfaced
+     and fixed several real bugs: the GIC node was missing `#address-cells`/
+     `#size-cells`/`ranges` (so an `interrupt-map` referencing it mis-parsed); the
+     `interrupt-map` entries lacked the 2 parent-address cells the GIC's
+     `#address-cells=2` requires; we had only one MMIO window where QEMU has both
+     a 32-bit non-prefetchable and a 64-bit window (both now emitted and
+     registered by the kernel as root-bus resources); and `bus-range` is now
+     consistent with the 1-bus ECAM. The blob validates clean under `dtc`.
+   - **Blocker (still open, narrowed to runtime).** Even with a QEMU-equivalent,
+     dtc-clean DTB - both windows registered, BAR sized correctly as 64-bit pref,
+     prefetch and space matched - the kernel **never runs BAR assignment**: it
+     goes straight from sizing BAR0 to "not claimed; can't enable device"
+     (`r->parent == NULL`, -EINVAL), whereas QEMU's kernel (same Image) prints
+     "BAR ... assigned". So the gap is no longer in the device tree; it is a
+     runtime difference in the PCI config-space access sequence or the kernel's
+     assign-vs-claim decision under Nether. **Next:** enable kernel PCI debug
+     (`CONFIG_PCI_DEBUG`/`dyndbg`) or trace-compare the config-space accesses
+     between a QEMU run and a Nether run (nether's `pci.zig` already logs cfg
+     rd/wr under the trace marker) to see why assignment is skipped. A focused
+     debugging session, not more DTB edits.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

@@ -35,12 +35,16 @@ pub const virtio_mmio_base: u64 = 0x0D00_0000;
 pub const virtio_mmio_stride: u64 = 0x200;
 pub const virtio_spi_base: u32 = 2; // SPI 0/1 reserved (1 = UART); virtio starts at 2
 
-/// PCIe (virtio-pci): ECAM config window (1 bus) and a 32-bit MMIO window for
-/// BARs, both below RAM. INTx legacy interrupt lands on a dedicated SPI.
+/// PCIe (virtio-pci): ECAM config window (1 bus) plus two BAR windows, matching
+/// QEMU's virt board - a 32-bit non-prefetchable window (the host bridge requires
+/// one) below RAM, and a 64-bit window high in IPA space where 64-bit BARs land.
+/// INTx legacy interrupt lands on a dedicated SPI.
 pub const ecam_base: u64 = 0x1000_0000;
 pub const ecam_size: u64 = 0x0010_0000; // 1 bus (256 functions * 4 KiB)
 pub const pci_mmio_base: u64 = 0x1100_0000;
-pub const pci_mmio_size: u64 = 0x0100_0000; // 16 MiB for BARs
+pub const pci_mmio_size: u64 = 0x0100_0000; // 16 MiB, 32-bit window
+pub const pci_mmio64_base: u64 = 0x80_0000_0000; // 512 GiB, 64-bit window
+pub const pci_mmio64_size: u64 = 0x0100_0000; // 16 MiB
 pub const pci_intx_spi: u32 = 3; // legacy INTA -> SPI (INTID 35)
 
 /// Main RAM starts at 1 GiB (below it is the MMIO/device region).
