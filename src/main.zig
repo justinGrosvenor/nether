@@ -292,6 +292,17 @@ fn markerPresent(path: [*:0]const u8) bool {
 /// device lock is held, so it replies via the engine directly (not the locking
 /// host* API) per the VsockDev re-entrancy contract; the kick that delivered the
 /// data flushes the echo to the guest before returning.
+/// virtio-net <-> slirp glue: guest-transmitted frames go to the user-mode stack,
+/// and frames the stack produces are pushed back to the guest's RX queue.
+fn netToSlirp(ctx: *anyopaque, frame: []const u8) void {
+    const s: *nether.Slirp = @ptrCast(@alignCast(ctx));
+    s.onGuestFrame(frame);
+}
+fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
+    const net: *nether.VirtioNet = @ptrCast(@alignCast(ctx));
+    _ = net.pushRx(frame);
+}
+
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
     switch (ev) {
@@ -669,12 +680,52 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         _ = vsdev.hostListen(1234);
     }
 
+    // Function 0:4.0 - virtio-net behind the in-VMM user-mode network stack
+    // (opt-in via a `nether-net` marker), so the guest gets a configured eth0 with
+    // no host tap/bridge/root: guest TX frames go to slirp, replies come back via
+    // pushRx. Address plan 10.0.2.0/24 (guest .15, gateway .2, DNS .3).
+    var net_be: nether.VirtioNet = undefined;
+    var net_dev: nether.virtio.Device = undefined;
+    var net_intx: IntxLine = undefined;
+    var slirp_stack: nether.Slirp = undefined;
+    const net_on = macMarkerPresent("nether-net");
+    if (net_on) {
+        net_be = .{};
+        net_dev = nether.virtio.Device.init(net_be.backend(), gmem);
+        net_intx = .{ .intid = armPciIntxIntid(4) };
+        net_dev.intx_ptr = &net_intx;
+        net_dev.intx_fn = IntxLine.set;
+        net_dev.msi_ptr = &net_dev;
+        net_dev.msi_fn = armSendMsi;
+        try pci_host.addFunction(net_dev.function(4, 0));
+        net_be.attach(&net_dev);
+        slirp_stack = .{};
+        slirp_stack.out_fn = slirpToNet;
+        slirp_stack.out_ctx = &net_be;
+        net_be.on_tx = netToSlirp;
+        net_be.on_tx_ctx = &slirp_stack;
+    }
+
     // One dispatcher over the 64-bit window routes to each function's live BAR.
-    var dev_list = [_]*nether.virtio.Device{ &con_dev, &blk_dev, &vs_dev };
-    var bar_win = PciBarWindow{ .devs = if (vsock_on) dev_list[0..3] else dev_list[0..2] };
+    var dev_buf: [4]*nether.virtio.Device = undefined;
+    var ndev: usize = 0;
+    dev_buf[ndev] = &con_dev;
+    ndev += 1;
+    dev_buf[ndev] = &blk_dev;
+    ndev += 1;
+    if (vsock_on) {
+        dev_buf[ndev] = &vs_dev;
+        ndev += 1;
+    }
+    if (net_on) {
+        dev_buf[ndev] = &net_dev;
+        ndev += 1;
+    }
+    var bar_win = PciBarWindow{ .devs = dev_buf[0..ndev] };
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
     if (vsock_on) std.debug.print("[nether] virtio-vsock: guest CID 3, host echo on port 1234 (PCI 0:3.0)\n", .{});
+    if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0)\n", .{});
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 

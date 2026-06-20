@@ -124,8 +124,20 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
   ```
   That round-trip (guest connects to host CID 2:1234, sends, host echoes back)
   exercises the full vsock datapath and is the host<->guest control channel.
-- `virtio_net.ko` would bind the same way once a macOS host net backend (vmnet)
-  and a net function are wired.
+- **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
+  user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
+  10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules
+  (`virtio_net` needs `failover` + `net_failover`; DHCP needs `af_packet` for
+  udhcpc's raw socket) and configure the interface:
+  ```sh
+  insmod /af_packet.ko; insmod /failover.ko; insmod /net_failover.ko; insmod /virtio_net.ko
+  ip link set eth0 up
+  udhcpc -i eth0 -q        # -> "lease of 10.0.2.15 obtained from 10.0.2.2"
+  ping -c2 10.0.2.2        # -> 0% loss (ARP + ICMP via slirp)
+  ```
+  This exercises the virtio-net datapath (TX/RX over virtio-pci, MSI-X) plus the
+  slirp ARP/IPv4/ICMP/UDP/DHCP handling. Outbound NAT to real host sockets
+  (UDP/DNS, TCP) is the next step on top of this.
 
 ## How the Linux boot works
 

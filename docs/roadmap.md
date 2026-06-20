@@ -322,9 +322,18 @@ The build-out arc (offline-first chunks):
      CID 2:1234, sends a line, and prints the echo
      (`VSOCK_ECHO: HELLO_FROM_GUEST_VSOCK`) - the full vsock datapath (3 queues,
      connection state machine, credit flow control, MSI-X) over virtio-pci. Boot,
-     SMP, and virtio-blk re-verified on the refreshed kernel. **Remaining
-     (optional):** a macOS host net backend (vmnet) + a net function to bind
-     `virtio_net.ko` the same way.
+     SMP, and virtio-blk re-verified on the refreshed kernel.
+   - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
+     backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
+     stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come
+     back via `Net.pushRx`, so an unprivileged guest gets a configured `eth0` with
+     no tap/bridge/root. It implements ARP, IPv4, ICMP echo and DHCP (address plan
+     10.0.2.0/24, QEMU-slirp defaults), unit-tested. Function `0:4.0`, opt-in via a
+     `nether-net` marker. Proven live: `udhcpc` gets `lease of 10.0.2.15 obtained
+     from 10.0.2.2`, `eth0` comes up `10.0.2.15/24`, and `ping 10.0.2.2` is 0% loss
+     (~0.3 ms) - the full virtio-net datapath plus the slirp stack. **Remaining:**
+     outbound NAT to real host sockets (DNS/UDP, then TCP) for actual internet
+     access; the L2/L3 + DHCP foundation is in place.
 6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs
    (`ARM_NUM_CPUS`, currently 4). Each core creates and runs its own vCPU on its
    own host thread (an HVF vCPU is bound to its creating thread), so the boot core
