@@ -166,6 +166,10 @@ fn lo(x: u64) u32 {
 /// GIC interrupt id relative to the SPI base, i.e. INTID = 32 + spi).
 pub const VirtioDev = struct { addr: u64, spi: u32 };
 
+/// A generic-ECAM PCIe host bridge: the config window and a 32-bit MMIO window
+/// for BARs (identity-mapped PCI<->CPU).
+pub const PcieConfig = struct { ecam_base: u64, ecam_size: u64, mmio_base: u64, mmio_size: u64 };
+
 pub const VirtConfig = struct {
     cmdline: []const u8,
     mem_base: u64,
@@ -176,6 +180,7 @@ pub const VirtConfig = struct {
     initrd_start: u64 = 0,
     initrd_end: u64 = 0,
     virtio: []const VirtioDev = &.{},
+    pcie: ?PcieConfig = null,
 };
 
 /// Build the "virt" device tree into `out` and return its size. Uses two
@@ -266,6 +271,29 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         b.propString("compatible", "virtio,mmio");
         b.propCells("reg", &.{ hi(vd.addr), lo(vd.addr), 0, @intCast(arm.virtio_mmio_stride) });
         b.propCells("interrupts", &.{ 0, vd.spi, 0x04 }); // SPI, number, level-high
+        b.endNode();
+    }
+
+    if (cfg.pcie) |p| {
+        var namebuf: [40]u8 = undefined;
+        const name = std.fmt.bufPrint(&namebuf, "pcie@{x}", .{p.ecam_base}) catch unreachable;
+        b.beginNode(name);
+        b.propString("compatible", "pci-host-ecam-generic");
+        b.propString("device_type", "pci");
+        b.propU32("#address-cells", 3);
+        b.propU32("#size-cells", 2);
+        b.propU32("#interrupt-cells", 1);
+        b.propCells("reg", &.{ hi(p.ecam_base), lo(p.ecam_base), hi(p.ecam_size), lo(p.ecam_size) });
+        b.propCells("bus-range", &.{ 0, 0 });
+        // 64-bit non-prefetchable MMIO. pci-host-generic requires a
+        // non-prefetchable window; 64-bit space fits the virtio 64-bit BARs.
+        // PCI address identity-mapped to the CPU.
+        b.propCells("ranges", &.{
+            0x0300_0000, hi(p.mmio_base), lo(p.mmio_base), // PCI addr (space, hi, lo)
+            hi(p.mmio_base),              lo(p.mmio_base), // CPU addr
+            hi(p.mmio_size),              lo(p.mmio_size), // size
+        });
+        b.propEmpty("dma-coherent");
         b.endNode();
     }
 

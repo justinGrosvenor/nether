@@ -26,6 +26,10 @@ pub const Function = struct {
 pub const Host = struct {
     functions: [max_functions]Function = undefined,
     count: usize = 0,
+    /// ECAM window placement. Defaults to the x86 memory map; aarch64 overrides
+    /// it (the bus decode is `offset >> 20`, so size must cover the bus range).
+    ecam_base: u64 = memmap.ecam_base,
+    ecam_size: u64 = memmap.ecam_size,
 
     pub fn addFunction(self: *Host, f: Function) error{Full}!void {
         if (self.count == max_functions) return error.Full;
@@ -36,8 +40,8 @@ pub const Host = struct {
     pub fn mmioDevice(self: *Host) io.MmioDevice {
         return .{
             .ptr = self,
-            .base = memmap.ecam_base,
-            .len = memmap.ecam_size,
+            .base = self.ecam_base,
+            .len = self.ecam_size,
             .read_fn = onRead,
             .write_fn = onWrite,
         };

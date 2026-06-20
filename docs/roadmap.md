@@ -234,20 +234,28 @@ The build-out arc (offline-first chunks):
    repacked as an initramfs with a tiny `/init`; recipe in
    [running-on-hvf.md](running-on-hvf.md)) it boots straight to a proper Alpine
    busybox shell as root. Next: virtio on aarch64 (step 5).
-5. **virtio on aarch64 (transport built; kernel-gated).** A **virtio-mmio**
-   transport (`virtio_mmio.zig`) reuses the exact same device backends
-   (blk/net/rng/vsock), `virtq` datapath, and `virtio.Device` queue state as the
-   x86 PCI path - only the register window differs, and completions are a plain
-   GIC SPI (no PCIe/ITS). It is unit-tested (identity, queue kick runs the
-   backend, level interrupt asserts/clears) and wired into `macBootLinux` (rng +
-   an in-memory blk) with matching `virtio_mmio@...` DTB nodes - which the kernel
-   parses (they appear under `/proc/device-tree`). **Blocker:** the stock Alpine
-   `-virt` kernel has no `VIRTIO_MMIO` driver (it targets QEMU virtio-*PCI*), so
-   nothing binds. Two ways forward: (a) an arm64 kernel built with
-   `CONFIG_VIRTIO_MMIO=y` - the current code then lights up as-is; or (b) a
-   virtio-pci front end on aarch64 (reuse `pci.zig` ECAM + `virtio.zig`; MSI via
-   the framework GIC, whose MSI region is already configured, described to the
-   guest as a GICv2m frame). The transport is the reusable half either way.
+5. **virtio on aarch64 (foundation; BAR-assignment blocked).** Two transports
+   exist behind the shared backends:
+   - **virtio-mmio** (`virtio_mmio.zig`) - unit-tested and its DTB nodes parse
+     (they appear under `/proc/device-tree`), but stock Alpine kernels build
+     `VIRTIO_MMIO` as a module (not `=y`), so nothing binds. Kept as the clean
+     path for a `CONFIG_VIRTIO_MMIO=y` kernel.
+   - **virtio-pci** (the path stock kernels support): a generic-ECAM host bridge
+     (`pci.zig` made ECAM-base-configurable) + a `pcie@...` DTB node (ranges,
+     bus-range, 64-bit non-prefetchable MMIO window) + a window-wide dispatcher
+     routing to the device's live BAR. **The virtio-rng device now enumerates**:
+     it appears as `0000:00:01.0 [1af4:1044]` in the guest's PCI bus and sysfs,
+     BAR sized and detected. The virtio BAR was switched to 64-bit
+     non-prefetchable (pci-host-generic requires a non-pref window; harmless on
+     x86).
+   - **Blocker:** the kernel detects the device + BAR but never claims or assigns
+     the BAR (boot is direct, with no firmware/EDK2 to assign PCI resources, and
+     this host's bus stays claim-only), so `pci_enable_device` fails (-EINVAL).
+     QEMU's `-kernel` boot works, so the gap is a DTB-pcie-node detail QEMU
+     includes (likely the `interrupt-map`/`msi-parent` + I/O range that complete
+     the bus). Next: complete the pcie node (interrupt routing) so the kernel
+     brings the bus fully up and assigns the BAR, then MSI via the framework GIC
+     (v2m) or INTx via the GIC SPI.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

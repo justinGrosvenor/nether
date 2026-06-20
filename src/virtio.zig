@@ -24,7 +24,7 @@ pub const FEATURES_OK = 8;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // BAR0 region offsets and size (size must be a power of two).
-const bar_size = 0x8000;
+pub const bar_size = 0x8000;
 const common_off = 0x0000;
 const isr_off = 0x1000;
 const notify_off = 0x2000;
@@ -164,7 +164,10 @@ pub const Device = struct {
     }
 
     pub fn cfgRead(self: *Device, reg: u16, size: u8) u32 {
-        if (size == 4 and reg == 0x10) return if (self.probe_lo) (~@as(u32, bar_size - 1)) | 0x0C else (self.bar0 & 0xFFFFFFF0) | 0x0C;
+        // BAR0: 64-bit (bit 2), non-prefetchable. pci-host-generic on aarch64
+        // requires a non-prefetchable window and won't claim a prefetchable BAR
+        // into it; non-pref is also fine for the x86 path.
+        if (size == 4 and reg == 0x10) return if (self.probe_lo) (~@as(u32, bar_size - 1)) | 0x04 else (self.bar0 & 0xFFFFFFF0) | 0x04;
         if (size == 4 and reg == 0x14) return if (self.probe_hi) 0xFFFFFFFF else self.bar1;
         var v: u32 = 0;
         var i: usize = 0;
@@ -367,7 +370,7 @@ test "config space exposes a modern virtio function" {
     try std.testing.expectEqual(@as(u32, 0x40), dev.cfgRead(0x34, 1));
 
     dev.cfgWrite(0x10, 4, 0xFFFFFFFF);
-    try std.testing.expectEqual(@as(u32, 0xFFFF800C), dev.cfgRead(0x10, 4)); // 32 KiB BAR
+    try std.testing.expectEqual(@as(u32, 0xFFFF8004), dev.cfgRead(0x10, 4)); // 32 KiB BAR, 64-bit non-pref
     dev.assignBar(0xC0000000);
     try std.testing.expectEqual(@as(u64, 0xC0000000), dev.barBase());
 
