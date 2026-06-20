@@ -297,8 +297,20 @@ The build-out arc (offline-first chunks):
        `virtio.Device` drives the line as a level via `intx_fn` -> `hv_gic_set_spi`
        (raise on ISR set, lower on ISR read). Also proven live (GIC SPI 36 Level,
        count climbs per RX) before MSI-X was added.
-     **Remaining (optional):** a richer rootfs/kernel with `virtio_rng=y` (or
-     modules in the initramfs) to drive the rng/blk/net backends directly over PCI.
+   - **Multiple virtio-pci functions on one bus (DONE).** `PciBarWindow` now
+     dispatches the whole 64-bit BAR window across a set of devices (each matched
+     by its live BAR), and each function gets its own MSI-X vectors + per-slot INTx
+     line. Demonstrated with two functions: `0:1.0` virtio-console and `0:2.0`
+     virtio-blk, both enumerated with BARs assigned and MSI-X bound.
+   - **virtio-blk live (DONE).** The leaf driver is a module, but the matching one
+     (same kernel version, no vermagic mismatch) ships in Alpine's netboot
+     `initramfs-virt`; dropping `virtio_blk.ko` into our initramfs and `insmod`-ing
+     it binds our `0:2.0` function as `/dev/vda` (2048 512-byte sectors over a 1 MiB
+     in-memory disk). `head -c /dev/vda` reads back the on-disk signature, proving
+     the full block datapath (request chain -> disk read -> DMA -> used ring ->
+     MSI-X completion) on aarch64/HVF. Recipe in running-on-hvf.md. **Remaining
+     (optional):** a macOS host net backend (vmnet) + a net function to bind
+     `virtio_net.ko` the same way.
 6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs
    (`ARM_NUM_CPUS`, currently 4). Each core creates and runs its own vCPU on its
    own host thread (an HVF vCPU is bound to its creating thread), so the boot core

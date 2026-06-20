@@ -597,37 +597,44 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     uart.irq_ctx = &uart;
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
-    // virtio-pci: a generic-ECAM PCIe host bridge with a virtio-console function,
-    // reusing the same PCI transport + backends + virtq as the x86 path. The
-    // guest RAM view (where the queues live) is `ram` based at ARM_RAM_BASE.
-    // virtio-console is used here because it is one of the only virtio leaf
-    // drivers built into the stock Alpine `virt` kernel (the rest are modules
-    // absent from the minirootfs), so it actually binds and creates /dev/hvc0 -
-    // giving a real virtqueue datapath over the BAR to exercise on HVF.
+    // virtio-pci: a generic-ECAM PCIe host bridge carrying multiple virtio
+    // functions, reusing the same PCI transport + backends + virtq as the x86
+    // path. The guest RAM view (where the queues live) is `ram` based at
+    // ARM_RAM_BASE. Each function gets the standard wiring: MSI-X (preferred, via
+    // the GICv2m frame) and a per-slot INTx fallback; the kernel assigns each
+    // BAR somewhere in the 64-bit window and one PciBarWindow dispatches to all.
     const gmem = nether.virtq.GuestMem{ .bytes = ram, .base = ARM_RAM_BASE };
     var pci_host = nether.PciHost{ .ecam_base = nether.memmap_arm.ecam_base, .ecam_size = nether.memmap_arm.ecam_size };
 
+    // Function 0:1.0 - virtio-console (binds the built-in driver -> /dev/hvc0).
     var con = nether.VirtioConsole{};
     con.out_fn = consoleOut; // guest hvc0 output -> host stdout
     con.out_ctx = &con;
     var con_dev = nether.virtio.Device.init(con.backend(), gmem);
     con.attach(&con_dev);
-    // INTx (level) for completions: this kernel has no MSI domain (no msi-map in
-    // the DTB), so virtio-pci falls back to legacy INTx routed via the pcie
-    // interrupt-map to a GIC SPI. Device at slot 1, pin INTA -> the DTB swizzle
-    // gives spi = pci_intx_spi + ((slot + pin - 1) % 4).
-    con_dev.intx_ptr = &con_dev;
-    con_dev.intx_fn = armPciIntx;
-    // MSI-X: if the guest enables it (via the GICv2m frame in the DTB), the device
-    // delivers completions by forwarding the guest-programmed message to the
-    // framework GIC instead of toggling the INTx line.
+    var con_intx = IntxLine{ .intid = armPciIntxIntid(1) };
+    con_dev.intx_ptr = &con_intx;
+    con_dev.intx_fn = IntxLine.set;
     con_dev.msi_ptr = &con_dev;
     con_dev.msi_fn = armSendMsi;
-    // Don't pre-assign: let the kernel place the 64-bit BAR in the 64-bit window
-    // (like QEMU). A window-wide dispatcher routes accesses to its live base.
-    try pci_host.addFunction(con_dev.function(1, 0)); // PCI 0:1.0
-    var con_bar = PciBarWindow{ .dev = &con_dev };
-    try bus.addMmio(con_bar.device());
+    try pci_host.addFunction(con_dev.function(1, 0));
+
+    // Function 0:2.0 - virtio-blk backed by an in-memory disk with a recognizable
+    // signature, exercised by loading virtio_blk.ko in the guest (-> /dev/vda).
+    // Proves a second virtio function on the same bus (own BAR + MSI-X vectors).
+    var blk = nether.VirtioBlk{ .disk = makeBlkDisk() };
+    var blk_dev = nether.virtio.Device.init(blk.backend(), gmem);
+    var blk_intx = IntxLine{ .intid = armPciIntxIntid(2) };
+    blk_dev.intx_ptr = &blk_intx;
+    blk_dev.intx_fn = IntxLine.set;
+    blk_dev.msi_ptr = &blk_dev;
+    blk_dev.msi_fn = armSendMsi;
+    try pci_host.addFunction(blk_dev.function(2, 0));
+
+    // One dispatcher over the 64-bit window routes to each function's live BAR.
+    var dev_list = [_]*nether.virtio.Device{ &con_dev, &blk_dev };
+    var bar_win = PciBarWindow{ .devs = &dev_list };
+    try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
@@ -758,15 +765,32 @@ fn consoleOut(ctx: *anyopaque, bytes: []const u8) void {
     _ = std.c.write(1, bytes.ptr, bytes.len);
 }
 
-/// Legacy PCI INTx line for the virtio function, delivered as a GIC SPI level.
-/// The DTB interrupt-map routes slot 1 / INTA to this SPI (see memmap_arm and
-/// dtb.zig's swizzle: pci_intx_spi + ((slot + pin - 1) % 4), slot=1 pin=1).
-const ARM_PCI_INTX_INTID: u32 = 32 + nether.memmap_arm.pci_intx_spi + ((1 + 1 - 1) % 4);
-fn armPciIntx(ctx: *anyopaque, level: bool) void {
-    _ = ctx;
-    const hvf = @import("hvf.zig");
-    _ = hvf.hv_gic_set_spi(ARM_PCI_INTX_INTID, level);
+/// Backing store for the virtio-blk function (1 MiB, in .bss). Sector 0 carries a
+/// signature so a guest `head -c /dev/vda` proves the block read datapath end to
+/// end. Writes land here in memory (not persisted to a host file).
+var blk_disk_storage: [1024 * 1024]u8 = undefined;
+fn makeBlkDisk() []u8 {
+    @memset(&blk_disk_storage, 0);
+    const sig = "NETHER-VIRTIO-BLK-DISK-OK\n";
+    @memcpy(blk_disk_storage[0..sig.len], sig);
+    return &blk_disk_storage;
 }
+
+/// Legacy PCI INTx line for a virtio function (the fallback when the guest has no
+/// MSI domain). The DTB interrupt-map routes (slot, INTA) to a GIC SPI via the
+/// swizzle pci_intx_spi + ((slot + pin - 1) % 4); each device carries its own
+/// IntxLine so the right SPI is asserted. INTx is unused once MSI-X is enabled.
+fn armPciIntxIntid(slot: u32) u32 {
+    return 32 + nether.memmap_arm.pci_intx_spi + ((slot + 1 - 1) % 4); // pin INTA = 1
+}
+const IntxLine = struct {
+    intid: u32,
+    fn set(ctx: *anyopaque, level: bool) void {
+        const self: *IntxLine = @ptrCast(@alignCast(ctx));
+        const hvf = @import("hvf.zig");
+        _ = hvf.hv_gic_set_spi(self.intid, level);
+    }
+};
 
 /// MSI-X delivery on HVF: forward the guest-programmed message (doorbell address
 /// + data = the GICv2m-allocated SPI intid) to the framework GIC, which raises it
@@ -789,10 +813,13 @@ fn armUartIrq(ctx: *anyopaque, level: bool) void {
     _ = hvf.hv_gic_set_spi(ARM_UART_INTID, level);
 }
 
-/// Routes accesses across the whole PCI MMIO window to a virtio device's BAR0
-/// at its *live* base (the kernel assigns BARs, so the base isn't known up front).
+/// Routes accesses across the whole 64-bit PCI MMIO window to the virtio device
+/// whose *live* BAR0 contains the address. The kernel assigns each function's BAR
+/// somewhere in the window, so we can't bind fixed sub-regions up front; instead
+/// one window-wide dispatcher matches every access against each device's current
+/// BAR base. Supports any number of functions on the bus.
 const PciBarWindow = struct {
-    dev: *nether.virtio.Device,
+    devs: []const *nether.virtio.Device,
 
     fn device(self: *PciBarWindow) nether.MmioDevice {
         return .{
@@ -803,25 +830,30 @@ const PciBarWindow = struct {
             .write_fn = write,
         };
     }
+    fn match(self: *PciBarWindow, addr: u64) ?struct { dev: *nether.virtio.Device, off: u64 } {
+        for (self.devs) |d| {
+            const bar = d.barBase();
+            if (bar != 0 and addr >= bar and addr - bar < nether.virtio.bar_size) {
+                return .{ .dev = d, .off = addr - bar };
+            }
+        }
+        return null;
+    }
     fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
         const self: *PciBarWindow = @ptrCast(@alignCast(ptr));
-        const addr = nether.memmap_arm.pci_mmio64_base + offset;
-        const bar = self.dev.barBase();
-        if (bar != 0 and addr >= bar and addr - bar < nether.virtio.bar_size) {
-            const v = self.dev.barRead(addr - bar, @intCast(data.len));
+        if (self.match(nether.memmap_arm.pci_mmio64_base + offset)) |m| {
+            const v = m.dev.barRead(m.off, @intCast(data.len));
             for (data, 0..) |*b, i| b.* = if (i < 4) @truncate(v >> @intCast(i * 8)) else 0;
         } else @memset(data, 0xFF);
     }
     fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
         const self: *PciBarWindow = @ptrCast(@alignCast(ptr));
-        const addr = nether.memmap_arm.pci_mmio64_base + offset;
-        const bar = self.dev.barBase();
-        if (bar != 0 and addr >= bar and addr - bar < nether.virtio.bar_size) {
+        if (self.match(nether.memmap_arm.pci_mmio64_base + offset)) |m| {
             var v: u32 = 0;
             for (data, 0..) |b, i| {
                 if (i < 4) v |= @as(u32, b) << @intCast(i * 8);
             }
-            self.dev.barWrite(addr - bar, @intCast(data.len), v);
+            m.dev.barWrite(m.off, @intCast(data.len), v);
         }
     }
 };

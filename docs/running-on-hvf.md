@@ -81,6 +81,29 @@ the DTB at +128 MiB, and the initramfs at +192 MiB; it is interactive (type into
 the shell). It powers off with `poweroff` (PSCI SYSTEM_OFF) or Ctrl-A is not
 needed - exit by killing the process.
 
+### Exercising virtio-blk (and other module-only leaf drivers)
+
+The `virt` kernel builds `virtio_pci` in but `virtio_blk`/`virtio_net`/`virtio_rng`
+as modules, and the minirootfs ships none. The matching modules (same kernel
+version, so no vermagic mismatch) live in Alpine's netboot `initramfs-virt`; drop
+the one you want into our initramfs and `insmod` it from the guest shell:
+
+```sh
+A=https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64
+curl -fSLO "$A/netboot/initramfs-virt"
+mkdir -p iv && ( cd iv && gunzip -c ../initramfs-virt | cpio -idmu --quiet )
+# our nether wires a virtio-blk function (0:2.0) backed by an in-memory disk;
+# add its leaf driver so the guest can bind it as /dev/vda:
+mkdir -p rootfs && cp iv/lib/modules/6.12.81-0-virt/kernel/drivers/block/virtio_blk.ko rootfs/
+( cd rootfs && find . | cpio -o -H newc --quiet | gzip ) > initramfs.cpio.gz
+```
+
+In the guest: `insmod /virtio_blk.ko` -> `/dev/vda` appears (2048 512-byte
+sectors); `head -c 26 /dev/vda` reads back the `NETHER-VIRTIO-BLK-DISK-OK`
+signature, proving the block datapath (request chain -> disk read -> DMA -> used
+ring -> MSI-X completion). The same approach would bind `virtio_net.ko` once a
+macOS host network backend (vmnet) and a net function are wired on this path.
+
 ## How the Linux boot works
 
 - `hv_vm_create` + `hv_vm_map` (guest RAM at the arm64 `virt` base `0x4000_0000`),
