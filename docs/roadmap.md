@@ -225,8 +225,13 @@ The build-out arc (offline-first chunks):
    `0x080A0000` is not intercepted by the framework (the kernel's `GICR_PIDR2`
    read at `0x080affe8` falls through to us), so it reports "No redistributor
    present" and panics in GIC init - despite the base satisfying the framework's
-   reported size/alignment. Next: reconcile the `hv_gic` redistributor placement
-   (Apple-specific semantics), then the generic timer, then init/console.
+   reported size/alignment. Found: the framework services the redistributor's
+   functional registers but not its PrimeCell ID block, so we model GICR_PIDR2
+   ourselves (the `GicrId` device) - now the redistributor is recognized ("GICv3:
+   988 SPIs implemented"). Current blocker: `gic_iterate_rdists` then takes a
+   guest-side (stage-1) translation fault reading GICR_TYPER, a kernel
+   ioremap/page-table issue in redistributor iteration. Next: resolve that, then
+   the generic timer, then init/console.
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
    net/vsock/rng light up on the new arch.
 
