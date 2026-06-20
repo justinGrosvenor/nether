@@ -167,6 +167,7 @@ pub const VirtConfig = struct {
     mem_base: u64,
     mem_size: u64,
     gicd_size: u64 = arm.gicd_size,
+    gicr_base: u64 = arm.gicr_base,
     gicr_size: u64 = arm.gicr_size,
     initrd_start: u64 = 0,
     initrd_end: u64 = 0,
@@ -235,7 +236,7 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.propU32("#interrupt-cells", 3);
     b.propCells("reg", &.{
         hi(arm.gicd_base), lo(arm.gicd_base), hi(cfg.gicd_size), lo(cfg.gicd_size),
-        hi(arm.gicr_base), lo(arm.gicr_base), hi(cfg.gicr_size), lo(cfg.gicr_size),
+        hi(cfg.gicr_base), lo(cfg.gicr_base), hi(cfg.gicr_size), lo(cfg.gicr_size),
     });
     b.propU32("phandle", GIC_PHANDLE);
     b.endNode();

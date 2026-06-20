@@ -26,6 +26,7 @@ const Error = hvtypes.Error;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
 const EC_HVC: u64 = 0x16; // HVC instruction from AArch64 (PSCI firmware calls)
 const EC_WFX: u64 = 0x01; // trapped WFI/WFE (idle); resume past it
+const EC_SYSREG: u64 = 0x18; // trapped MSR/MRS/system reg (emulate RAZ/WI)
 
 /// PSCI function IDs (the guest's "firmware" for power; the arm64 analog of the
 /// ACPI PM block). The guest calls these via `hvc #0` with the FID in w0/x0.
@@ -49,7 +50,7 @@ pub const Vm = struct {
     /// GIC region sizes the framework reported (used to fill the DTB so the
     /// kernel's GIC reg matches what hv_gic actually placed).
     gicd_size: u64 = arm.gicd_size,
-    gicr_size: u64 = arm.gicr_size,
+    gicr_size: u64 = arm.gicr_size, // whole redistributor region (DTB GICR reg size)
 
     pub fn init() Error!Vm {
         try ok(hvf.hv_vm_create(null), "hv_vm_create");
@@ -96,22 +97,32 @@ pub const Vm = struct {
         if (cfg == null) return error.SyscallFailed;
         try ok(hvf.hv_gic_config_set_distributor_base(cfg, arm.gicd_base), "gic distributor base");
         try ok(hvf.hv_gic_config_set_redistributor_base(cfg, arm.gicr_base), "gic redistributor base");
+        // MSI region: the GIC isn't fully provisioned (and the redistributor base
+        // query fails) without it. Reserve the top of the SPI range for MSI.
+        try ok(hvf.hv_gic_config_set_msi_region_base(cfg, arm.msi_base), "gic msi base");
+        var spi_base: u32 = 0;
+        var spi_count: u32 = 0;
+        _ = hvf.hv_gic_get_spi_interrupt_range(&spi_base, &spi_count);
+        const msi_count: u32 = if (spi_count > 64) 64 else spi_count;
+        try ok(hvf.hv_gic_config_set_msi_interrupt_range(cfg, spi_base + spi_count - msi_count, msi_count), "gic msi range");
         try ok(hvf.hv_gic_create(cfg), "hv_gic_create");
 
         var ds: usize = arm.gicd_size;
         var rs: usize = arm.gicr_size;
         _ = hvf.hv_gic_get_distributor_size(&ds);
-        _ = hvf.hv_gic_get_redistributor_size(&rs);
+        _ = hvf.hv_gic_get_redistributor_region_size(&rs); // whole region, for the DTB
         self.gicd_size = ds;
         self.gicr_size = rs;
     }
 
     pub fn createVcpu(self: *Vm, id: u32) Error!Vcpu {
         _ = self;
-        _ = id;
         var handle: hvf.hv_vcpu_t = 0;
         var exit: *hvf.Exit = undefined;
         try ok(hvf.hv_vcpu_create(&handle, &exit, null), "hv_vcpu_create");
+        // GICv3 affinity routing: MPIDR_EL1 must be set (bit 31 RES1; Aff0 = id)
+        // before the GIC redistributor can be associated with this vCPU.
+        _ = hvf.hv_vcpu_set_sys_reg(handle, hvf.HV_SYS_REG_MPIDR_EL1, 0x8000_0000 | @as(u64, id));
         return .{ .handle = handle, .exit = exit };
     }
 };
@@ -122,6 +133,14 @@ pub const Vcpu = struct {
 
     pub fn deinit(self: *Vcpu) void {
         _ = hvf.hv_vcpu_destroy(self.handle);
+    }
+
+    /// The guest-physical base the framework placed this vCPU's GIC redistributor
+    /// at (valid after creation). The DTB must describe this address.
+    pub fn redistributorBase(self: *Vcpu) u64 {
+        var base: hvf.hv_ipa_t = 0;
+        _ = hvf.hv_gic_get_redistributor_base(self.handle, &base);
+        return base;
     }
 
     /// aarch64 boot entry: PC = kernel base, X0 = DTB pointer (the Linux arm64
@@ -143,6 +162,7 @@ pub const Vcpu = struct {
                         EC_DATA_ABORT_LOWER => self.handleDataAbort(bus, esr),
                         EC_HVC => self.handlePsci(power),
                         EC_WFX => self.stepPc(4), // idle wait; the GIC wakes us
+                        EC_SYSREG => self.handleSysReg(esr),
                         else => {
                             std.debug.print("[nether] unhandled exception EC=0x{x} ESR=0x{x}\n", .{ ec, esr });
                             return error.UnhandledExit;
@@ -199,6 +219,15 @@ pub const Vcpu = struct {
             PSCI_SYSTEM_RESET => power.request(.reset),
             else => self.setX(0, PSCI_NOT_SUPPORTED),
         }
+    }
+
+    /// Trapped system-register access (EC 0x18): emulate as RAZ/WI - reads return
+    /// 0, writes are dropped. ISS[0]=direction (1=read/MRS), ISS[9:5]=Rt. Fine for
+    /// the debug/PMU/implementation-defined registers the kernel probes at boot.
+    fn handleSysReg(self: *Vcpu, esr: u64) void {
+        const iss = esr & 0x1ff_ffff;
+        if (iss & 1 == 1) self.setX(@truncate((iss >> 5) & 0x1f), 0); // MRS -> RAZ
+        self.stepPc(4);
     }
 
     fn stepPc(self: *Vcpu, bytes: u64) void {

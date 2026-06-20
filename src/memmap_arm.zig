@@ -15,13 +15,19 @@ pub const gib = 1 << 30;
 /// GIC (interrupt controller), low MMIO.
 pub const gicd_base: u64 = 0x0800_0000; // distributor
 pub const gicd_size: u64 = 0x0001_0000; // 64 KiB
-pub const gicr_base: u64 = 0x080A_0000; // redistributors
-pub const gicr_size: u64 = 0x0002_0000; // 2 64-KiB frames per CPU (1 CPU)
+// The framework redistributor *region* is sized for the max vCPUs (~32 MiB), so
+// it is placed above the UART and below RAM to avoid overlap. The actual base is
+// queried from the framework after the vCPU exists; this is the request/fallback.
+pub const gicr_base: u64 = 0x0A00_0000; // redistributor region (clear of GICD/UART)
+pub const gicr_size: u64 = 0x0200_0000; // ~32 MiB region (fallback; queried at runtime)
 
 /// PL011 UART.
 pub const uart_base: u64 = 0x0900_0000;
 pub const uart_size: u64 = 0x0000_1000;
 pub const uart_spi: u32 = 1; // SPI 1 (GIC interrupt id 32 + 1)
+
+/// GIC MSI region (GITS-style doorbell), above the redistributor region.
+pub const msi_base: u64 = 0x0C00_0000;
 
 /// Main RAM starts at 1 GiB (below it is the MMIO/device region).
 pub const ram_base: u64 = 0x4000_0000;

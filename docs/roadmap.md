@@ -214,24 +214,22 @@ The build-out arc (offline-first chunks):
    (`hv_gic`, the in-kernel LAPIC analog), the ARM generic timer (delivered via
    the GIC), and a full aarch64 memory map - these are exercised by a real OS, so
    they land with step 4.
-4. **aarch64 Linux boot (in progress).** Done: the **DTB generator** (`dtb.zig`),
-   the aarch64 memory map (`memmap_arm.zig`), the framework GIC creation
-   (`hv_gic`, `setupIrq`), and the `Image` + `X0 = DTB` boot path (`macBootLinux`:
-   load Image at the RAM base, DTB + initramfs in RAM, I-cache flush, enter).
-   **An arm64 Alpine kernel (6.12) now boots under HVF on the Mac**: it parses our
-   DTB (`Machine model: nether-virt`), runs early init over our PL011 earlycon,
-   PSCI works (HVC decode; the version/SYSTEM_OFF handlers), and the GIC
-   *distributor* is framework-intercepted. **Blocker:** the GIC *redistributor* at
-   `0x080A0000` is not intercepted by the framework (the kernel's `GICR_PIDR2`
-   read at `0x080affe8` falls through to us), so it reports "No redistributor
-   present" and panics in GIC init - despite the base satisfying the framework's
-   reported size/alignment. Found: the framework services the redistributor's
-   functional registers but not its PrimeCell ID block, so we model GICR_PIDR2
-   ourselves (the `GicrId` device) - now the redistributor is recognized ("GICv3:
-   988 SPIs implemented"). Current blocker: `gic_iterate_rdists` then takes a
-   guest-side (stage-1) translation fault reading GICR_TYPER, a kernel
-   ioremap/page-table issue in redistributor iteration. Next: resolve that, then
-   the generic timer, then init/console.
+4. **aarch64 Linux boot (DONE).** An arm64 Alpine kernel (6.12) **boots under HVF
+   on Apple Silicon all the way to an interactive userspace shell.** The pieces:
+   the **DTB generator** (`dtb.zig`), the aarch64 memory map (`memmap_arm.zig`),
+   the framework **GICv3** (`hv_gic`: distributor + redistributor + MSI region),
+   the **generic timer** (delivered via the GIC), **PSCI** (HVC), the **PL011**
+   console, and the `Image` + `X0 = DTB` boot path (`macBootLinux`). The keystone
+   was **MPIDR_EL1**: GICv3 affinity routing requires each vCPU's MPIDR set before
+   the framework will associate (and MMIO-intercept) its redistributor - without
+   it `hv_gic_get_redistributor_base` returns BAD_ARGUMENT and all redistributor
+   registers fall through. The redistributor *region* is ~32 MiB (sized for max
+   vCPUs), placed clear of the UART/RAM, and its base is queried from the
+   framework and written into the DTB. Trapped system-register accesses (EC 0x18)
+   are emulated RAZ/WI. The kernel reaches `Run /init`, runs Alpine init, and
+   drops to the initramfs recovery shell (it only lacks Alpine boot media).
+   Remaining polish: wire host stdin -> PL011 RX for interactivity, and a proper
+   rootfs/initramfs; then virtio on aarch64 (step 5).
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
    net/vsock/rng light up on the new arch.
 

@@ -506,6 +506,13 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const ram = try vm.addMemory(0, ARM_RAM_BASE, ARM_RAM_SIZE);
     try vm.enableSplitIrqchip(); // hv_gic_create, before the vCPU
 
+    // The vCPU must exist before we can ask where the framework placed its GIC
+    // redistributor; the DTB has to describe that actual address.
+    var vcpu = try vm.createVcpu(0);
+    defer vcpu.deinit();
+    const queried = vcpu.redistributorBase();
+    const gicr_base = if (queried != 0) queried else nether.memmap_arm.gicr_base;
+
     @memcpy(ram[0..kernel.len], kernel); // Image at the RAM base
 
     var initrd_start: u64 = 0;
@@ -522,6 +529,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .mem_base = ARM_RAM_BASE,
         .mem_size = ARM_RAM_SIZE,
         .gicd_size = vm.hv.gicd_size,
+        .gicr_base = gicr_base,
         .gicr_size = vm.hv.gicr_size,
         .initrd_start = initrd_start,
         .initrd_end = initrd_end,
@@ -534,19 +542,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var uart = nether.Pl011{};
     uart.out_fn = uartOut;
     uart.out_ctx = &uart;
-    var gicr_id = GicrId{};
     var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
-    // The framework GIC services the redistributor's functional registers but not
-    // its PrimeCell ID registers; those fall through to us. Supply GICR_PIDR2 so
-    // Linux recognizes a GICv3 redistributor.
-    try bus.addMmio(gicr_id.device(nether.memmap_arm.gicr_base, vm.hv.gicr_size));
 
-    var vcpu = try vm.createVcpu(0);
-    defer vcpu.deinit();
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
-    std.debug.print("[nether] booting arm64 Image: kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} r=0x{x}\n", .{ kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, vm.hv.gicr_size });
+    std.debug.print("[nether] booting arm64 Image: kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.run(&bus, &power) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
@@ -614,29 +615,6 @@ fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
     }
     return buf;
 }
-
-/// Fills the GICv3 redistributor PrimeCell ID registers the framework GIC leaves
-/// unmodeled. Only GICR_PIDR2's architecture field (bits [7:4] = 3) is load-
-/// bearing for Linux's "is this a GICv3 redistributor?" check; everything else
-/// reads as zero. Each 64-KiB redistributor frame has its ID block at +0xFFE8.
-const GicrId = struct {
-    const PIDR2 = 0xFFE8;
-    const ARCH_GICV3: u8 = 0x30;
-
-    fn device(self: *GicrId, base: u64, len: u64) nether.MmioDevice {
-        return .{ .ptr = self, .base = base, .len = len, .read_fn = read, .write_fn = write };
-    }
-    fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
-        _ = ptr;
-        @memset(data, 0);
-        if (offset & 0xffff == PIDR2 and data.len > 0) data[0] = ARCH_GICV3;
-    }
-    fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
-        _ = ptr;
-        _ = offset;
-        _ = data;
-    }
-};
 
 /// PL011 TX sink: write one guest byte to host stdout (libc is linked on macOS).
 fn uartOut(ctx: *anyopaque, byte: u8) void {
