@@ -302,6 +302,9 @@ fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
     const net: *nether.VirtioNet = @ptrCast(@alignCast(ctx));
     _ = net.pushRx(frame);
 }
+fn slirpPollLoop(s: *nether.Slirp) void {
+    while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
+}
 
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
@@ -704,6 +707,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
         net_be.on_tx_ctx = &slirp_stack;
+        // Host thread: poll NAT sockets and inject replies back into the guest.
+        if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
     }
 
     // One dispatcher over the 64-bit window routes to each function's live BAR.

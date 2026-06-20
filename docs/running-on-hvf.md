@@ -136,8 +136,12 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
   ping -c2 10.0.2.2        # -> 0% loss (ARP + ICMP via slirp)
   ```
   This exercises the virtio-net datapath (TX/RX over virtio-pci, MSI-X) plus the
-  slirp ARP/IPv4/ICMP/UDP/DHCP handling. Outbound NAT to real host sockets
-  (UDP/DNS, TCP) is the next step on top of this.
+  slirp ARP/IPv4/ICMP/UDP/DHCP handling.
+  - **Outbound UDP + DNS** work through slirp's host-socket NAT (no privilege):
+    ```sh
+    nslookup example.com 10.0.2.3     # -> real records (forwarded to 8.8.8.8)
+    ```
+    A poll thread relays replies back to the guest. TCP NAT (HTTP/git) is next.
 
 ## How the Linux boot works
 

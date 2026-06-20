@@ -331,9 +331,17 @@ The build-out arc (offline-first chunks):
      10.0.2.0/24, QEMU-slirp defaults), unit-tested. Function `0:4.0`, opt-in via a
      `nether-net` marker. Proven live: `udhcpc` gets `lease of 10.0.2.15 obtained
      from 10.0.2.2`, `eth0` comes up `10.0.2.15/24`, and `ping 10.0.2.2` is 0% loss
-     (~0.3 ms) - the full virtio-net datapath plus the slirp stack. **Remaining:**
-     outbound NAT to real host sockets (DNS/UDP, then TCP) for actual internet
-     access; the L2/L3 + DHCP foundation is in place.
+     (~0.3 ms) - the full virtio-net datapath plus the slirp stack.
+   - **Outbound UDP NAT + DNS (DONE).** slirp forwards the guest's UDP through
+     ordinary host sockets (no privilege): a per-flow table maps each guest UDP
+     flow to a host `SOCK_DGRAM`, a poll thread reads replies and injects them back
+     with the address the guest expects. DNS queries to the virtual resolver
+     (10.0.2.3:53) are forwarded to a real upstream (8.8.8.8). Proven live:
+     `nslookup example.com 10.0.2.3` returns real records. So the guest now has
+     real name resolution and outbound UDP with no host networking setup.
+     **Remaining:** TCP NAT (a guest-facing connection state machine bridged to
+     host sockets) for HTTP/git/etc - the lossless in-process path means no
+     retransmit/congestion logic is needed, just correct seq/ack + the poll thread.
 6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs
    (`ARM_NUM_CPUS`, currently 4). Each core creates and runs its own vCPU on its
    own host thread (an HVF vCPU is bound to its creating thread), so the boot core
