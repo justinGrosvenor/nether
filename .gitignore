@@ -9,3 +9,5 @@ nether-web
 nether-vsock
 nether-net
 nether-snapshot
+nether-snapshot-save
+nether-restore

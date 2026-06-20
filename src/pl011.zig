@@ -57,6 +57,19 @@ pub const Pl011 = struct {
         return .{ .ptr = self, .base = base, .len = 0x1000, .read_fn = readThunk, .write_fn = writeThunk };
     }
 
+    /// Snapshot of the guest-programmed register state (the RX ring is transient
+    /// host input, not part of guest-visible architectural state). `imsc` is the
+    /// load-bearing field: without it a restored UART has RX interrupts masked and
+    /// the console goes deaf.
+    pub const State = struct { imsc: u32, irq_level: bool };
+    pub fn exportState(self: *const Pl011) State {
+        return .{ .imsc = self.imsc, .irq_level = self.irq_level };
+    }
+    pub fn importState(self: *Pl011, s: State) void {
+        self.imsc = s.imsc;
+        self.irq_level = s.irq_level;
+    }
+
     fn writeThunk(ptr: *anyopaque, offset: u64, data: []const u8) void {
         const self: *Pl011 = @ptrCast(@alignCast(ptr));
         switch (offset) {

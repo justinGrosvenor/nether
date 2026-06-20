@@ -109,6 +109,20 @@ pub const SNAPSHOT_SYS_REGS = [_]hv_sys_reg_t{
     0xdf19, // CNTV_CTL_EL0
     0xdf1a, // CNTV_CVAL_EL0
     0xe703, // CNTVOFF_EL2
+    // Pointer-authentication keys: the kernel signs return addresses with these,
+    // so a restore onto a fresh vCPU (whose keys differ) would fault on the first
+    // AUTIASP unless they travel with the snapshot. All five pairs (A/B
+    // instruction, A/B data, generic).
+    0xc108, // APIAKEYLO_EL1
+    0xc109, // APIAKEYHI_EL1
+    0xc10a, // APIBKEYLO_EL1
+    0xc10b, // APIBKEYHI_EL1
+    0xc110, // APDAKEYLO_EL1
+    0xc111, // APDAKEYHI_EL1
+    0xc112, // APDBKEYLO_EL1
+    0xc113, // APDBKEYHI_EL1
+    0xc118, // APGAKEYLO_EL1
+    0xc119, // APGAKEYHI_EL1
 };
 
 /// GIC state save/restore (macOS 15+): `state_create` snapshots the live GIC into
@@ -120,6 +134,27 @@ pub extern fn hv_gic_state_create() hv_gic_state_t;
 pub extern fn hv_gic_state_get_size(state: hv_gic_state_t, size: *usize) hv_return_t;
 pub extern fn hv_gic_state_get_data(state: hv_gic_state_t, data: *anyopaque) hv_return_t;
 pub extern fn hv_gic_set_state(data: *const anyopaque, size: usize) hv_return_t;
+
+/// GICv3 CPU-interface (ICC_*) registers: per-vCPU state that hv_gic_state does
+/// NOT cover (that snapshots the distributor + redistributors). Without restoring
+/// these onto a fresh vCPU, the CPU interface stays at reset (group 1 disabled,
+/// priority mask blocking everything) and the core rejects every interrupt -
+/// including the timer - so a restored guest is alive but frozen. SRE must be set
+/// first (it gates sysreg access to the interface), so it leads the list.
+pub const hv_gic_icc_reg_t = c_int;
+pub extern fn hv_gic_get_icc_reg(vcpu: hv_vcpu_t, reg: hv_gic_icc_reg_t, value: *u64) hv_return_t;
+pub extern fn hv_gic_set_icc_reg(vcpu: hv_vcpu_t, reg: hv_gic_icc_reg_t, value: u64) hv_return_t;
+pub const SNAPSHOT_ICC_REGS = [_]hv_gic_icc_reg_t{
+    0xc665, // SRE_EL1 (first: enables sysreg access to the interface)
+    0xc230, // PMR_EL1 (priority mask)
+    0xc666, // IGRPEN0_EL1
+    0xc667, // IGRPEN1_EL1 (group 1 enable)
+    0xc643, // BPR0_EL1
+    0xc663, // BPR1_EL1
+    0xc664, // CTLR_EL1
+    0xc644, // AP0R0_EL1
+    0xc648, // AP1R0_EL1
+};
 
 /// Framework GIC (macOS 15+): an in-hypervisor GICv3, the aarch64 analog of the
 /// in-kernel LAPIC the KVM split irqchip gives us. Created once per VM, before

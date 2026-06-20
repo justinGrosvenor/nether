@@ -337,16 +337,28 @@ The build-out arc (offline-first chunks):
    orchestrator thread drives a phase machine (`SnapCtl`) and each vCPU
    self-captures/self-restores its own context at a rendezvous (register access is
    owning-thread only) before the orchestrator snapshots/restores the global state.
-   Proven live (opt-in `nether-snapshot` marker): snapshot a 4-core Alpine guest at
-   the shell (`ram=512MiB gic=126405B cpus=4`), let it run (a `/tmp/REWIND_ME` file
-   is created, ~130 KB of RAM changes), then restore - the file is gone, the RAM is
-   rewound, and the guest stays fully interactive across all 4 cores. The capture
-   is in-memory ("rewind"); a byte-serialized form is the same data and is the next
-   step toward cross-process fork. Code: `hvf_backend.zig` (CpuState, SnapCtl,
-   capture/restore, GIC wrappers), `hvf.zig` (bindings + the EL1 sys-reg list),
-   `main.zig` (the orchestrator). Known rough edges: full-RAM copy (no dirty-page
-   CoW yet) and the PL011 console state is outside the snapshot (the I/O channel,
-   not guest-visible architectural state).
+   Proven live two ways:
+   - **In-memory rewind** (opt-in `nether-snapshot`): snapshot a 4-core Alpine guest
+     at the shell (`ram=512MiB gic=126405B cpus=4`), let it run (a `/tmp/REWIND_ME`
+     file is created, ~130 KB of RAM changes), then restore - the file is gone, the
+     RAM is rewound, and the guest stays fully interactive across all 4 cores.
+   - **Cross-process fork** (`nether-snapshot-save` writes `nether.snap`; a separate
+     run with `nether-restore` rebuilds the VM from it - no kernel/DTB boot, the
+     snapshot *is* the guest). A 513 MiB file restores to a fully interactive 4-core
+     guest, and a `/tmp/fork_marker` written in the original before the snapshot is
+     present in the fork - live filesystem + memory state carried across processes.
+   Getting cross-process restore right surfaced three pieces of per-vCPU state that
+   in-place rewind never exercised (the original vCPU kept them) but a fresh vCPU
+   does not inherit: the **pointer-auth keys** (APIAKEY...; else the first `autiasp`
+   faults and the kernel kills the idle task), the **GICv3 CPU-interface registers**
+   (ICC_PMR/IGRPEN1/SRE/...; without them the fresh CPU interface masks every
+   interrupt and the guest is alive-but-frozen), and the **PL011 IMSC** (else the
+   restored console has RX interrupts masked and goes deaf). Code: `hvf_backend.zig`
+   (CpuState incl. sys+ICC regs, SnapCtl, capture/restore, GIC state wrappers),
+   `hvf.zig` (bindings + the EL1 sys-reg and ICC-reg lists), `virtio.zig`
+   (pointer-free `DeviceState` export/import), `pl011.zig` (`State`), `main.zig`
+   (orchestrator + `nether.snap` format + the restore path). Known rough edges:
+   full-RAM copy (no dirty-page CoW yet); same-host/same-build snapshot format.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track. SMP and snapshot on the KVM

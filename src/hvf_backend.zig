@@ -159,6 +159,7 @@ pub const CpuState = struct {
     fpsr: u64 = 0,
     v: [32]hvf.hv_simd_fp_uchar16 = [_]hvf.hv_simd_fp_uchar16{@splat(0)} ** 32,
     sys: [hvf.SNAPSHOT_SYS_REGS.len]u64 = [_]u64{0} ** hvf.SNAPSHOT_SYS_REGS.len,
+    icc: [hvf.SNAPSHOT_ICC_REGS.len]u64 = [_]u64{0} ** hvf.SNAPSHOT_ICC_REGS.len,
 };
 
 /// Snapshot/restore coordination across vCPU threads. The orchestrator sets a
@@ -207,6 +208,7 @@ pub const Vcpu = struct {
         _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_FPSR, &s.fpsr);
         for (&s.v, 0..) |*q, i| _ = hvf.hv_vcpu_get_simd_fp_reg(self.handle, @intCast(i), q);
         for (hvf.SNAPSHOT_SYS_REGS, 0..) |reg, i| _ = hvf.hv_vcpu_get_sys_reg(self.handle, reg, &s.sys[i]);
+        for (hvf.SNAPSHOT_ICC_REGS, 0..) |reg, i| _ = hvf.hv_gic_get_icc_reg(self.handle, reg, &s.icc[i]);
         return s;
     }
 
@@ -219,6 +221,7 @@ pub const Vcpu = struct {
         _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_FPSR, s.fpsr);
         for (s.v, 0..) |q, i| _ = hvf.hv_vcpu_set_simd_fp_reg(self.handle, @intCast(i), q);
         for (hvf.SNAPSHOT_SYS_REGS, 0..) |reg, i| _ = hvf.hv_vcpu_set_sys_reg(self.handle, reg, s.sys[i]);
+        for (hvf.SNAPSHOT_ICC_REGS, 0..) |reg, i| _ = hvf.hv_gic_set_icc_reg(self.handle, reg, s.icc[i]);
     }
 
     /// The guest-physical base the framework placed this vCPU's GIC redistributor

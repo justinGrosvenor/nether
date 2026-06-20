@@ -158,6 +158,69 @@ pub const Device = struct {
         return (@as(u64, self.bar1) << 32) | (self.bar0 & 0xFFFFFFF0);
     }
 
+    /// Pointer-free snapshot of a Device's mutable transport state. The live
+    /// Device's backend/mem/IRQ pointers are not portable across a process, so a
+    /// snapshot carries only the data fields; the restore side rewires the
+    /// pointers by re-initializing the Device and then importing this state.
+    pub const DeviceState = struct {
+        features: u64,
+        driver_features: u64,
+        device_feature_select: u32,
+        driver_feature_select: u32,
+        status: u8,
+        queue_select: u16,
+        isr: u8,
+        bar0: u32,
+        bar1: u32,
+        config: [256]u8,
+        queues: [max_queues]virtq.Virtqueue,
+        qenable: [max_queues]bool,
+        msix_enabled: bool,
+        config_vector: u16,
+        queue_vector: [max_queues]u16,
+        msix_table: [num_vectors]MsixEntry,
+    };
+
+    pub fn exportState(self: *const Device) DeviceState {
+        return .{
+            .features = self.features,
+            .driver_features = self.driver_features,
+            .device_feature_select = self.device_feature_select,
+            .driver_feature_select = self.driver_feature_select,
+            .status = self.status,
+            .queue_select = self.queue_select,
+            .isr = self.isr,
+            .bar0 = self.bar0,
+            .bar1 = self.bar1,
+            .config = self.config,
+            .queues = self.queues,
+            .qenable = self.qenable,
+            .msix_enabled = self.msix_enabled,
+            .config_vector = self.config_vector,
+            .queue_vector = self.queue_vector,
+            .msix_table = self.msix_table,
+        };
+    }
+
+    pub fn importState(self: *Device, s: *const DeviceState) void {
+        self.features = s.features;
+        self.driver_features = s.driver_features;
+        self.device_feature_select = s.device_feature_select;
+        self.driver_feature_select = s.driver_feature_select;
+        self.status = s.status;
+        self.queue_select = s.queue_select;
+        self.isr = s.isr;
+        self.bar0 = s.bar0;
+        self.bar1 = s.bar1;
+        self.config = s.config;
+        self.queues = s.queues;
+        self.qenable = s.qenable;
+        self.msix_enabled = s.msix_enabled;
+        self.config_vector = s.config_vector;
+        self.queue_vector = s.queue_vector;
+        self.msix_table = s.msix_table;
+    }
+
     /// Raise the completion interrupt for queue `q`: MSI-X if enabled, else the
     /// legacy ISR/IRQ. Backends call this after publishing to the used ring.
     pub fn interruptQueue(self: *Device, q: u16) void {
@@ -402,6 +465,47 @@ test "config space exposes a modern virtio function" {
 
     dev.commonWrite(0x00, 1);
     try std.testing.expectEqual(@as(u32, 1), dev.commonRead(0x04)); // VERSION_1 in high dword
+}
+
+test "device transport state round-trips through export/import" {
+    var ram = [_]u8{0} ** 64;
+    const Noop = struct {
+        fn notify(p: *anyopaque, d: *Device, q: u16) void {
+            _ = p;
+            _ = d;
+            _ = q;
+        }
+        fn cfg(p: *anyopaque, o: u16, s: u8) u32 {
+            _ = p;
+            _ = o;
+            _ = s;
+            return 0;
+        }
+    };
+    const be = Backend{ .ptr = undefined, .device_id = 2, .num_queues = 2, .device_features = 0, .notify = Noop.notify, .config_read = Noop.cfg };
+    var src = Device.init(be, .{ .bytes = &ram, .base = 0 });
+    // Mutate transport state the way a driver would.
+    src.assignBar(0x8000004000);
+    src.commonWrite(0x14, 0xb); // status
+    src.commonWrite(0x16, 1); // queue_select = 1
+    src.commonWrite(0x18, 128); // queue_size
+    src.commonWrite(0x1c, 1); // queue_enable
+    src.isr = 1;
+
+    const state = src.exportState();
+
+    // A freshly-initialized device with different live pointers imports the state.
+    var ram2 = [_]u8{0} ** 64;
+    var dst = Device.init(be, .{ .bytes = &ram2, .base = 0x1000 });
+    dst.importState(&state);
+
+    try std.testing.expectEqual(@as(u64, 0x8000004000), dst.barBase());
+    try std.testing.expectEqual(@as(u8, 0xb), dst.status);
+    try std.testing.expectEqual(@as(u16, 128), dst.queues[1].size);
+    try std.testing.expect(dst.qenable[1]);
+    try std.testing.expectEqual(@as(u8, 1), dst.isr);
+    // The live binding (guest memory) is untouched by import.
+    try std.testing.expectEqual(@as(u64, 0x1000), dst.mem.base);
 }
 
 test "MSI-X delivers a queue completion to the programmed vector" {
