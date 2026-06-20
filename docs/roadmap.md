@@ -234,8 +234,8 @@ The build-out arc (offline-first chunks):
    repacked as an initramfs with a tiny `/init`; recipe in
    [running-on-hvf.md](running-on-hvf.md)) it boots straight to a proper Alpine
    busybox shell as root. Next: virtio on aarch64 (step 5).
-5. **virtio on aarch64 (foundation; BAR-assignment blocked).** Two transports
-   exist behind the shared backends:
+5. **virtio on aarch64 (working: BAR assignment solved).** Two transports exist
+   behind the shared backends:
    - **virtio-mmio** (`virtio_mmio.zig`) - unit-tested and its DTB nodes parse
      (they appear under `/proc/device-tree`), but stock Alpine kernels build
      `VIRTIO_MMIO` as a module (not `=y`), so nothing binds. Kept as the clean
@@ -243,64 +243,44 @@ The build-out arc (offline-first chunks):
    - **virtio-pci** (the path stock kernels support): a generic-ECAM host bridge
      (`pci.zig` made ECAM-base-configurable) + a `pcie@...` DTB node (ranges,
      bus-range, 64-bit non-prefetchable MMIO window) + a window-wide dispatcher
-     routing to the device's live BAR. **The virtio-rng device now enumerates**:
-     it appears as `0000:00:01.0 [1af4:1044]` in the guest's PCI bus and sysfs,
-     BAR sized and detected. The virtio BAR was switched to 64-bit
-     non-prefetchable (pci-host-generic requires a non-pref window; harmless on
-     x86).
-   - **DTB now QEMU-equivalent and `dtc`-clean.** Installed `qemu`/`dtc`, dumped a
-     real `-M virt` DTB, and diffed the `pcie` node against ours - which surfaced
-     and fixed several real bugs: the GIC node was missing `#address-cells`/
-     `#size-cells`/`ranges` (so an `interrupt-map` referencing it mis-parsed); the
-     `interrupt-map` entries lacked the 2 parent-address cells the GIC's
-     `#address-cells=2` requires; we had only one MMIO window where QEMU has both
-     a 32-bit non-prefetchable and a 64-bit window (both now emitted and
-     registered by the kernel as root-bus resources); and `bus-range` is now
-     consistent with the 1-bus ECAM. The blob validates clean under `dtc`.
-   - **Root cause isolated via trace-diff (still open).** Captured Nether's
-     config-space accesses (trace marker) and QEMU's (`-trace pci_cfg_write`) for
-     the same kernel + an equivalent DTB, and ran the kernel's PCI setup `dyndbg`:
-       * Nether: the kernel sizes BAR0 (writes 0xffffffff, reads the mask, writes
-         the type bits back) and then goes **straight to the virtio-pci probe** -
-         no assignment write to BAR0, COMMAND register never enabled. The PCI
-         setup debug shows scan -> "resource 4/5" -> "not claimed", with **no
-         `pci_bus_assign_resources` pass at all**.
-       * QEMU: after sizing, a second pass **assigns** (`@0x20<-0x400c @0x24<-0x80`
-         -> BAR at 0x8000004000) and **enables** the device (`@0x4<-0x7` =
-         MEM|IO|BUS_MASTER), then `/dev/hwrng` works.
-     So Nether's `pci-host-generic` takes the **claim** path while QEMU's takes
-     **assign** - the device tree and the config-space emulation are both correct
-     (device enumerates, BAR sizes right); the difference is purely the kernel's
-     claim-vs-assign decision for this bus. Ruled out (tested, no effect):
-     prefetchable vs non-pref BAR/window, 32/64-bit windows, the I/O window
-     (root-bus resources now match QEMU exactly), interrupt-map, GIC #address-cells,
-     bus-range, pre-assign vs kernel-assign, `pci=realloc`, and
-     `linux,pci-probe-only=0`.
-   - **Kernel 6.12 source read (done) - and the contradiction.** Traced the full
-     call graph: `pci-host-common.c` calls `of_pci_check_probe_only()` then
-     `pci_host_probe()`, which claims first only if `bridge->preserve_config` and
-     then *unconditionally* calls `pci_assign_unassigned_root_bus_resources()`
-     ("if we didn't claim above, this will reassign everything").
-     `bridge->preserve_config = pci_preserve_config()` = `pci_acpi_preserve_config`
-     (false on a DT boot - no ACPI handle) OR `of_pci_preserve_config(pcie_node)`,
-     which with `linux,pci-probe-only=<0>` (confirmed in the blob via dtc) returns
-     false; `of_pci_check_probe_only` then clears the global `PCI_PROBE_ONLY`. So
-     **by the source the assign pass should run and reassign our BAR** - yet
-     setup-bus.c emits nothing for our device (no "assigned"/"no space") and the
-     BAR is never written, while QEMU's kernel (same Image, equivalent DT boot)
-     assigns and enables it. The source-level gates all say "assign" but the
-     runtime takes the claim path: a contradiction that source-reading and
-     guest-side tracing cannot resolve.
-   - **One structural diff remains:** QEMU's node has `msi-map` -> a
-     `arm,gic-v2m-frame` msi-controller; ours has none (the framework GIC's MSI
-     isn't described to the guest). Unproven whether it diverts resource
-     assignment, but it's the next lever. **Next:** (a) model the GIC MSI in the
-     DTB (a GICv3 ITS or v2m frame) + wire `hv_gic_send_msi`, then retest
-     assignment; or (b) use an instrumented/debuggable kernel (CONFIG_PCI_DEBUG
-     build, or a kgdb / QEMU-gdb session) to watch the assign decision directly,
-     since the stock kernel contradicts its own source here. The transport,
-     datapath, and DTB are correct and reusable; only this last kernel-side assign
-     gate stands between enumeration and a bound virtio-pci device.
+     routing to the device's live BAR. **The virtio-rng device now fully
+     enumerates AND its BAR is assigned and the device enabled**: the guest log
+     shows `BAR 0 [mem 0x8000000000-0x8000007fff 64bit pref]: assigned` then
+     `virtio-pci 0000:00:01.0: enabling device (0000 -> 0002)`, and the device
+     registers on the virtio bus as `virtio0`. The virtio core resets it,
+     negotiates features over the BAR MMIO, and acknowledges it.
+   - **DTB is QEMU-equivalent and `dtc`-clean** (installed `qemu`/`dtc`, dumped a
+     real `-M virt` DTB and diffed the `pcie`/GIC nodes; fixed the GIC
+     `#address-cells`/`#size-cells`/`ranges`, the `interrupt-map` parent-address
+     cells, and added both the 32-bit and 64-bit MMIO windows). All correct - but
+     the DTB was never the blocker.
+   - **THE ROOT CAUSE (solved): a zero PCI class code.** Our config space left the
+     class code bytes (0x09-0x0b) unset, so the device reported `class 0x000000`.
+     Linux's resource assigner `__dev_sort_resources()` (drivers/pci/setup-bus.c)
+     begins with `if (class == PCI_CLASS_NOT_DEFINED || class ==
+     PCI_CLASS_BRIDGE_HOST) return;` - so a device whose `class >> 8` is 0 is
+     **skipped entirely by the assign pass**, its BARs never added to the
+     assignment list. That is exactly why our BAR stayed unassigned ("not claimed;
+     can't enable device") while QEMU's devices (class `0x020000` net,
+     `0x00ff00` rng) were assigned. The fix is a one-liner in `virtio.zig
+     buildConfig`: write a real per-type class (net `0x0200`, block `0x0100`,
+     console `0x0780`, else `PCI_CLASS_OTHERS 0x00ff`) at config offset 0x0a. The
+     `: assigned`/`enabling device` log lines are `pci_info` level and print
+     regardless of `dyndbg`, which is what finally exposed the difference - and
+     retroactively explains the old "trace-diff": the claim-vs-assign framing and
+     the `msi-map`/`preserve_config` theories were all red herrings; the assign
+     pass was silently filtering the device on class.
+   - **Datapath proof is gated on a guest leaf driver, not on Nether.** This
+     minimal Alpine minirootfs ships **no kernel modules** (`/lib/modules` is
+     absent) and the kernel has only `virtio_console`/`virtio_rproc_serial` built
+     in - `virtio_rng`/`blk`/`net` are all modules, so none can bind here (same
+     shape as the virtio-mmio finding, one level deeper: the transport works and
+     the device registers as `virtio0`; only the leaf driver is missing). **Next:**
+     a `virtio-console` device backend (device_id 3, the only built-in leaf
+     driver) to exercise a real virtqueue datapath (`/dev/hvc0`) on HVF; or a
+     richer rootfs/kernel with `virtio_rng=y`. MSI-X interrupt delivery
+     (`hv_gic_send_msi`, not yet bound) is the other remaining piece for a fully
+     interrupt-driven datapath.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

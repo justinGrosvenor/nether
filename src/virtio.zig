@@ -100,6 +100,18 @@ pub const Device = struct {
         std.mem.writeInt(u16, c[2..4], 0x1040 + self.backend.device_id, .little);
         std.mem.writeInt(u16, c[6..8], 0x0010, .little); // status: cap list
         c[8] = 0x01; // revision (modern)
+        // PCI class code (bytes 0x09 prog-if, 0x0a subclass, 0x0b base class).
+        // This MUST be non-zero: the Linux resource assigner skips any device
+        // whose class>>8 is PCI_CLASS_NOT_DEFINED (0x0000) in __dev_sort_resources,
+        // leaving its BARs unassigned ("not claimed; can't enable device"). We
+        // mirror QEMU virtio-pci's per-type classes; default is PCI_CLASS_OTHERS.
+        const class_dev: u16 = switch (self.backend.device_id) {
+            1 => 0x0200, // net
+            2 => 0x0100, // block (mass storage)
+            3 => 0x0780, // console (simple comms)
+            else => 0x00ff, // rng and others: PCI_CLASS_OTHERS
+        };
+        std.mem.writeInt(u16, c[0x0a..0x0c], class_dev, .little); // base/subclass
         c[0x0e] = 0x00; // header type 0
         std.mem.writeInt(u16, c[0x2c..0x2e], 0x1af4, .little);
         std.mem.writeInt(u16, c[0x2e..0x30], self.backend.device_id, .little);
