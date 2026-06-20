@@ -234,8 +234,8 @@ The build-out arc (offline-first chunks):
    repacked as an initramfs with a tiny `/init`; recipe in
    [running-on-hvf.md](running-on-hvf.md)) it boots straight to a proper Alpine
    busybox shell as root. Next: virtio on aarch64 (step 5).
-5. **virtio on aarch64 (working: BAR assignment solved).** Two transports exist
-   behind the shared backends:
+5. **virtio on aarch64 (working end-to-end: virtio-console datapath live).** Two
+   transports exist behind the shared backends:
    - **virtio-mmio** (`virtio_mmio.zig`) - unit-tested and its DTB nodes parse
      (they appear under `/proc/device-tree`), but stock Alpine kernels build
      `VIRTIO_MMIO` as a module (not `=y`), so nothing binds. Kept as the clean
@@ -270,17 +270,28 @@ The build-out arc (offline-first chunks):
      retroactively explains the old "trace-diff": the claim-vs-assign framing and
      the `msi-map`/`preserve_config` theories were all red herrings; the assign
      pass was silently filtering the device on class.
-   - **Datapath proof is gated on a guest leaf driver, not on Nether.** This
-     minimal Alpine minirootfs ships **no kernel modules** (`/lib/modules` is
-     absent) and the kernel has only `virtio_console`/`virtio_rproc_serial` built
-     in - `virtio_rng`/`blk`/`net` are all modules, so none can bind here (same
-     shape as the virtio-mmio finding, one level deeper: the transport works and
-     the device registers as `virtio0`; only the leaf driver is missing). **Next:**
-     a `virtio-console` device backend (device_id 3, the only built-in leaf
-     driver) to exercise a real virtqueue datapath (`/dev/hvc0`) on HVF; or a
-     richer rootfs/kernel with `virtio_rng=y`. MSI-X interrupt delivery
-     (`hv_gic_send_msi`, not yet bound) is the other remaining piece for a fully
-     interrupt-driven datapath.
+   - **Datapath proven end-to-end via virtio-console.** This minimal Alpine
+     minirootfs ships no kernel modules (`/lib/modules` absent) and the kernel has
+     only `virtio_console`/`virtio_rproc_serial` built in - so `virtio_console`
+     (`virtio_console.zig`, device_id 3) was added as the leaf that actually binds
+     and creates `/dev/hvc0`. Both directions of the virtqueue DMA datapath now
+     work live on HVF:
+       * **TX** (guest -> host): `echo X > /dev/hvc0` kicks the transmitq; the
+         backend walks the descriptor chain, reads guest memory over the assigned
+         BAR, and emits to host stdout.
+       * **RX** (host -> guest): `pushRx` fills a posted receiveq buffer and raises
+         the completion; the guest reads it from hvc0.
+   - **Legacy INTx interrupts (level) wired and proven.** With no MSI domain in
+     the DTB the guest virtio-pci driver falls back to INTx; we report Interrupt
+     Pin = INTA (config 0x3d) and route it through the pcie interrupt-map to a GIC
+     SPI. `virtio.Device` drives the line as a level (raise when the ISR is set,
+     lower when the guest reads/clears it, via `intx_fn`); on HVF that is
+     `hv_gic_set_spi`. The guest shows `14: <count> GICv3 36 Level virtio0` and the
+     count increments on each RX delivery - real interrupt delivery on the PCI
+     INTx SPI, confirmed. **Remaining (optional):** MSI-X via `hv_gic_send_msi`
+     (not yet bound) + an `msi-map`/ITS in the DTB for a message-signalled path; a
+     richer rootfs/kernel with `virtio_rng=y` to exercise the rng/blk/net backends
+     directly over PCI.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

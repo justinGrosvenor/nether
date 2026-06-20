@@ -76,6 +76,11 @@ pub const Device = struct {
     irq_fn: ?*const fn (ptr: *anyopaque) void = null,
     msi_ptr: ?*anyopaque = null,
     msi_fn: ?*const fn (ptr: *anyopaque, addr: u64, data: u32) void = null,
+    // Legacy PCI INTx as a level line (aarch64, where there is no MSI domain in
+    // the DTB so the guest virtio-pci driver falls back to INTx). Raised when the
+    // ISR is set, lowered when the guest reads (and thereby clears) the ISR.
+    intx_ptr: ?*anyopaque = null,
+    intx_fn: ?*const fn (ptr: *anyopaque, level: bool) void = null,
 
     pub fn init(backend: Backend, mem: virtq.GuestMem) Device {
         var d = Device{
@@ -113,6 +118,10 @@ pub const Device = struct {
         };
         std.mem.writeInt(u16, c[0x0a..0x0c], class_dev, .little); // base/subclass
         c[0x0e] = 0x00; // header type 0
+        // Interrupt Pin = INTA. On a DT boot with no MSI domain the guest routes
+        // this through the pcie interrupt-map to a GIC SPI and uses INTx; without
+        // a non-zero pin the PCI core assigns no IRQ and find_vqs has none to use.
+        c[0x3d] = 0x01;
         std.mem.writeInt(u16, c[0x2c..0x2e], 0x1af4, .little);
         std.mem.writeInt(u16, c[0x2e..0x30], self.backend.device_id, .little);
         c[0x34] = 0x40; // cap pointer
@@ -160,7 +169,10 @@ pub const Device = struct {
                 trace.log("msi q={d} vec={d} addr=0x{x} data=0x{x}", .{ q, vec, e.addr, e.data });
                 if (self.msi_fn) |f| f(self.msi_ptr.?, e.addr, e.data);
             }
-        } else if (self.irq_fn) |f| f(self.irq_ptr.?);
+        } else {
+            if (self.irq_fn) |f| f(self.irq_ptr.?);
+            if (self.intx_fn) |f| f(self.intx_ptr.?, true); // INTx level high
+        }
     }
 
     // --- PCI config space ---------------------------------------------------
@@ -225,6 +237,7 @@ pub const Device = struct {
         if (off < notify_off) {
             const v = self.isr;
             self.isr = 0;
+            if (self.intx_fn) |f| f(self.intx_ptr.?, false); // INTx level low after ISR read
             return v;
         }
         if (off < device_off) return 0; // notify region
@@ -315,6 +328,7 @@ pub const Device = struct {
                     self.isr = 0;
                     self.msix_enabled = false;
                     self.resetQueues();
+                    if (self.intx_fn) |f| f(self.intx_ptr.?, false); // line low on reset
                 }
             },
             0x16 => self.queue_select = @truncate(value),

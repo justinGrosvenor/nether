@@ -562,19 +562,32 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
-    // virtio-pci: a generic-ECAM PCIe host bridge with a virtio-rng function,
+    // virtio-pci: a generic-ECAM PCIe host bridge with a virtio-console function,
     // reusing the same PCI transport + backends + virtq as the x86 path. The
     // guest RAM view (where the queues live) is `ram` based at ARM_RAM_BASE.
+    // virtio-console is used here because it is one of the only virtio leaf
+    // drivers built into the stock Alpine `virt` kernel (the rest are modules
+    // absent from the minirootfs), so it actually binds and creates /dev/hvc0 -
+    // giving a real virtqueue datapath over the BAR to exercise on HVF.
     const gmem = nether.virtq.GuestMem{ .bytes = ram, .base = ARM_RAM_BASE };
     var pci_host = nether.PciHost{ .ecam_base = nether.memmap_arm.ecam_base, .ecam_size = nether.memmap_arm.ecam_size };
 
-    var rng = nether.VirtioRng{};
-    var rng_dev = nether.virtio.Device.init(rng.backend(), gmem);
+    var con = nether.VirtioConsole{};
+    con.out_fn = consoleOut; // guest hvc0 output -> host stdout
+    con.out_ctx = &con;
+    var con_dev = nether.virtio.Device.init(con.backend(), gmem);
+    con.attach(&con_dev);
+    // INTx (level) for completions: this kernel has no MSI domain (no msi-map in
+    // the DTB), so virtio-pci falls back to legacy INTx routed via the pcie
+    // interrupt-map to a GIC SPI. Device at slot 1, pin INTA -> the DTB swizzle
+    // gives spi = pci_intx_spi + ((slot + pin - 1) % 4).
+    con_dev.intx_ptr = &con_dev;
+    con_dev.intx_fn = armPciIntx;
     // Don't pre-assign: let the kernel place the 64-bit BAR in the 64-bit window
     // (like QEMU). A window-wide dispatcher routes accesses to its live base.
-    try pci_host.addFunction(rng_dev.function(1, 0)); // PCI 0:1.0
-    var rng_bar = PciBarWindow{ .dev = &rng_dev };
-    try bus.addMmio(rng_bar.device());
+    try pci_host.addFunction(con_dev.function(1, 0)); // PCI 0:1.0
+    var con_bar = PciBarWindow{ .dev = &con_dev };
+    try bus.addMmio(con_bar.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
@@ -663,6 +676,24 @@ fn uartOut(ctx: *anyopaque, byte: u8) void {
     _ = ctx;
     const b = [1]u8{byte};
     _ = std.c.write(1, &b, 1);
+}
+
+/// virtio-console TX sink: write guest hvc0 output straight to host stdout. The
+/// bytes arrive via the virtqueue DMA datapath over the assigned BAR (not the
+/// PL011), so seeing them is the end-to-end virtio-pci proof on aarch64.
+fn consoleOut(ctx: *anyopaque, bytes: []const u8) void {
+    _ = ctx;
+    _ = std.c.write(1, bytes.ptr, bytes.len);
+}
+
+/// Legacy PCI INTx line for the virtio function, delivered as a GIC SPI level.
+/// The DTB interrupt-map routes slot 1 / INTA to this SPI (see memmap_arm and
+/// dtb.zig's swizzle: pci_intx_spi + ((slot + pin - 1) % 4), slot=1 pin=1).
+const ARM_PCI_INTX_INTID: u32 = 32 + nether.memmap_arm.pci_intx_spi + ((1 + 1 - 1) % 4);
+fn armPciIntx(ctx: *anyopaque, level: bool) void {
+    _ = ctx;
+    const hvf = @import("hvf.zig");
+    _ = hvf.hv_gic_set_spi(ARM_PCI_INTX_INTID, level);
 }
 
 /// The PL011's SPI interrupt id: SPIs start at GIC INTID 32, and the DTB places
