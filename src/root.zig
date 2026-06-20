@@ -17,6 +17,8 @@ pub const PioDevice = io.PioDevice;
 pub const MmioDevice = io.MmioDevice;
 
 pub const memmap = @import("memmap.zig");
+pub const memmap_arm = @import("memmap_arm.zig");
+pub const dtb = @import("dtb.zig");
 pub const irqchip = @import("irqchip.zig");
 pub const acpi = @import("acpi.zig");
 pub const elf = @import("elf.zig");
@@ -65,6 +67,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
     _ = @import("pl011.zig"); // aarch64 PL011 UART
+    _ = @import("dtb.zig"); // aarch64 device-tree generator
     // Pull in the vendored VT files so their tests run too.
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");
