@@ -81,28 +81,51 @@ the DTB at +128 MiB, and the initramfs at +192 MiB; it is interactive (type into
 the shell). It powers off with `poweroff` (PSCI SYSTEM_OFF) or Ctrl-A is not
 needed - exit by killing the process.
 
-### Exercising virtio-blk (and other module-only leaf drivers)
+### Kernel + module-only leaf drivers (virtio-blk, vsock)
 
-The `virt` kernel builds `virtio_pci` in but `virtio_blk`/`virtio_net`/`virtio_rng`
-as modules, and the minirootfs ships none. The matching modules (same kernel
-version, so no vermagic mismatch) live in Alpine's netboot `initramfs-virt`; drop
-the one you want into our initramfs and `insmod` it from the guest shell:
+The `virt` kernel builds `virtio_pci` in but `virtio_blk`/`virtio_net`/`vsock`
+etc. as modules, and the minirootfs ships none. The kernel image AND its modules
+both live in the Alpine `linux-virt` apk, so pulling both from one apk guarantees
+a vermagic match (don't mix versions). Current kernel: `6.12.93-0-virt`.
 
 ```sh
-A=https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64
-curl -fSLO "$A/netboot/initramfs-virt"
-mkdir -p iv && ( cd iv && gunzip -c ../initramfs-virt | cpio -idmu --quiet )
-# our nether wires a virtio-blk function (0:2.0) backed by an in-memory disk;
-# add its leaf driver so the guest can bind it as /dev/vda:
-mkdir -p rootfs && cp iv/lib/modules/6.12.81-0-virt/kernel/drivers/block/virtio_blk.ko rootfs/
-( cd rootfs && find . | cpio -o -H newc --quiet | gzip ) > initramfs.cpio.gz
+# one apk has /boot/vmlinuz-virt (EFI-zboot) and /lib/modules/<ver>/ (all modules)
+V=6.12.93-r0; MV=6.12.93-0-virt
+curl -fSLO "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/linux-virt-$V.apk"
+mkdir -p lv && tar -xzf linux-virt-$V.apk -C lv 2>/dev/null
+# unwrap the EFI-zboot kernel to a raw Image:
+off=$(($(od -An -tu4 -j8  -N4 lv/boot/vmlinuz-virt)))
+len=$(($(od -An -tu4 -j12 -N4 lv/boot/vmlinuz-virt)))
+tail -c +$((off+1)) lv/boot/vmlinuz-virt | head -c "$len" | gunzip > kernels/Image
+# add the leaf modules (modules are gzipped .ko.gz; insmod needs them decompressed)
+M=lv/lib/modules/$MV/kernel
+for ko in drivers/block/virtio_blk net/vmw_vsock/vsock \
+          net/vmw_vsock/vmw_vsock_virtio_transport_common \
+          net/vmw_vsock/vmw_vsock_virtio_transport; do
+  gunzip -c "$M/$ko.ko.gz" > "rootfs/$(basename $ko).ko"
+done
+# the static vsock client (busybox has no vsock tool):
+zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vsock_client
+( cd rootfs && find . | cpio -o -H newc --quiet | gzip ) > kernels/initramfs.cpio.gz
 ```
 
-In the guest: `insmod /virtio_blk.ko` -> `/dev/vda` appears (2048 512-byte
-sectors); `head -c 26 /dev/vda` reads back the `NETHER-VIRTIO-BLK-DISK-OK`
-signature, proving the block datapath (request chain -> disk read -> DMA -> used
-ring -> MSI-X completion). The same approach would bind `virtio_net.ko` once a
-macOS host network backend (vmnet) and a net function are wired on this path.
+- **virtio-blk** (`0:2.0`, in-memory disk): `insmod /virtio_blk.ko` -> `/dev/vda`
+  (2048 512-byte sectors); `head -c 26 /dev/vda` reads back the
+  `NETHER-VIRTIO-BLK-DISK-OK` signature, proving the block datapath (request chain
+  -> disk read -> DMA -> used ring -> MSI-X completion).
+- **virtio-vsock** (`0:3.0`, opt-in via a `nether-vsock` marker): the host listens
+  on port 1234 and echoes. In the guest, load the three modules in order then run
+  the client:
+  ```sh
+  insmod /vsock.ko
+  insmod /vmw_vsock_virtio_transport_common.ko
+  insmod /vmw_vsock_virtio_transport.ko
+  /vsock_client     # -> "VSOCK_ECHO: HELLO_FROM_GUEST_VSOCK"
+  ```
+  That round-trip (guest connects to host CID 2:1234, sends, host echoes back)
+  exercises the full vsock datapath and is the host<->guest control channel.
+- `virtio_net.ko` would bind the same way once a macOS host net backend (vmnet)
+  and a net function are wired.
 
 ## How the Linux boot works
 

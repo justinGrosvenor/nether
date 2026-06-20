@@ -308,7 +308,21 @@ The build-out arc (offline-first chunks):
      it binds our `0:2.0` function as `/dev/vda` (2048 512-byte sectors over a 1 MiB
      in-memory disk). `head -c /dev/vda` reads back the on-disk signature, proving
      the full block datapath (request chain -> disk read -> DMA -> used ring ->
-     MSI-X completion) on aarch64/HVF. Recipe in running-on-hvf.md. **Remaining
+     MSI-X completion) on aarch64/HVF. Recipe in running-on-hvf.md.
+   - **virtio-vsock live (DONE) - the host<->guest control channel.** Function
+     `0:3.0` (opt-in via a `nether-vsock` marker), guest CID 3 / host CID 2, the
+     host listening on port 1234 and echoing (`virtio_vsock.zig`, the same engine
+     the x86 path uses). The guest vsock stack is module-only and was NOT in the old
+     netboot initramfs, and Alpine had moved `linux-virt` past our pinned kernel, so
+     the kernel was refreshed to **6.12.93-0-virt** (image + all modules pulled from
+     one `linux-virt` apk to guarantee a vermagic match). Loading `vsock.ko` +
+     `vmw_vsock_virtio_transport_common.ko` + `vmw_vsock_virtio_transport.ko` binds
+     our `0:3.0` function; a tiny static aarch64 vsock client
+     (`tools/vsock_client.c`, since busybox has no vsock tool) connects to host
+     CID 2:1234, sends a line, and prints the echo
+     (`VSOCK_ECHO: HELLO_FROM_GUEST_VSOCK`) - the full vsock datapath (3 queues,
+     connection state machine, credit flow control, MSI-X) over virtio-pci. Boot,
+     SMP, and virtio-blk re-verified on the refreshed kernel. **Remaining
      (optional):** a macOS host net backend (vmnet) + a net function to bind
      `virtio_net.ko` the same way.
 6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs

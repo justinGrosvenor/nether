@@ -641,11 +641,40 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     blk_dev.msi_fn = armSendMsi;
     try pci_host.addFunction(blk_dev.function(2, 0));
 
+    // Function 0:3.0 - virtio-vsock, the host<->guest control channel (opt-in via
+    // a `nether-vsock` marker). Guest CID 3, host CID 2; the host listens on port
+    // 1234 and echoes. The engine is heap-allocated (large, connection state); the
+    // transport/glue are stack locals that outlive `run`.
+    var vs_engine: ?*nether.Vsock = null;
+    defer if (vs_engine) |v| allocator.destroy(v);
+    var vsdev: nether.VsockDev = undefined;
+    var vs_dev: nether.virtio.Device = undefined;
+    var vs_intx: IntxLine = undefined;
+    const vsock_on = macMarkerPresent("nether-vsock");
+    if (vsock_on) {
+        const vs = try allocator.create(nether.Vsock);
+        vs.* = .{ .guest_cid = 3 };
+        vs.on_event = vsockEcho;
+        vs.on_event_ctx = vs;
+        vs_engine = vs;
+        vsdev = .{ .engine = vs };
+        vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
+        vs_intx = .{ .intid = armPciIntxIntid(3) };
+        vs_dev.intx_ptr = &vs_intx;
+        vs_dev.intx_fn = IntxLine.set;
+        vs_dev.msi_ptr = &vs_dev;
+        vs_dev.msi_fn = armSendMsi;
+        try pci_host.addFunction(vs_dev.function(3, 0));
+        vsdev.attach(&vs_dev);
+        _ = vsdev.hostListen(1234);
+    }
+
     // One dispatcher over the 64-bit window routes to each function's live BAR.
-    var dev_list = [_]*nether.virtio.Device{ &con_dev, &blk_dev };
-    var bar_win = PciBarWindow{ .devs = &dev_list };
+    var dev_list = [_]*nether.virtio.Device{ &con_dev, &blk_dev, &vs_dev };
+    var bar_win = PciBarWindow{ .devs = if (vsock_on) dev_list[0..3] else dev_list[0..2] };
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
+    if (vsock_on) std.debug.print("[nether] virtio-vsock: guest CID 3, host echo on port 1234 (PCI 0:3.0)\n", .{});
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
