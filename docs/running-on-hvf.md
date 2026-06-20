@@ -31,35 +31,78 @@ codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
 provisioning profile is needed on your own machine. Re-sign after every rebuild
 (the binary's signature is replaced).
 
-Expected output (the current first-light milestone): a tiny aarch64 guest that
-prints over an MMIO UART and powers off.
+With no kernel present it runs a first-light blob (prints over the PL011 and
+powers off via PSCI). With a kernel + rootfs in `kernels/` (below) it **boots
+aarch64 Linux to an interactive shell**:
 
 ```
-Nether lives. Phase 0: aarch64 guest over MMIO UART.
+  Nether - aarch64 Linux on Apple Hypervisor.framework
+  Linux 6.12.81-0-virt aarch64
 
-[nether] guest shutdown.
+~ # uname -a
+Linux (none) 6.12.81-0-virt #1-Alpine SMP PREEMPT_DYNAMIC aarch64 Linux
 ```
 
-## What works today, and what's next
+## Booting Linux to a shell
 
-First light proves the HVF substrate end to end: `hv_vm_create` + `hv_vm_map`
-(guest RAM at the standard arm64 `virt` base `0x4000_0000`), `hv_vcpu_create`, the
-`hv_vcpu_run` loop, and the data-abort (ESR_EL2) decode that turns a guest MMIO
-access into a `Bus` dispatch (the same device bus the x86 path uses). A guest
-signals stop with a write to a poweroff sentinel (PSCI replaces this with the
-substrate).
+Put an arm64 kernel `Image` and an initramfs under `kernels/` (gitignored). The
+Alpine netboot kernel is EFI-zboot-wrapped, so extract the inner `Image`; the
+rootfs is the Alpine aarch64 minirootfs repacked as a newc cpio with an `/init`.
 
-Still to come on the aarch64 track (see [roadmap.md](roadmap.md)): the framework
-GIC (`hv_gic`), a PL011 UART, the ARM generic timer, PSCI for power, an
-`Image`+DTB Linux boot path, and then the virtio devices (reusing the datapath,
-with MSI via the GIC ITS).
+```sh
+mkdir -p kernels && cd kernels
+A=https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64
+
+# Kernel: fetch vmlinuz-virt and unwrap the EFI-zboot gzip payload to a raw Image.
+curl -fSLO "$A/netboot/vmlinuz-virt"
+off=$(($(od -An -tu4 -j8  -N4 vmlinuz-virt)))   # zboot payload_offset
+len=$(($(od -An -tu4 -j12 -N4 vmlinuz-virt)))   # zboot payload_size
+tail -c +$((off+1)) vmlinuz-virt | head -c "$len" | gunzip > Image
+
+# Rootfs: Alpine aarch64 minirootfs + a tiny /init, packed as a newc cpio.gz.
+curl -fSLO "$A/alpine-minirootfs-3.21.7-aarch64.tar.gz"
+mkdir -p rootfs && tar -xzf alpine-minirootfs-3.21.7-aarch64.tar.gz -C rootfs
+cat > rootfs/init <<'SH'
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+echo; echo "  Nether - aarch64 Linux on Apple Hypervisor.framework"
+echo "  $(uname -srm)"; echo
+exec /bin/sh
+SH
+chmod +x rootfs/init
+( cd rootfs && find . | cpio -o -H newc | gzip ) > initramfs.cpio.gz
+cd ..
+```
+
+Then build, sign, and run (as in step 1). The boot loads `Image` at the RAM base,
+the DTB at +128 MiB, and the initramfs at +192 MiB; it is interactive (type into
+the shell). It powers off with `poweroff` (PSCI SYSTEM_OFF) or Ctrl-A is not
+needed - exit by killing the process.
+
+## How the Linux boot works
+
+- `hv_vm_create` + `hv_vm_map` (guest RAM at the arm64 `virt` base `0x4000_0000`),
+  `hv_vcpu_create`, the `hv_vcpu_run` loop, and the ESR_EL2 decode that turns a
+  guest MMIO access into a `Bus` dispatch (the same device bus the x86 path uses).
+- **GICv3** via the framework (`hv_gic`): distributor + redistributor + MSI
+  region. The keystone is `MPIDR_EL1` - GICv3 affinity routing requires each
+  vCPU's MPIDR set before the framework will associate (and MMIO-intercept) its
+  redistributor. The redistributor *region* is ~32 MiB (max-vCPU sized), placed
+  clear of the UART/RAM, and its base is queried from the framework into the DTB.
+- **generic timer** (delivered via the GIC), **PSCI** over HVC for power, a
+  **PL011** console (TX to stdout; RX from host stdin raising the PL011 SPI), and
+  trapped system-register accesses emulated RAZ/WI.
+- The DTB (`dtb.zig`) describes all of the above; the kernel gets its address in
+  `X0` (the arm64 boot protocol).
 
 ## Notes
 
-- The guest blob is position-independent (absolute MOVZ immediates) and loaded at
-  `0x4000_0000`; after writing guest code through the host mapping we call
-  `sys_icache_invalidate`, since host data writes are not I-cache coherent with
+- Guest code/images are loaded through the host mapping, then
+  `sys_icache_invalidate`d, since host data writes are not I-cache coherent with
   the guest core on Apple Silicon.
-- `zig build run` is not wired for the codesign step; run the signed binary
-  directly as above. (Cross-compiling the Linux artifact with `zig build` is
-  unaffected and needs no signing.)
+- `zig build run` is not wired for codesigning; run the signed binary directly.
+  Cross-compiling the Linux artifact with `zig build` is unaffected and unsigned.
+- Still to come (see [roadmap.md](roadmap.md)): virtio on aarch64 (reuse the
+  device datapath; MSI via the GIC, whose region is already configured).

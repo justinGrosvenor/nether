@@ -481,7 +481,12 @@ fn macMain() !void {
 
     if (readFileMac(allocator, "kernels/Image") catch null) |kernel| {
         defer allocator.free(kernel);
-        const initramfs = readFileMac(allocator, "kernels/initramfs-virt") catch null;
+        // Prefer our own busybox/Alpine initramfs (boots to a usable shell); fall
+        // back to Alpine's netboot initramfs (which drops to recovery).
+        const initramfs: ?[]const u8 = blk: {
+            if (readFileMac(allocator, "kernels/initramfs.cpio.gz") catch null) |fs| break :blk fs;
+            break :blk readFileMac(allocator, "kernels/initramfs-virt") catch null;
+        };
         defer if (initramfs) |fs| allocator.free(fs);
         try macBootLinux(allocator, kernel, initramfs);
     } else {

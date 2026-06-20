@@ -230,8 +230,10 @@ The build-out arc (offline-first chunks):
    drops to the initramfs recovery shell (it only lacks Alpine boot media). The
    shell is **interactive**: host stdin feeds the PL011 RX, which raises its SPI
    through the GIC (`hv_gic_set_spi`) so the guest tty reads it - typing a command
-   runs it and prints back. Remaining polish: a proper rootfs/initramfs; then
-   virtio on aarch64 (step 5).
+   runs it and prints back. With a real rootfs (the Alpine aarch64 minirootfs
+   repacked as an initramfs with a tiny `/init`; recipe in
+   [running-on-hvf.md](running-on-hvf.md)) it boots straight to a proper Alpine
+   busybox shell as root. Next: virtio on aarch64 (step 5).
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
    net/vsock/rng light up on the new arch.
 
