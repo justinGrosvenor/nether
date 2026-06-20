@@ -248,14 +248,22 @@ The build-out arc (offline-first chunks):
      BAR sized and detected. The virtio BAR was switched to 64-bit
      non-prefetchable (pci-host-generic requires a non-pref window; harmless on
      x86).
-   - **Blocker:** the kernel detects the device + BAR but never claims or assigns
-     the BAR (boot is direct, with no firmware/EDK2 to assign PCI resources, and
-     this host's bus stays claim-only), so `pci_enable_device` fails (-EINVAL).
-     QEMU's `-kernel` boot works, so the gap is a DTB-pcie-node detail QEMU
-     includes (likely the `interrupt-map`/`msi-parent` + I/O range that complete
-     the bus). Next: complete the pcie node (interrupt routing) so the kernel
-     brings the bus fully up and assigns the BAR, then MSI via the framework GIC
-     (v2m) or INTx via the GIC SPI.
+   - **Blocker (precisely characterized).** The complete PCI boot log shows the
+     kernel size BAR0 and then go *straight* to "BAR 0 ...: not claimed; can't
+     enable device" - with **no assignment attempt, no conflict, and no
+     "no space" line in between**. So it is neither an address nor a flags issue:
+     the kernel detects the BAR but never inserts it into the resource tree
+     (`r->parent == NULL`), so `pci_enable_device` returns -EINVAL. Confirmed
+     orthogonal to: prefetchable vs non-prefetchable BAR, 32- vs 64-bit MMIO
+     window, pre-assigned vs kernel-assigned BAR, and `pci=realloc` (~10 combos
+     tried). QEMU's `-kernel` direct boot of the same kernel works, so the gap is
+     a property of QEMU's generated `pcie` node that ours lacks. **Next (not more
+     guessing):** dump a real QEMU virt DTB (`qemu-system-aarch64 -M
+     virt,dumpdtb=...`) and diff the pcie node against `dtb.zig`'s - needs
+     `qemu`/`dtc` installed (neither is on the box yet). Candidate missing
+     properties: `interrupt-map`/`interrupt-map-mask`, `msi-parent`/`msi-map`,
+     and the multi-entry `ranges` (I/O + 32-bit + 64-bit). Then MSI via the
+     framework GIC (v2m) or INTx via a GIC SPI.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

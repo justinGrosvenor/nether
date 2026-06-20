@@ -285,11 +285,11 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         b.propU32("#interrupt-cells", 1);
         b.propCells("reg", &.{ hi(p.ecam_base), lo(p.ecam_base), hi(p.ecam_size), lo(p.ecam_size) });
         b.propCells("bus-range", &.{ 0, 0 });
-        // 64-bit non-prefetchable MMIO. pci-host-generic requires a
-        // non-prefetchable window; 64-bit space fits the virtio 64-bit BARs.
-        // PCI address identity-mapped to the CPU.
+        // 32-bit non-prefetchable MMIO (PCI space code 0x02000000), the window
+        // QEMU's virt board uses for small BARs and the one pci-host-generic
+        // assigns into. PCI address identity-mapped to the CPU.
         b.propCells("ranges", &.{
-            0x0300_0000, hi(p.mmio_base), lo(p.mmio_base), // PCI addr (space, hi, lo)
+            0x0200_0000, hi(p.mmio_base), lo(p.mmio_base), // PCI addr (space, hi, lo)
             hi(p.mmio_base),              lo(p.mmio_base), // CPU addr
             hi(p.mmio_size),              lo(p.mmio_size), // size
         });
