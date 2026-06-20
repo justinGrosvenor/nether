@@ -357,8 +357,18 @@ The build-out arc (offline-first chunks):
    (CpuState incl. sys+ICC regs, SnapCtl, capture/restore, GIC state wrappers),
    `hvf.zig` (bindings + the EL1 sys-reg and ICC-reg lists), `virtio.zig`
    (pointer-free `DeviceState` export/import), `pl011.zig` (`State`), `main.zig`
-   (orchestrator + `nether.snap` format + the restore path). Known rough edges:
-   full-RAM copy (no dirty-page CoW yet); same-host/same-build snapshot format.
+   (orchestrator + `nether.snap` format + the restore path).
+   - **Copy-on-write fork.** The RAM region of `nether.snap` is page-aligned and a
+     restore maps it `MAP_PRIVATE` (`hvf_backend.mapMemoryCow`) rather than copying
+     it: each fork shares the base image's pages through the page cache and only
+     copies the pages it writes, so the base file is never mutated and N forks cost
+     ~base + per-fork deltas. Proven: fork a guest, write inside it -> the base
+     `nether.snap` checksum is byte-identical afterwards; fork the same base again
+     -> it sees the original state but not the first fork's writes (isolated COW
+     views from one immutable base). Two independent sandboxes from one boot.
+   Known rough edges: same-host/same-build snapshot format; the restore still
+   touches all pages once for I-cache invalidation (correctness), so the COW win is
+   memory sharing + an untouched base rather than zero-read restore latency yet.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track. SMP and snapshot on the KVM

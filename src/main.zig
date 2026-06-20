@@ -822,10 +822,14 @@ fn macSnapshotter(ctx: *SnapCtx) void {
 }
 
 // --- snapshot file format ---------------------------------------------------
-// Header (48 B) then per-vCPU CpuState, the two DeviceStates, GIC bytes, disk
-// bytes, and RAM. Same-host/same-build only (raw struct layout, native endian).
+// Header (64 B) then per-vCPU CpuState, the two DeviceStates, the PL011 state,
+// GIC bytes, disk bytes, then (page-aligned) RAM. The RAM region is aligned to
+// HOST_PAGE so it can be mapped copy-on-write (MAP_PRIVATE) on restore - a fork
+// shares the file's pages and only copies what it writes. Same-host/same-build
+// only (raw struct layout, native endian).
 const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
-const SNAP_VERSION: u32 = 1;
+const SNAP_VERSION: u32 = 2;
+const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
 
 fn writeAll(fd: c_int, buf: []const u8) bool {
     var off: usize = 0;
@@ -854,7 +858,12 @@ fn writeSnapshotFile(
     if (fd < 0) return false;
     defer _ = libc.close(fd);
 
-    var hdr = [_]u8{0} ** 48;
+    // The metadata precedes a page-aligned RAM region (so RAM can be mmap'd COW).
+    const meta = 64 + cpus.len * @sizeOf(@TypeOf(cpus[0])) + @sizeOf(@TypeOf(con)) +
+        @sizeOf(@TypeOf(blk)) + @sizeOf(@TypeOf(uart)) + gic.len + disk.len;
+    const ram_off = std.mem.alignForward(usize, meta, HOST_PAGE);
+
+    var hdr = [_]u8{0} ** 64;
     std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
     std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION, .little);
     std.mem.writeInt(u32, hdr[8..12], @intCast(cpus.len), .little);
@@ -862,6 +871,7 @@ fn writeSnapshotFile(
     std.mem.writeInt(u64, hdr[24..32], ram.len, .little);
     std.mem.writeInt(u64, hdr[32..40], gic.len, .little);
     std.mem.writeInt(u64, hdr[40..48], disk.len, .little);
+    std.mem.writeInt(u64, hdr[48..56], ram_off, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -869,6 +879,9 @@ fn writeSnapshotFile(
     if (!writeAll(fd, std.mem.asBytes(&uart))) return false;
     if (!writeAll(fd, gic)) return false;
     if (!writeAll(fd, disk)) return false;
+    // Pad to the page-aligned RAM offset, then write RAM.
+    var pad = [_]u8{0} ** HOST_PAGE;
+    if (ram_off > meta and !writeAll(fd, pad[0 .. ram_off - meta])) return false;
     if (!writeAll(fd, ram)) return false;
     return true;
 }
@@ -925,21 +938,26 @@ fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     }
     defer _ = libc.close(fd);
 
-    var hdr = [_]u8{0} ** 48;
+    var hdr = [_]u8{0} ** 64;
     if (!readExact(fd, &hdr)) return error.BadSnapshot;
     if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return error.BadSnapshot;
     const num_cpus = std.mem.readInt(u32, hdr[8..12], .little);
     const ram_size = std.mem.readInt(u64, hdr[24..32], .little);
     const gic_size = std.mem.readInt(u64, hdr[32..40], .little);
     const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
+    const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
     if (num_cpus > hvfb.MAX_SNAP_CPUS or ram_size != ARM_RAM_SIZE) return error.BadSnapshot;
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
-    const ram = try vm.addMemory(0, ARM_RAM_BASE, ARM_RAM_SIZE);
+    // Map RAM copy-on-write from the snapshot file: the fork shares the base
+    // image's pages and only copies what it writes, so restore is instant (no
+    // 512 MiB read) and forks are memory-cheap.
+    const ram = try vm.hv.mapMemoryCow(ARM_RAM_BASE, ARM_RAM_SIZE, fd, ram_off);
     try vm.enableSplitIrqchip(); // create the GIC before vCPUs (state restored below)
 
-    // Read the saved state in file order: cpus, con, blk, gic, disk, ram.
+    // Read the small metadata sequentially (cpus, con, blk, uart, gic, disk); RAM
+    // is mapped above by offset, not read.
     var cpus: [hvfb.MAX_SNAP_CPUS]hvfb.CpuState = undefined;
     var i: u32 = 0;
     while (i < num_cpus) : (i += 1) if (!readExact(fd, std.mem.asBytes(&cpus[i]))) return error.BadSnapshot;
@@ -955,7 +973,6 @@ fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (disk_size > 0) {
         if (!readExact(fd, blk_disk_storage[0..@intCast(disk_size)])) return error.BadSnapshot;
     }
-    if (!readExact(fd, ram)) return error.BadSnapshot;
     hvf.sys_icache_invalidate(ram.ptr, ram.len); // host writes -> guest I-fetch
 
     // Recreate vCPUs with their captured contexts. cpu0 is this thread; the rest

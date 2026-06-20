@@ -101,6 +101,31 @@ pub const Vm = struct {
         std.posix.munmap(@alignCast(host));
     }
 
+    /// Map a file region as guest RAM copy-on-write (MAP_PRIVATE): page-ins are
+    /// demand-paged from the file and shared across forks via the page cache,
+    /// while the guest's writes copy into private pages and leave the file (the
+    /// fork base) untouched. `offset` must be page-aligned. This makes a snapshot
+    /// restore instant (no up-front RAM copy) and a fork memory-cheap.
+    pub fn mapMemoryCow(self: *Vm, guest_phys: u64, size: usize, fd: std.posix.fd_t, offset: u64) Error![]u8 {
+        _ = self;
+        const mem = std.posix.mmap(
+            null,
+            size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE }, // file-backed, copy-on-write
+            fd,
+            offset,
+        ) catch return error.SyscallFailed;
+        errdefer std.posix.munmap(mem);
+        try ok(hvf.hv_vm_map(
+            mem.ptr,
+            guest_phys,
+            size,
+            hvf.HV_MEMORY_READ | hvf.HV_MEMORY_WRITE | hvf.HV_MEMORY_EXEC,
+        ), "hv_vm_map (cow)");
+        return mem;
+    }
+
     /// Create the framework GICv3 (before any vCPU), placing the distributor and
     /// redistributor at the memmap_arm bases, and record the region sizes the
     /// framework chose so the DTB can describe them accurately.
