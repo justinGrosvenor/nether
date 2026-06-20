@@ -179,6 +179,16 @@ pub const PcieConfig = struct {
     mmio64_size: u64,
 };
 
+/// A GICv2m MSI frame: a doorbell region plus a contiguous range of GIC SPIs the
+/// frame translates message writes into. Described as a child of the GIC node so
+/// the PCIe host bridge can use MSI/MSI-X instead of legacy INTx.
+pub const MsiConfig = struct {
+    doorbell_base: u64,
+    doorbell_size: u64,
+    spi_base: u32,
+    spi_count: u32,
+};
+
 pub const VirtConfig = struct {
     cmdline: []const u8,
     mem_base: u64,
@@ -190,6 +200,7 @@ pub const VirtConfig = struct {
     initrd_end: u64 = 0,
     virtio: []const VirtioDev = &.{},
     pcie: ?PcieConfig = null,
+    msi: ?MsiConfig = null,
 };
 
 /// Build the "virt" device tree into `out` and return its size. Uses two
@@ -201,6 +212,7 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
 
     const GIC_PHANDLE = 1;
     const CLK_PHANDLE = 2;
+    const V2M_PHANDLE = 3;
 
     b.beginNode(""); // root
     b.propU32("#address-cells", 2);
@@ -269,6 +281,22 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         hi(cfg.gicr_base), lo(cfg.gicr_base), hi(cfg.gicr_size), lo(cfg.gicr_size),
     });
     b.propU32("phandle", GIC_PHANDLE);
+    if (cfg.msi) |m| {
+        // GICv2m MSI frame (child of the GIC). The frame translates a doorbell
+        // write into one of [spi_base, spi_base+spi_count) SPIs; advertising the
+        // base/count here makes the guest skip reading MSI_TYPER from the frame
+        // (which lives in the framework-owned MSI region).
+        var v2mname: [40]u8 = undefined;
+        const vn = std.fmt.bufPrint(&v2mname, "v2m@{x}", .{m.doorbell_base}) catch unreachable;
+        b.beginNode(vn);
+        b.propString("compatible", "arm,gic-v2m-frame");
+        b.propEmpty("msi-controller");
+        b.propCells("reg", &.{ hi(m.doorbell_base), lo(m.doorbell_base), hi(m.doorbell_size), lo(m.doorbell_size) });
+        b.propU32("arm,msi-base-spi", m.spi_base);
+        b.propU32("arm,msi-num-spis", m.spi_count);
+        b.propU32("phandle", V2M_PHANDLE);
+        b.endNode();
+    }
     b.endNode();
 
     b.beginNode("memory@40000000");
@@ -304,6 +332,8 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         b.propU32("#size-cells", 2);
         b.propU32("#interrupt-cells", 1);
         b.propU32("linux,pci-domain", 0);
+        // MSI/MSI-X via the GICv2m frame (preferred over the INTx interrupt-map).
+        if (cfg.msi != null) b.propU32("msi-parent", V2M_PHANDLE);
         b.propCells("reg", &.{ hi(p.ecam_base), lo(p.ecam_base), hi(p.ecam_size), lo(p.ecam_size) });
         // ECAM is 1 MiB = exactly one bus, so the bus-range must be a single bus
         // (pci_ecam_create sizes the config space as (bus_max+1) << 20).
@@ -432,6 +462,51 @@ test "virt DTB carries the cmdline and key device nodes" {
     // Property names are interned once in the strings block.
     try testing.expect(std.mem.indexOf(u8, blob, "compatible") != null);
     try testing.expect(std.mem.indexOf(u8, blob, "interrupts") != null);
+}
+
+test "v2m MSI frame and msi-parent appear when an MSI config is given" {
+    var out: [8192]u8 = undefined;
+    const n = buildVirt(&out, .{
+        .cmdline = "x",
+        .mem_base = 0x4000_0000,
+        .mem_size = 0x0800_0000,
+        .pcie = .{
+            .ecam_base = arm.ecam_base,    .ecam_size = arm.ecam_size,
+            .io_base = arm.pci_io_base,    .io_size = arm.pci_io_size,
+            .mmio_base = arm.pci_mmio_base, .mmio_size = arm.pci_mmio_size,
+            .mmio64_base = arm.pci_mmio64_base, .mmio64_size = arm.pci_mmio64_size,
+        },
+        .msi = .{ .doorbell_base = arm.msi_base, .doorbell_size = 0x1000, .spi_base = 955, .spi_count = 64 },
+    });
+    const blob = out[0..n];
+    try testing.expect(std.mem.indexOf(u8, blob, "arm,gic-v2m-frame") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "arm,msi-base-spi") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "msi-parent") != null);
+    // Structure must remain balanced with the extra GIC child + pcie prop.
+    const struct_off = be32(&out, 8);
+    const struct_len = be32(&out, 36);
+    var pos: usize = struct_off;
+    const end = struct_off + struct_len;
+    var depth: i32 = 0;
+    while (pos < end) {
+        const tok = be32(&out, pos);
+        pos += 4;
+        switch (tok) {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                while (out[pos] != 0) pos += 1;
+                pos = std.mem.alignForward(usize, pos + 1, 4);
+            },
+            FDT_END_NODE => depth -= 1,
+            FDT_PROP => {
+                const vlen = be32(&out, pos);
+                pos += 8 + std.mem.alignForward(usize, vlen, 4);
+            },
+            FDT_END => break,
+            else => return error.BadToken,
+        }
+    }
+    try testing.expectEqual(@as(i32, 0), depth);
 }
 
 test "property names are deduplicated in the strings block" {

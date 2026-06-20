@@ -86,6 +86,12 @@ pub extern fn hv_gic_get_redistributor_base(vcpu: hv_vcpu_t, base: *hv_ipa_t) hv
 pub extern fn hv_gic_get_distributor_base_alignment(alignment: *usize) hv_return_t;
 pub extern fn hv_gic_get_redistributor_base_alignment(alignment: *usize) hv_return_t;
 pub extern fn hv_gic_set_spi(intid: u32, level: bool) hv_return_t;
+/// Deliver a message-signalled interrupt: `address` is the MSI doorbell the guest
+/// programmed into the device's MSI-X message (must fall in the configured MSI
+/// region), `intid` is the GIC interrupt id to raise (must fall in the configured
+/// MSI interrupt range). The VMM calls this in place of the device writing the
+/// doorbell, so the guest sees a normal GIC MSI without us modelling an ITS.
+pub extern fn hv_gic_send_msi(address: hv_ipa_t, intid: u32) hv_return_t;
 
 /// libkern cache maintenance: after writing guest code through the host mapping,
 /// invalidate the instruction cache so the guest core fetches what we wrote

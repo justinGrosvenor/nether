@@ -281,17 +281,24 @@ The build-out arc (offline-first chunks):
          BAR, and emits to host stdout.
        * **RX** (host -> guest): `pushRx` fills a posted receiveq buffer and raises
          the completion; the guest reads it from hvc0.
-   - **Legacy INTx interrupts (level) wired and proven.** With no MSI domain in
-     the DTB the guest virtio-pci driver falls back to INTx; we report Interrupt
-     Pin = INTA (config 0x3d) and route it through the pcie interrupt-map to a GIC
-     SPI. `virtio.Device` drives the line as a level (raise when the ISR is set,
-     lower when the guest reads/clears it, via `intx_fn`); on HVF that is
-     `hv_gic_set_spi`. The guest shows `14: <count> GICv3 36 Level virtio0` and the
-     count increments on each RX delivery - real interrupt delivery on the PCI
-     INTx SPI, confirmed. **Remaining (optional):** MSI-X via `hv_gic_send_msi`
-     (not yet bound) + an `msi-map`/ITS in the DTB for a message-signalled path; a
-     richer rootfs/kernel with `virtio_rng=y` to exercise the rng/blk/net backends
-     directly over PCI.
+   - **Two interrupt paths, both wired and proven:**
+     * **MSI-X (preferred)** via a GICv2m frame. The DTB describes an
+       `arm,gic-v2m-frame` child of the GIC (doorbell at `msi_base`, SPI range =
+       the framework's reserved top-of-SPI window) and `msi-parent` on the pcie
+       node; the framework's MSI range is clamped to the gic-v2m limit
+       (`base + count <= V2M_MAX_SPI = 1019`, which the framework's reported
+       exclusive top of 1020 trips by one). The guest then enables MSI-X and
+       `virtio.Device` delivers completions by forwarding the guest-programmed
+       message (`addr`, `data` = the allocated SPI intid) to `hv_gic_send_msi`.
+       Proven: `/proc/interrupts` shows three `GICv2m-PCI-MSIX-0000:00:01.0`
+       vectors (config/input/output) and the input/output counts climb on RX/TX.
+     * **Legacy INTx (level)** fallback for a kernel with no MSI domain: Interrupt
+       Pin = INTA (config 0x3d) routed via the pcie interrupt-map to a GIC SPI;
+       `virtio.Device` drives the line as a level via `intx_fn` -> `hv_gic_set_spi`
+       (raise on ISR set, lower on ISR read). Also proven live (GIC SPI 36 Level,
+       count climbs per RX) before MSI-X was added.
+     **Remaining (optional):** a richer rootfs/kernel with `virtio_rng=y` (or
+     modules in the initramfs) to drive the rng/blk/net backends directly over PCI.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

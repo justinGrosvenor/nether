@@ -548,6 +548,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             .mmio64_base = nether.memmap_arm.pci_mmio64_base,
             .mmio64_size = nether.memmap_arm.pci_mmio64_size,
         },
+        .msi = .{
+            .doorbell_base = nether.memmap_arm.msi_base,
+            .doorbell_size = 0x1000,
+            .spi_base = vm.hv.msi_spi_base,
+            .spi_count = vm.hv.msi_spi_count,
+        },
     });
     @memcpy(ram[ARM_DTB_OFF..][0..dtb_len], dtb_buf[0..dtb_len]);
 
@@ -583,6 +589,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // gives spi = pci_intx_spi + ((slot + pin - 1) % 4).
     con_dev.intx_ptr = &con_dev;
     con_dev.intx_fn = armPciIntx;
+    // MSI-X: if the guest enables it (via the GICv2m frame in the DTB), the device
+    // delivers completions by forwarding the guest-programmed message to the
+    // framework GIC instead of toggling the INTx line.
+    con_dev.msi_ptr = &con_dev;
+    con_dev.msi_fn = armSendMsi;
     // Don't pre-assign: let the kernel place the 64-bit BAR in the 64-bit window
     // (like QEMU). A window-wide dispatcher routes accesses to its live base.
     try pci_host.addFunction(con_dev.function(1, 0)); // PCI 0:1.0
@@ -694,6 +705,15 @@ fn armPciIntx(ctx: *anyopaque, level: bool) void {
     _ = ctx;
     const hvf = @import("hvf.zig");
     _ = hvf.hv_gic_set_spi(ARM_PCI_INTX_INTID, level);
+}
+
+/// MSI-X delivery on HVF: forward the guest-programmed message (doorbell address
+/// + data = the GICv2m-allocated SPI intid) to the framework GIC, which raises it
+/// as if the device had written the doorbell.
+fn armSendMsi(ctx: *anyopaque, addr: u64, data: u32) void {
+    _ = ctx;
+    const hvf = @import("hvf.zig");
+    _ = hvf.hv_gic_send_msi(addr, data);
 }
 
 /// The PL011's SPI interrupt id: SPIs start at GIC INTID 32, and the DTB places

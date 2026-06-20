@@ -51,6 +51,11 @@ pub const Vm = struct {
     /// kernel's GIC reg matches what hv_gic actually placed).
     gicd_size: u64 = arm.gicd_size,
     gicr_size: u64 = arm.gicr_size, // whole redistributor region (DTB GICR reg size)
+    /// The GIC SPI range the framework reserved for MSIs (the top of its SPI
+    /// space); the DTB's v2m frame advertises exactly this so the guest allocates
+    /// MSI vectors the framework will accept via hv_gic_send_msi.
+    msi_spi_base: u32 = 0,
+    msi_spi_count: u32 = 0,
 
     pub fn init() Error!Vm {
         try ok(hvf.hv_vm_create(null), "hv_vm_create");
@@ -103,8 +108,18 @@ pub const Vm = struct {
         var spi_base: u32 = 0;
         var spi_count: u32 = 0;
         _ = hvf.hv_gic_get_spi_interrupt_range(&spi_base, &spi_count);
-        const msi_count: u32 = if (spi_count > 64) 64 else spi_count;
-        try ok(hvf.hv_gic_config_set_msi_interrupt_range(cfg, spi_base + spi_count - msi_count, msi_count), "gic msi range");
+        // Reserve the top of the SPI range for MSI, but never past the GICv2m
+        // limit: the Linux gic-v2m driver rejects a frame whose (base + count)
+        // exceeds V2M_MAX_SPI = 1019 (so the last usable SPI is 1018). The
+        // framework reports an exclusive top of 1020, which trips that by one.
+        const V2M_MAX_SPI: u32 = 1019;
+        var top = spi_base + spi_count; // exclusive
+        if (top > V2M_MAX_SPI) top = V2M_MAX_SPI;
+        const msi_count: u32 = if (top - spi_base > 64) 64 else top - spi_base;
+        const msi_base = top - msi_count;
+        try ok(hvf.hv_gic_config_set_msi_interrupt_range(cfg, msi_base, msi_count), "gic msi range");
+        self.msi_spi_base = msi_base;
+        self.msi_spi_count = msi_count;
         try ok(hvf.hv_gic_create(cfg), "hv_gic_create");
 
         var ds: usize = arm.gicd_size;
