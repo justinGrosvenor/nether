@@ -145,16 +145,80 @@ pub const Vm = struct {
         // GICv3 affinity routing: MPIDR_EL1 must be set (bit 31 RES1; Aff0 = id)
         // before the GIC redistributor can be associated with this vCPU.
         _ = hvf.hv_vcpu_set_sys_reg(handle, hvf.HV_SYS_REG_MPIDR_EL1, 0x8000_0000 | @as(u64, id));
-        return .{ .handle = handle, .exit = exit };
+        return .{ .handle = handle, .exit = exit, .id = id };
     }
 };
+
+/// A full vCPU register context for snapshot/restore: GP regs, PC/SP/PSTATE, the
+/// SIMD&FP file, and the EL1 system registers in hvf.SNAPSHOT_SYS_REGS order.
+pub const CpuState = struct {
+    x: [31]u64 = [_]u64{0} ** 31, // X0..X30
+    pc: u64 = 0,
+    cpsr: u64 = 0,
+    fpcr: u64 = 0,
+    fpsr: u64 = 0,
+    v: [32]hvf.hv_simd_fp_uchar16 = [_]hvf.hv_simd_fp_uchar16{@splat(0)} ** 32,
+    sys: [hvf.SNAPSHOT_SYS_REGS.len]u64 = [_]u64{0} ** hvf.SNAPSHOT_SYS_REGS.len,
+};
+
+/// Snapshot/restore coordination across vCPU threads. The orchestrator sets a
+/// phase and forces every vCPU out of `hv_vcpu_run`; each vCPU self-captures or
+/// self-restores its own context (register access is owning-thread only), parks,
+/// and waits for the orchestrator to advance the phase.
+pub const MAX_SNAP_CPUS = 8;
+pub const SnapPhase = enum(u8) { running, quiesce, restoring, resumed };
+pub const SnapCtl = struct {
+    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SnapPhase.running)),
+    parked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    cpu: [MAX_SNAP_CPUS]CpuState = [_]CpuState{.{}} ** MAX_SNAP_CPUS,
+};
+
+/// Serialize the live GIC state into `buf`, returning its length (0 on failure).
+/// `buf` must be large enough (the framework's state is a few KiB).
+pub fn gicCaptureState(buf: []u8) usize {
+    const st = hvf.hv_gic_state_create() orelse return 0;
+    var size: usize = 0;
+    if (hvf.hv_gic_state_get_size(st, &size) != hvf.HV_SUCCESS or size > buf.len) return 0;
+    if (hvf.hv_gic_state_get_data(st, buf.ptr) != hvf.HV_SUCCESS) return 0;
+    return size;
+}
+
+/// Restore GIC state from a buffer captured by gicCaptureState.
+pub fn gicRestoreState(data: []const u8) bool {
+    return hvf.hv_gic_set_state(data.ptr, data.len) == hvf.HV_SUCCESS;
+}
 
 pub const Vcpu = struct {
     handle: hvf.hv_vcpu_t,
     exit: *hvf.Exit,
+    id: u32 = 0,
 
     pub fn deinit(self: *Vcpu) void {
         _ = hvf.hv_vcpu_destroy(self.handle);
+    }
+
+    /// Read this vCPU's full register context (owning thread only).
+    pub fn capture(self: *Vcpu) CpuState {
+        var s = CpuState{};
+        for (&s.x, 0..) |*r, i| _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_X0 + @as(hvf.hv_reg_t, @intCast(i)), r);
+        _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_PC, &s.pc);
+        _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_CPSR, &s.cpsr);
+        _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_FPCR, &s.fpcr);
+        _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_FPSR, &s.fpsr);
+        for (&s.v, 0..) |*q, i| _ = hvf.hv_vcpu_get_simd_fp_reg(self.handle, @intCast(i), q);
+        for (hvf.SNAPSHOT_SYS_REGS, 0..) |reg, i| _ = hvf.hv_vcpu_get_sys_reg(self.handle, reg, &s.sys[i]);
+        return s;
+    }
+
+    /// Write a register context back into this vCPU (owning thread only).
+    pub fn restore(self: *Vcpu, s: *const CpuState) void {
+        for (s.x, 0..) |r, i| _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_X0 + @as(hvf.hv_reg_t, @intCast(i)), r);
+        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_PC, s.pc);
+        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_CPSR, s.cpsr);
+        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_FPCR, s.fpcr);
+        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_FPSR, s.fpsr);
+        for (s.v, 0..) |q, i| _ = hvf.hv_vcpu_set_simd_fp_reg(self.handle, @intCast(i), q);
+        for (hvf.SNAPSHOT_SYS_REGS, 0..) |reg, i| _ = hvf.hv_vcpu_set_sys_reg(self.handle, reg, s.sys[i]);
     }
 
     /// The guest-physical base the framework placed this vCPU's GIC redistributor
@@ -174,14 +238,28 @@ pub const Vcpu = struct {
     }
 
     pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power) !StopReason {
-        return self.runSmp(bus, power, null);
+        return self.runSmp(bus, power, null, null);
     }
 
-    /// Run loop with optional SMP control (for PSCI CPU_ON routing). The single-CPU
-    /// `run` is this with `sc = null`.
-    pub fn runSmp(self: *Vcpu, bus: *io.Bus, power: *pwr.Power, sc: ?*smp.Smp) !StopReason {
+    /// Run loop with optional SMP control (PSCI CPU_ON routing) and optional
+    /// snapshot control (quiesce + self-capture/restore). The single-CPU `run` is
+    /// this with both null.
+    pub fn runSmp(self: *Vcpu, bus: *io.Bus, power: *pwr.Power, sc: ?*smp.Smp, snap: ?*SnapCtl) !StopReason {
         while (true) {
             try ok(hvf.hv_vcpu_run(self.handle), "hv_vcpu_run");
+            // Snapshot rendezvous: if the orchestrator has requested a quiesce,
+            // self-capture or self-restore this vCPU's context (register access is
+            // owning-thread only), park, and wait for the phase to advance. Checked
+            // before handling the exit so a forced-exit (hv_vcpus_exit) parks here.
+            if (snap) |sn| {
+                const ph: SnapPhase = @enumFromInt(sn.phase.load(.acquire));
+                if (ph == .quiesce or ph == .restoring) {
+                    if (ph == .quiesce) sn.cpu[self.id] = self.capture() else self.restore(&sn.cpu[self.id]);
+                    _ = sn.parked.fetchAdd(1, .release);
+                    while (@as(SnapPhase, @enumFromInt(sn.phase.load(.acquire))) != .resumed) std.atomic.spinLoopHint();
+                    continue; // re-enter the guest with (possibly restored) state
+                }
+            }
             switch (self.exit.reason) {
                 hvf.HV_EXIT_REASON_EXCEPTION => {
                     const esr = self.exit.exception.syndrome;

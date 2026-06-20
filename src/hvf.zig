@@ -56,6 +56,17 @@ pub extern fn hv_vcpu_destroy(vcpu: hv_vcpu_t) hv_return_t;
 pub extern fn hv_vcpu_run(vcpu: hv_vcpu_t) hv_return_t;
 pub extern fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) hv_return_t;
 pub extern fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *u64) hv_return_t;
+/// Force the listed vCPUs out of `hv_vcpu_run` (used to quiesce secondaries for a
+/// consistent snapshot). Callable from any thread, unlike run/get_reg/set_reg
+/// which must run on the vCPU's owning thread.
+pub extern fn hv_vcpus_exit(vcpus: [*]const hv_vcpu_t, count: u32) hv_return_t;
+
+/// SIMD&FP registers (V0..V31), each a 128-bit value. FPCR/FPSR are the plain
+/// HV_REG_FPCR/FPSR above. Needed for a complete vCPU snapshot.
+pub const hv_simd_fp_uchar16 = @Vector(16, u8);
+pub const hv_simd_fp_reg_t = c_int;
+pub extern fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: hv_simd_fp_reg_t, value: *hv_simd_fp_uchar16) hv_return_t;
+pub extern fn hv_vcpu_set_simd_fp_reg(vcpu: hv_vcpu_t, reg: hv_simd_fp_reg_t, value: hv_simd_fp_uchar16) hv_return_t;
 
 /// System registers (hv_sys_reg_t). MPIDR_EL1 holds the vCPU's GICv3 affinity and
 /// must be set before the GIC redistributor can be associated with the vCPU.
@@ -63,6 +74,52 @@ pub const hv_sys_reg_t = c_int;
 pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
 pub extern fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) hv_return_t;
 pub extern fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *u64) hv_return_t;
+
+/// The EL1 execution-context system registers captured/restored by a snapshot
+/// (values from <Hypervisor/hv_vcpu_types.h>). This covers the MMU (SCTLR, TTBR0/1,
+/// TCR, MAIR/AMAIR), exception state (SPSR/ELR/ESR/FAR/VBAR), stacks (SP_EL0/1),
+/// thread pointers, the cache-select, pointer-auth key, and the virtual timer
+/// (CNTV_CTL/CVAL/KCTL + CNTVOFF, which rebases the guest's view of the counter so
+/// time is continuous across restore). MPIDR is set at vCPU creation, not here.
+pub const SNAPSHOT_SYS_REGS = [_]hv_sys_reg_t{
+    0xc080, // SCTLR_EL1
+    0xc082, // CPACR_EL1
+    0xc100, // TTBR0_EL1
+    0xc101, // TTBR1_EL1
+    0xc102, // TCR_EL1
+    0xc200, // SPSR_EL1
+    0xc201, // ELR_EL1
+    0xc208, // SP_EL0
+    0xe208, // SP_EL1
+    0xc288, // AFSR0_EL1
+    0xc289, // AFSR1_EL1
+    0xc290, // ESR_EL1
+    0xc300, // FAR_EL1
+    0xc3a0, // PAR_EL1
+    0xc510, // MAIR_EL1
+    0xc518, // AMAIR_EL1
+    0xc600, // VBAR_EL1
+    0xc681, // CONTEXTIDR_EL1
+    0xc684, // TPIDR_EL1
+    0xde82, // TPIDR_EL0
+    0xde83, // TPIDRRO_EL0
+    0xd000, // CSSELR_EL1
+    0x8012, // MDSCR_EL1
+    0xc708, // CNTKCTL_EL1
+    0xdf19, // CNTV_CTL_EL0
+    0xdf1a, // CNTV_CVAL_EL0
+    0xe703, // CNTVOFF_EL2
+};
+
+/// GIC state save/restore (macOS 15+): `state_create` snapshots the live GIC into
+/// an opaque object, `get_size`/`get_data` serialize it to a byte buffer, and
+/// `set_state` restores from such a buffer. The single hardest piece of a VM
+/// snapshot to get right; Apple provides it directly so we need not model an ITS.
+pub const hv_gic_state_t = ?*anyopaque;
+pub extern fn hv_gic_state_create() hv_gic_state_t;
+pub extern fn hv_gic_state_get_size(state: hv_gic_state_t, size: *usize) hv_return_t;
+pub extern fn hv_gic_state_get_data(state: hv_gic_state_t, data: *anyopaque) hv_return_t;
+pub extern fn hv_gic_set_state(data: *const anyopaque, size: usize) hv_return_t;
 
 /// Framework GIC (macOS 15+): an in-hypervisor GICv3, the aarch64 analog of the
 /// in-kernel LAPIC the KVM split irqchip gives us. Created once per VM, before

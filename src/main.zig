@@ -509,6 +509,7 @@ const ARM_NUM_CPUS: u32 = 4;
 /// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
 fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]const u8) !void {
     const hvf = @import("hvf.zig");
+    const hvfb = @import("hvf_backend.zig");
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
@@ -532,10 +533,13 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var sec_ctx: [ARM_NUM_CPUS]SmpCtx = undefined;
     var power = nether.Power{};
     var bus = nether.Bus{};
+    var snapctl = hvfb.SnapCtl{}; // snapshot/restore rendezvous across vCPU threads
+    var handles: [ARM_NUM_CPUS]u64 = undefined; // vCPU handles for hv_vcpus_exit
+    handles[0] = vcpu.handle;
 
     var ci: u32 = 1;
     while (ci < ARM_NUM_CPUS) : (ci += 1) {
-        sec_ctx[ci] = .{ .vm = &vm, .id = ci, .cpu = &cpus[ci], .bus = &bus, .power = &power, .smpc = &smpc, .created = &created };
+        sec_ctx[ci] = .{ .vm = &vm, .id = ci, .cpu = &cpus[ci], .bus = &bus, .power = &power, .smpc = &smpc, .created = &created, .handles = &handles, .snap = &snapctl };
         (std.Thread.spawn(.{}, macSecondaryCpu, .{&sec_ctx[ci]}) catch |err| {
             std.debug.print("[nether] secondary cpu {d} spawn failed: {s}\n", .{ ci, @errorName(err) });
             return err;
@@ -649,8 +653,25 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] stdin thread failed: {s}; console is output-only\n", .{@errorName(err)});
     }
 
+    // Snapshot/restore demo (opt-in via a `nether-snapshot` marker): orchestrator
+    // thread captures and later restores the whole machine while the guest runs.
+    var snap_ctx = SnapCtx{
+        .allocator = allocator,
+        .ram = ram,
+        .handles = &handles,
+        .num_cpus = ARM_NUM_CPUS,
+        .snap = &snapctl,
+        .con_dev = &con_dev,
+        .blk_dev = &blk_dev,
+        .blk_disk = blk.disk,
+    };
+    if (macMarkerPresent("nether-snapshot")) {
+        if (std.Thread.spawn(.{}, macSnapshotter, .{&snap_ctx})) |t| t.detach() else |_| {}
+        std.debug.print("[nether] snapshot demo armed (nether-snapshot marker present)\n", .{});
+    }
+
     std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ ARM_NUM_CPUS, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
-    const reason = vcpu.runSmp(&bus, &power, &smpc) catch |err| {
+    const reason = vcpu.runSmp(&bus, &power, &smpc, &snapctl) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };
@@ -668,24 +689,124 @@ const SmpCtx = struct {
     power: *nether.Power,
     smpc: *nether.smp.Smp,
     created: *std.atomic.Value(u32),
+    handles: [*]u64, // each secondary records its vCPU handle for snapshot quiesce
+    snap: *anyopaque, // *hvf_backend.SnapCtl (typed in the mac-only path)
 };
 
 /// A secondary core: create its vCPU (establishing its GIC redistributor), report
 /// readiness, then park until PSCI CPU_ON gives it an entry point and run from
 /// there. x0 = the PSCI context_id, per the boot protocol.
 fn macSecondaryCpu(ctx: *SmpCtx) void {
+    const hvfb = @import("hvf_backend.zig");
     var vcpu = ctx.vm.createVcpu(ctx.id) catch {
         _ = ctx.created.fetchAdd(1, .release); // count anyway so the boot core proceeds
         return;
     };
     defer vcpu.deinit();
+    ctx.handles[ctx.id] = vcpu.handle; // for hv_vcpus_exit during a snapshot
     _ = ctx.created.fetchAdd(1, .release);
     while (!ctx.cpu.started.load(.acquire)) {
         if (ctx.power.action != null) return; // shutdown before we were ever turned on
         _ = usleep(200);
     }
     vcpu.setAarch64Entry(ctx.cpu.entry, ctx.cpu.context) catch return;
-    _ = vcpu.runSmp(ctx.bus, ctx.power, ctx.smpc) catch {};
+    const sn: *hvfb.SnapCtl = @ptrCast(@alignCast(ctx.snap));
+    _ = vcpu.runSmp(ctx.bus, ctx.power, ctx.smpc, sn) catch {};
+}
+
+/// Context for the snapshot orchestrator thread.
+const SnapCtx = struct {
+    allocator: std.mem.Allocator,
+    ram: []u8,
+    handles: []const u64,
+    num_cpus: u32,
+    snap: *anyopaque, // *hvf_backend.SnapCtl
+    con_dev: *nether.virtio.Device,
+    blk_dev: *nether.virtio.Device,
+    blk_disk: []u8,
+};
+
+fn countDiff(a: []const u8, b: []const u8) u64 {
+    var n: u64 = 0;
+    const len = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (a[i] != b[i]) n += 1;
+    }
+    return n;
+}
+
+/// Force all vCPUs out of the guest and wait until each has parked at the snapshot
+/// rendezvous (self-captured or self-restored its own context).
+fn quiesce(sn: anytype, handles: []const u64, n: u32, phase: u8) void {
+    const hvf = @import("hvf.zig");
+    sn.parked.store(0, .release);
+    sn.phase.store(phase, .release);
+    while (sn.parked.load(.acquire) < n) {
+        _ = hvf.hv_vcpus_exit(handles.ptr, n); // re-fire; catches a vCPU not yet back in run
+        _ = usleep(2000);
+    }
+}
+
+/// Snapshot/restore demonstration (opt-in via a `nether-snapshot` marker). After
+/// the guest is up: quiesce all vCPUs and capture the full machine state (RAM, per
+/// vCPU register context, framework GIC state, virtio device state); let the guest
+/// run on; then quiesce again and restore everything, rewinding the guest to the
+/// snapshot. That the 4-core Linux guest stays healthy afterwards is the proof the
+/// captured state is complete and consistent.
+fn macSnapshotter(ctx: *SnapCtx) void {
+    const hvf = @import("hvf.zig");
+    const hvfb = @import("hvf_backend.zig");
+    const sn: *hvfb.SnapCtl = @ptrCast(@alignCast(ctx.snap));
+    const n = ctx.num_cpus;
+
+    var t: u32 = 0;
+    while (t < 200) : (t += 1) _ = usleep(100_000); // ~20s: let the guest reach the shell
+
+    // --- CAPTURE -----------------------------------------------------------
+    quiesce(sn, ctx.handles, n, @intFromEnum(hvfb.SnapPhase.quiesce));
+    const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
+    const ram_snap = ctx.allocator.alloc(u8, ctx.ram.len) catch {
+        std.debug.print("[nether] snapshot: out of memory for RAM copy\n", .{});
+        return;
+    };
+    @memcpy(ram_snap, ctx.ram);
+    var gicbuf: [128 * 1024]u8 = undefined;
+    const giclen = hvfb.gicCaptureState(&gicbuf);
+    const con_snap = ctx.con_dev.*;
+    const blk_snap = ctx.blk_dev.*;
+    const disk_snap = ctx.allocator.alloc(u8, ctx.blk_disk.len) catch return;
+    @memcpy(disk_snap, ctx.blk_disk);
+    sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+    std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), giclen, n });
+
+    t = 0;
+    while (t < 40) : (t += 1) _ = usleep(100_000); // ~4s: let the guest run and mutate state
+
+    const advanced = countDiff(ctx.ram, ram_snap);
+
+    // --- RESTORE -----------------------------------------------------------
+    sn.cpu = cpu_snap; // load the captured contexts for each vCPU to self-restore
+    quiesce(sn, ctx.handles, n, @intFromEnum(hvfb.SnapPhase.restoring));
+    @memcpy(ctx.ram, ram_snap);
+    if (giclen > 0) _ = hvfb.gicRestoreState(gicbuf[0..giclen]);
+    ctx.con_dev.* = con_snap;
+    ctx.blk_dev.* = blk_snap;
+    @memcpy(ctx.blk_disk, disk_snap);
+    sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+    std.debug.print("\n[nether] RESTORE done: guest had advanced {d} RAM bytes since the snapshot; rewound to it. Guest should still be alive.\n", .{advanced});
+    _ = hvf;
+
+    ctx.allocator.free(ram_snap);
+    ctx.allocator.free(disk_snap);
+}
+
+/// Opt-in marker check (macOS libc), mirroring the x86 markerPresent.
+fn macMarkerPresent(path: [*:0]const u8) bool {
+    const fd = libc.open(path, 0, @as(c_int, 0));
+    if (fd < 0) return false;
+    _ = libc.close(fd);
+    return true;
 }
 
 /// First light under Apple HVF: a tiny aarch64 blob writes a message to the PL011

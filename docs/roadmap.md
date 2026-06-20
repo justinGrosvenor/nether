@@ -326,7 +326,29 @@ The build-out arc (offline-first chunks):
    redistributor (128 KiB stride), and the virtio-console datapath + MSI-X still
    work under load. (Clean SMP teardown on guest shutdown is a known rough edge:
    a secondary parked in WFI inside `hv_vcpu_run` is not force-stopped.)
+7. **Snapshot / restore (DONE).** The whole live machine can be captured and
+   restored - the microVM fork primitive an agent platform is built on. Captured
+   state: guest RAM, each vCPU's full register context (GP + PC/SP/PSTATE + the
+   SIMD&FP file + the EL1 system registers, including `CNTVOFF_EL2` so the guest's
+   view of time stays continuous), the framework **GIC state**
+   (`hv_gic_state_create`/`get_data`/`set_state` - the one piece that would
+   otherwise be unrecoverable, but Apple exposes it directly), and the virtio
+   device + backing-disk state. SMP is quiesced with `hv_vcpus_exit`: an
+   orchestrator thread drives a phase machine (`SnapCtl`) and each vCPU
+   self-captures/self-restores its own context at a rendezvous (register access is
+   owning-thread only) before the orchestrator snapshots/restores the global state.
+   Proven live (opt-in `nether-snapshot` marker): snapshot a 4-core Alpine guest at
+   the shell (`ram=512MiB gic=126405B cpus=4`), let it run (a `/tmp/REWIND_ME` file
+   is created, ~130 KB of RAM changes), then restore - the file is gone, the RAM is
+   rewound, and the guest stays fully interactive across all 4 cores. The capture
+   is in-memory ("rewind"); a byte-serialized form is the same data and is the next
+   step toward cross-process fork. Code: `hvf_backend.zig` (CpuState, SnapCtl,
+   capture/restore, GIC wrappers), `hvf.zig` (bindings + the EL1 sys-reg list),
+   `main.zig` (the orchestrator). Known rough edges: full-RAM copy (no dirty-page
+   CoW yet) and the PL011 console state is outside the snapshot (the I/O channel,
+   not guest-visible architectural state).
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
-(a live networked boot) is independent of this track. SMP on the KVM path
-(per-vCPU threads + INIT/SIPI) is the analogous follow-up there.
+(a live networked boot) is independent of this track. SMP and snapshot on the KVM
+path (per-vCPU threads + INIT/SIPI; KVM's GET/SET ioctls + dirty-log) are the
+analogous follow-ups there.

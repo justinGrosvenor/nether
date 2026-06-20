@@ -8,3 +8,4 @@ nether-trace
 nether-web
 nether-vsock
 nether-net
+nether-snapshot
