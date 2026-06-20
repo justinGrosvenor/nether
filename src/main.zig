@@ -470,42 +470,144 @@ const arm_message = "Nether lives. Phase 0: aarch64 guest over MMIO UART.\n";
 const ARM_RAM_BASE: u64 = 0x4000_0000;
 const ARM_UART_BASE: u64 = 0x0900_0000;
 
-/// First light under Apple HVF: load a tiny aarch64 blob that writes a message
-/// to a UART (MMIO, dispatched through the same Bus the x86 path uses) and then
-/// powers off. Proves hv_vm_create/map, hv_vcpu_run, and the data-abort decode.
+/// macOS/HVF entry: boot an arm64 Linux `Image` from kernels/ if present,
+/// otherwise run the first-light blob demo.
 fn macMain() !void {
-    const hvf = @import("hvf.zig");
-
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     nether.trace.init();
 
-    var vm = try nether.Vm.init(allocator); // hv_vm_create
+    if (readFileMac(allocator, "kernels/Image") catch null) |kernel| {
+        defer allocator.free(kernel);
+        const initramfs = readFileMac(allocator, "kernels/initramfs-virt") catch null;
+        defer if (initramfs) |fs| allocator.free(fs);
+        try macBootLinux(allocator, kernel, initramfs);
+    } else {
+        try macBlobDemo(allocator);
+    }
+}
+
+// Guest layout for the Linux boot: kernel at the RAM base (Image text_offset 0),
+// the DTB at +128 MiB, and the initramfs at +192 MiB, all clear of the ~35 MiB
+// kernel image.
+const ARM_RAM_SIZE: usize = 512 * nether.memmap.mib;
+const ARM_DTB_OFF: u64 = 0x0800_0000;
+const ARM_INITRD_OFF: u64 = 0x0C00_0000;
+
+/// Boot an arm64 Linux kernel: place the Image, DTB, and initramfs in guest RAM,
+/// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
+fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]const u8) !void {
+    const hvf = @import("hvf.zig");
+
+    var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
-    const ram = try vm.addMemory(0, ARM_RAM_BASE, 2 * nether.memmap.mib); // hv_vm_map
+    const ram = try vm.addMemory(0, ARM_RAM_BASE, ARM_RAM_SIZE);
+    try vm.enableSplitIrqchip(); // hv_gic_create, before the vCPU
+
+    @memcpy(ram[0..kernel.len], kernel); // Image at the RAM base
+
+    var initrd_start: u64 = 0;
+    var initrd_end: u64 = 0;
+    if (initramfs) |fs| {
+        @memcpy(ram[ARM_INITRD_OFF..][0..fs.len], fs);
+        initrd_start = ARM_RAM_BASE + ARM_INITRD_OFF;
+        initrd_end = initrd_start + fs.len;
+    }
+
+    var dtb_buf: [16 * 1024]u8 = undefined;
+    const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
+        .cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000",
+        .mem_base = ARM_RAM_BASE,
+        .mem_size = ARM_RAM_SIZE,
+        .gicd_size = vm.hv.gicd_size,
+        .gicr_size = vm.hv.gicr_size,
+        .initrd_start = initrd_start,
+        .initrd_end = initrd_end,
+    });
+    @memcpy(ram[ARM_DTB_OFF..][0..dtb_len], dtb_buf[0..dtb_len]);
+
+    hvf.sys_icache_invalidate(ram.ptr, kernel.len); // host write -> guest I-fetch
 
     var power = nether.Power{};
     var uart = nether.Pl011{};
     uart.out_fn = uartOut;
-    uart.out_ctx = &uart; // ctx is unused by uartOut; any non-null pointer
+    uart.out_ctx = &uart;
+    var bus = nether.Bus{};
+    try bus.addMmio(uart.device(ARM_UART_BASE));
+
+    var vcpu = try vm.createVcpu(0);
+    defer vcpu.deinit();
+    try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
+
+    std.debug.print("[nether] booting arm64 Image: kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} r=0x{x}\n", .{ kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, vm.hv.gicr_size });
+    const reason = vcpu.run(&bus, &power) catch |err| {
+        std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// First light under Apple HVF: a tiny aarch64 blob writes a message to the PL011
+/// (MMIO, dispatched through the same Bus the x86 path uses) and powers off via
+/// PSCI. Proves hv_vm_create/map, hv_vcpu_run, and the data-abort/HVC decode.
+fn macBlobDemo(allocator: std.mem.Allocator) !void {
+    const hvf = @import("hvf.zig");
+
+    var vm = try nether.Vm.init(allocator);
+    defer vm.deinit();
+    const ram = try vm.addMemory(0, ARM_RAM_BASE, 2 * nether.memmap.mib);
+
+    var power = nether.Power{};
+    var uart = nether.Pl011{};
+    uart.out_fn = uartOut;
+    uart.out_ctx = &uart;
     var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
     const blob = comptime buildArmBlob(arm_message);
     @memcpy(ram[0..blob.len], &blob);
-    hvf.sys_icache_invalidate(ram.ptr, blob.len); // host write -> guest I-fetch
+    hvf.sys_icache_invalidate(ram.ptr, blob.len);
 
-    var vcpu = try vm.createVcpu(0); // hv_vcpu_create
+    var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
-    try vcpu.setAarch64Entry(ARM_RAM_BASE, 0); // PC = blob, X0 = (no DTB yet)
+    try vcpu.setAarch64Entry(ARM_RAM_BASE, 0);
 
     const reason = vcpu.run(&bus, &power) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// libc file IO (macOS): std.posix/std.c don't expose these publicly in this Zig,
+/// and the new std.Io.Dir reader needs an Io instance; these symbols are linked.
+const libc = struct {
+    extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
+    extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+};
+
+/// Read a whole file (macOS host side). Caller owns the slice.
+fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
+    const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
+    if (fd < 0) return error.OpenFailed;
+    defer _ = libc.close(fd);
+    const size_i = libc.lseek(fd, 0, 2); // SEEK_END
+    if (size_i <= 0) return error.OpenFailed;
+    _ = libc.lseek(fd, 0, 0); // SEEK_SET
+    const size: usize = @intCast(size_i);
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    var off: usize = 0;
+    while (off < size) {
+        const n = libc.read(fd, buf.ptr + off, size - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    return buf;
 }
 
 /// PL011 TX sink: write one guest byte to host stdout (libc is linked on macOS).

@@ -54,6 +54,12 @@ pub const Builder = struct {
         self.put32(v);
     }
 
+    pub fn propU64(self: *Builder, name: []const u8, v: u64) void {
+        self.header(name, 8);
+        self.put32(@truncate(v >> 32));
+        self.put32(@truncate(v));
+    }
+
     pub fn propCells(self: *Builder, name: []const u8, cells: []const u32) void {
         self.header(name, cells.len * 4);
         for (cells) |c| self.put32(c);
@@ -154,10 +160,21 @@ fn lo(x: u64) u32 {
     return @truncate(x);
 }
 
-/// Build the "virt" device tree into `out` and return its size. `cmdline` is the
-/// kernel command line; `mem_base`/`mem_size` describe guest RAM. Uses two
+/// Parameters for the "virt" device tree. GIC region sizes come from the
+/// framework GIC at runtime; the initrd range is set when an initramfs is loaded.
+pub const VirtConfig = struct {
+    cmdline: []const u8,
+    mem_base: u64,
+    mem_size: u64,
+    gicd_size: u64 = arm.gicd_size,
+    gicr_size: u64 = arm.gicr_size,
+    initrd_start: u64 = 0,
+    initrd_end: u64 = 0,
+};
+
+/// Build the "virt" device tree into `out` and return its size. Uses two
 /// phandles: 1 = GIC (interrupt-parent), 2 = the PL011 reference clock.
-pub fn buildVirt(out: []u8, cmdline: []const u8, mem_base: u64, mem_size: u64) usize {
+pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     var sbuf: [4096]u8 = undefined;
     var strbuf: [1024]u8 = undefined;
     var b = Builder.init(&sbuf, &strbuf);
@@ -178,8 +195,12 @@ pub fn buildVirt(out: []u8, cmdline: []const u8, mem_base: u64, mem_size: u64) u
     b.endNode();
 
     b.beginNode("chosen");
-    b.propString("bootargs", cmdline);
+    b.propString("bootargs", cfg.cmdline);
     b.propString("stdout-path", "/pl011@9000000");
+    if (cfg.initrd_end > cfg.initrd_start) {
+        b.propU64("linux,initrd-start", cfg.initrd_start);
+        b.propU64("linux,initrd-end", cfg.initrd_end);
+    }
     b.endNode();
 
     b.beginNode("apb-pclk"); // fixed reference clock for the PL011
@@ -213,15 +234,15 @@ pub fn buildVirt(out: []u8, cmdline: []const u8, mem_base: u64, mem_size: u64) u
     b.propEmpty("interrupt-controller");
     b.propU32("#interrupt-cells", 3);
     b.propCells("reg", &.{
-        hi(arm.gicd_base), lo(arm.gicd_base), hi(arm.gicd_size), lo(arm.gicd_size),
-        hi(arm.gicr_base), lo(arm.gicr_base), hi(arm.gicr_size), lo(arm.gicr_size),
+        hi(arm.gicd_base), lo(arm.gicd_base), hi(cfg.gicd_size), lo(cfg.gicd_size),
+        hi(arm.gicr_base), lo(arm.gicr_base), hi(cfg.gicr_size), lo(cfg.gicr_size),
     });
     b.propU32("phandle", GIC_PHANDLE);
     b.endNode();
 
     b.beginNode("memory@40000000");
     b.propString("device_type", "memory");
-    b.propCells("reg", &.{ hi(mem_base), lo(mem_base), hi(mem_size), lo(mem_size) });
+    b.propCells("reg", &.{ hi(cfg.mem_base), lo(cfg.mem_base), hi(cfg.mem_size), lo(cfg.mem_size) });
     b.endNode();
 
     b.beginNode("pl011@9000000");
@@ -246,7 +267,7 @@ fn be32(b: []const u8, off: usize) u32 {
 
 test "virt DTB has a valid FDT header" {
     var out: [8192]u8 = undefined;
-    const n = buildVirt(&out, "console=ttyAMA0", 0x4000_0000, 0x0800_0000);
+    const n = buildVirt(&out, .{ .cmdline = "console=ttyAMA0", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
     try testing.expectEqual(@as(u32, FDT_MAGIC), be32(&out, 0));
     try testing.expectEqual(@as(u32, @intCast(n)), be32(&out, 4)); // totalsize
     try testing.expectEqual(@as(u32, FDT_VERSION), be32(&out, 20));
@@ -261,7 +282,7 @@ test "virt DTB has a valid FDT header" {
 
 test "structure block is well-formed and balanced" {
     var out: [8192]u8 = undefined;
-    _ = buildVirt(&out, "x", 0x4000_0000, 0x0800_0000);
+    _ = buildVirt(&out, .{ .cmdline = "x", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
     const struct_off = be32(&out, 8);
     const struct_len = be32(&out, 36);
 
@@ -300,7 +321,7 @@ test "structure block is well-formed and balanced" {
 
 test "virt DTB carries the cmdline and key device nodes" {
     var out: [8192]u8 = undefined;
-    const n = buildVirt(&out, "console=ttyAMA0 root=/dev/ram0", 0x4000_0000, 0x0800_0000);
+    const n = buildVirt(&out, .{ .cmdline = "console=ttyAMA0 root=/dev/ram0", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
     const blob = out[0..n];
     // The struct block holds node names and string-valued props; the strings
     // block holds property names. Substring checks span both.

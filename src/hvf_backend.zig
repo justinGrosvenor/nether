@@ -16,6 +16,7 @@ const std = @import("std");
 const io = @import("io.zig");
 const pwr = @import("power.zig");
 const hvf = @import("hvf.zig");
+const arm = @import("memmap_arm.zig");
 const hvtypes = @import("hvtypes.zig");
 
 const StopReason = hvtypes.StopReason;
@@ -24,11 +25,14 @@ const Error = hvtypes.Error;
 /// ESR_EL2 exception classes we care about.
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
 const EC_HVC: u64 = 0x16; // HVC instruction from AArch64 (PSCI firmware calls)
+const EC_WFX: u64 = 0x01; // trapped WFI/WFE (idle); resume past it
 
 /// PSCI function IDs (the guest's "firmware" for power; the arm64 analog of the
 /// ACPI PM block). The guest calls these via `hvc #0` with the FID in w0/x0.
+const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+const PSCI_VERSION_1_0: u64 = 0x0001_0000; // major 1, minor 0
 const PSCI_NOT_SUPPORTED: u64 = @bitCast(@as(i64, -1));
 
 /// Initial PSTATE: EL1h (M[3:0]=0b0101) with D,A,I,F masked (0xF<<6).
@@ -42,6 +46,11 @@ fn ok(r: hvf.hv_return_t, comptime what: []const u8) Error!void {
 }
 
 pub const Vm = struct {
+    /// GIC region sizes the framework reported (used to fill the DTB so the
+    /// kernel's GIC reg matches what hv_gic actually placed).
+    gicd_size: u64 = arm.gicd_size,
+    gicr_size: u64 = arm.gicr_size,
+
     pub fn init() Error!Vm {
         try ok(hvf.hv_vm_create(null), "hv_vm_create");
         return .{};
@@ -79,9 +88,22 @@ pub const Vm = struct {
         std.posix.munmap(@alignCast(host));
     }
 
-    /// No-op for now: the framework GIC (hv_gic) lands with the aarch64 substrate.
+    /// Create the framework GICv3 (before any vCPU), placing the distributor and
+    /// redistributor at the memmap_arm bases, and record the region sizes the
+    /// framework chose so the DTB can describe them accurately.
     pub fn setupIrq(self: *Vm) Error!void {
-        _ = self;
+        const cfg = hvf.hv_gic_config_create();
+        if (cfg == null) return error.SyscallFailed;
+        try ok(hvf.hv_gic_config_set_distributor_base(cfg, arm.gicd_base), "gic distributor base");
+        try ok(hvf.hv_gic_config_set_redistributor_base(cfg, arm.gicr_base), "gic redistributor base");
+        try ok(hvf.hv_gic_create(cfg), "hv_gic_create");
+
+        var ds: usize = arm.gicd_size;
+        var rs: usize = arm.gicr_size;
+        _ = hvf.hv_gic_get_distributor_size(&ds);
+        _ = hvf.hv_gic_get_redistributor_size(&rs);
+        self.gicd_size = ds;
+        self.gicr_size = rs;
     }
 
     pub fn createVcpu(self: *Vm, id: u32) Error!Vcpu {
@@ -120,6 +142,7 @@ pub const Vcpu = struct {
                     switch (ec) {
                         EC_DATA_ABORT_LOWER => self.handleDataAbort(bus, esr),
                         EC_HVC => self.handlePsci(power),
+                        EC_WFX => self.stepPc(4), // idle wait; the GIC wakes us
                         else => {
                             std.debug.print("[nether] unhandled exception EC=0x{x} ESR=0x{x}\n", .{ ec, esr });
                             return error.UnhandledExit;
@@ -165,18 +188,16 @@ pub const Vcpu = struct {
         self.stepPc(if ((esr >> 25) & 1 == 1) 4 else 2);
     }
 
-    /// PSCI over HVC: the guest's power firmware. SYSTEM_OFF/RESET become a power
-    /// request the run loop observes (no PC step - the guest is going down);
-    /// anything else returns NOT_SUPPORTED and resumes past the hvc.
+    /// PSCI over HVC: the guest's power firmware. Unlike a data abort, HV_REG_PC
+    /// on an HVC exit already points past the `hvc` (ELR semantics), so we must
+    /// NOT step it - the result just goes in x0.
     fn handlePsci(self: *Vcpu, power: *pwr.Power) void {
         const fid = self.getX(0) & 0xffff_ffff;
         switch (fid) {
+            PSCI_VERSION => self.setX(0, PSCI_VERSION_1_0),
             PSCI_SYSTEM_OFF => power.request(.shutdown),
             PSCI_SYSTEM_RESET => power.request(.reset),
-            else => {
-                self.setX(0, PSCI_NOT_SUPPORTED);
-                self.stepPc(4);
-            },
+            else => self.setX(0, PSCI_NOT_SUPPORTED),
         }
     }
 

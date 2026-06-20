@@ -214,14 +214,19 @@ The build-out arc (offline-first chunks):
    (`hv_gic`, the in-kernel LAPIC analog), the ARM generic timer (delivered via
    the GIC), and a full aarch64 memory map - these are exercised by a real OS, so
    they land with step 4.
-4. **aarch64 Linux boot (in progress).** Done: the **DTB generator** (`dtb.zig`,
-   the device-tree analog of `acpi.zig`) - a flattened-device-tree `Builder` plus
-   the "virt" tree (RAM, CPU, PSCI, GICv3, generic timer, PL011 with its
-   reference clock), and the aarch64 memory map (`memmap_arm.zig`). Offline-tested
-   (FDT header, balanced structure, node presence, string dedup). Remaining: the
-   framework GIC (`hv_gic`) + generic timer wired to it, and the `Image` + `X0 =
-   DTB` boot path - then it boots an arm64 `Image` to a console. Needs an arm64
-   kernel `Image` + initramfs as inputs (the analog of the PVH vmlinux).
+4. **aarch64 Linux boot (in progress).** Done: the **DTB generator** (`dtb.zig`),
+   the aarch64 memory map (`memmap_arm.zig`), the framework GIC creation
+   (`hv_gic`, `setupIrq`), and the `Image` + `X0 = DTB` boot path (`macBootLinux`:
+   load Image at the RAM base, DTB + initramfs in RAM, I-cache flush, enter).
+   **An arm64 Alpine kernel (6.12) now boots under HVF on the Mac**: it parses our
+   DTB (`Machine model: nether-virt`), runs early init over our PL011 earlycon,
+   PSCI works (HVC decode; the version/SYSTEM_OFF handlers), and the GIC
+   *distributor* is framework-intercepted. **Blocker:** the GIC *redistributor* at
+   `0x080A0000` is not intercepted by the framework (the kernel's `GICR_PIDR2`
+   read at `0x080affe8` falls through to us), so it reports "No redistributor
+   present" and panics in GIC init - despite the base satisfying the framework's
+   reported size/alignment. Next: reconcile the `hv_gic` redistributor placement
+   (Apple-specific semantics), then the generic timer, then init/console.
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
    net/vsock/rng light up on the new arch.
 

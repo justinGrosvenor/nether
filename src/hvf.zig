@@ -57,6 +57,21 @@ pub extern fn hv_vcpu_run(vcpu: hv_vcpu_t) hv_return_t;
 pub extern fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) hv_return_t;
 pub extern fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *u64) hv_return_t;
 
+/// Framework GIC (macOS 15+): an in-hypervisor GICv3, the aarch64 analog of the
+/// in-kernel LAPIC the KVM split irqchip gives us. Created once per VM, before
+/// vCPUs. The distributor/redistributor MMIO is serviced by the framework (not
+/// surfaced to us as data aborts); we raise device interrupts with set_spi.
+pub const hv_gic_config_t = ?*anyopaque;
+pub extern fn hv_gic_config_create() hv_gic_config_t;
+pub extern fn hv_gic_config_set_distributor_base(config: hv_gic_config_t, base: hv_ipa_t) hv_return_t;
+pub extern fn hv_gic_config_set_redistributor_base(config: hv_gic_config_t, base: hv_ipa_t) hv_return_t;
+pub extern fn hv_gic_create(config: hv_gic_config_t) hv_return_t;
+pub extern fn hv_gic_get_distributor_size(size: *usize) hv_return_t;
+pub extern fn hv_gic_get_redistributor_size(size: *usize) hv_return_t;
+pub extern fn hv_gic_get_distributor_base_alignment(alignment: *usize) hv_return_t;
+pub extern fn hv_gic_get_redistributor_base_alignment(alignment: *usize) hv_return_t;
+pub extern fn hv_gic_set_spi(intid: u32, level: bool) hv_return_t;
+
 /// libkern cache maintenance: after writing guest code through the host mapping,
 /// invalidate the instruction cache so the guest core fetches what we wrote
 /// (host data writes are not I-cache coherent on Apple Silicon).
