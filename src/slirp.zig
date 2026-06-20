@@ -18,10 +18,15 @@ const Lock = @import("lock.zig").Lock;
 // NAT path only runs on the macOS/HVF net path, but the bindings compile anywhere.
 const sock = struct {
     const AF_INET: c_int = 2;
+    const SOCK_STREAM: c_int = 1;
     const SOCK_DGRAM: c_int = 2;
     const F_SETFL: c_int = 4;
     const O_NONBLOCK: c_int = 0x0004; // macOS
     const POLLIN: c_short = 0x0001;
+    const POLLOUT: c_short = 0x0004;
+    const SOL_SOCKET: c_int = 0xffff; // macOS
+    const SO_ERROR: c_int = 0x1007; // macOS
+    const SHUT_WR: c_int = 1;
 
     // macOS sockaddr_in (note the leading sin_len byte).
     const sockaddr_in = extern struct {
@@ -40,13 +45,40 @@ const sock = struct {
     extern "c" fn recv(fd: c_int, buf: [*]u8, n: usize, flags: c_int) isize;
     extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
     extern "c" fn poll(fds: [*]pollfd, n: c_uint, timeout: c_int) c_int;
+    extern "c" fn getsockopt(fd: c_int, level: c_int, opt: c_int, val: *c_int, len: *u32) c_int;
+    extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
 };
 
 const ETH_HDR = 14;
 const ETHERTYPE_ARP = 0x0806;
 const ETHERTYPE_IPV4 = 0x0800;
 const IPPROTO_ICMP = 1;
+const IPPROTO_TCP = 6;
 const IPPROTO_UDP = 17;
+
+// TCP flags.
+const TH_FIN: u8 = 0x01;
+const TH_SYN: u8 = 0x02;
+const TH_RST: u8 = 0x04;
+const TH_PSH: u8 = 0x08;
+const TH_ACK: u8 = 0x10;
+
+const MAX_TCP = 32;
+const TcpState = enum { free, connecting, established, closing };
+const TcpConn = struct {
+    state: TcpState = .free,
+    fd: c_int = -1,
+    guest_port: u16 = 0,
+    dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    dst_port: u16 = 0,
+    snd_nxt: u32 = 0, // next seq we will send to the guest
+    snd_una: u32 = 0, // earliest seq the guest has not yet ACKed
+    rcv_nxt: u32 = 0, // next seq we expect from the guest
+    guest_win: u32 = 0, // the guest's advertised receive window (unscaled)
+    guest_mss: u16 = 1460,
+    guest_fin: bool = false,
+    fin_sent: bool = false,
+};
 
 const MAX_UDP = 32;
 const UdpFlow = struct {
@@ -83,6 +115,8 @@ pub const Slirp = struct {
     // loop (host thread) reads replies and injects them back to the guest, so the
     // table is shared with the vCPU thread and guarded by `lock`.
     udp: [MAX_UDP]UdpFlow = [_]UdpFlow{.{}} ** MAX_UDP,
+    tcp: [MAX_TCP]TcpConn = [_]TcpConn{.{}} ** MAX_TCP,
+    isn_ctr: u32 = 0x1000_0000, // our TCP initial-sequence-number generator
     lock: Lock = .{},
     poll_scratch: [2048]u8 = undefined, // reply assembly on the poll thread
 
@@ -136,6 +170,7 @@ pub const Slirp = struct {
         switch (ip[9]) {
             IPPROTO_ICMP => self.handleIcmp(frame, ihl),
             IPPROTO_UDP => self.handleUdp(frame, ihl),
+            IPPROTO_TCP => self.tcpOut(ip, ihl),
             else => {},
         }
     }
@@ -219,19 +254,35 @@ pub const Slirp = struct {
         return f;
     }
 
-    /// Host thread: poll all NAT sockets and inject any replies back to the guest.
-    /// Returns after one poll cycle (caller loops).
+    /// Host thread: poll all NAT sockets (UDP flows + TCP conns) and move data
+    /// between them and the guest. Returns after one poll cycle (caller loops).
     pub fn pollOnce(self: *Slirp, timeout_ms: i32) void {
-        var fds: [MAX_UDP]sock.pollfd = undefined;
-        var idx: [MAX_UDP]usize = undefined;
+        const N = MAX_UDP + MAX_TCP;
+        var fds: [N]sock.pollfd = undefined;
+        var tag: [N]u32 = undefined; // bit 31 = TCP; low bits = table index
         var n: u32 = 0;
         self.lock.lock();
         for (&self.udp, 0..) |*f, i| {
             if (f.used and f.fd >= 0) {
                 fds[n] = .{ .fd = f.fd, .events = sock.POLLIN };
-                idx[n] = i;
+                tag[n] = @intCast(i);
                 n += 1;
             }
+        }
+        for (&self.tcp, 0..) |*c, i| {
+            const ev: sock.pollfd = switch (c.state) {
+                .connecting => .{ .fd = c.fd, .events = sock.POLLOUT },
+                .established => blk: {
+                    // Only read from the host while the guest's window has room,
+                    // so a full window does not spin the poll loop.
+                    if (c.guest_win > (c.snd_nxt -% c.snd_una)) break :blk .{ .fd = c.fd, .events = sock.POLLIN };
+                    continue;
+                },
+                else => continue,
+            };
+            fds[n] = ev;
+            tag[n] = 0x8000_0000 | @as(u32, @intCast(i));
+            n += 1;
         }
         self.lock.unlock();
         if (n == 0) {
@@ -241,17 +292,194 @@ pub const Slirp = struct {
         if (sock.poll(&fds, n, timeout_ms) <= 0) return;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
-            if (fds[k].revents & sock.POLLIN == 0) continue;
-            self.lock.lock();
-            const f = &self.udp[idx[k]];
-            const got = if (f.used and f.fd >= 0) sock.recv(f.fd, self.poll_scratch[0..1500].ptr, 1500, 0) else -1;
-            const sip = f.seen_ip;
-            const sport = f.seen_port;
-            const gport = f.guest_port;
-            self.lock.unlock();
-            if (got <= 0) continue;
-            self.injectUdpToGuest(&sip, sport, gport, self.poll_scratch[0..@intCast(got)]);
+            if (fds[k].revents == 0) continue;
+            if (tag[k] & 0x8000_0000 != 0) self.tcpPollReady(tag[k] & 0x7fff_ffff, fds[k].revents) else self.udpPollReady(tag[k], fds[k].revents);
         }
+    }
+
+    fn udpPollReady(self: *Slirp, i: u32, revents: c_short) void {
+        if (revents & sock.POLLIN == 0) return;
+        self.lock.lock();
+        const f = &self.udp[i];
+        const got = if (f.used and f.fd >= 0) sock.recv(f.fd, self.poll_scratch[0..1500].ptr, 1500, 0) else -1;
+        const sip = f.seen_ip;
+        const sport = f.seen_port;
+        const gport = f.guest_port;
+        self.lock.unlock();
+        if (got <= 0) return;
+        self.injectUdpToGuest(&sip, sport, gport, self.poll_scratch[0..@intCast(got)]);
+    }
+
+    fn tcpPollReady(self: *Slirp, i: u32, revents: c_short) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const c = &self.tcp[i];
+        if (c.state == .connecting) {
+            var err: c_int = 0;
+            var len: u32 = 4;
+            _ = sock.getsockopt(c.fd, sock.SOL_SOCKET, sock.SO_ERROR, &err, &len);
+            if (err != 0) { // connect failed -> reset the guest
+                self.tcpSend(c, c.snd_nxt, TH_RST | TH_ACK, &.{}, null);
+                self.tcpClose(c);
+                return;
+            }
+            c.state = .established;
+            self.tcpSend(c, c.snd_nxt, TH_SYN | TH_ACK, &.{}, c.guest_mss);
+            c.snd_nxt +%= 1; // the SYN consumes a sequence number
+            return;
+        }
+        if (c.state == .established and revents & sock.POLLIN != 0) {
+            const inflight = c.snd_nxt -% c.snd_una;
+            if (c.guest_win <= inflight) return;
+            var room: u32 = c.guest_win - inflight;
+            if (room > c.guest_mss) room = c.guest_mss;
+            if (room > 1400) room = 1400;
+            const got = sock.recv(c.fd, self.poll_scratch[0..room].ptr, room, 0);
+            if (got > 0) {
+                self.tcpSend(c, c.snd_nxt, TH_PSH | TH_ACK, self.poll_scratch[0..@intCast(got)], null);
+                c.snd_nxt +%= @intCast(got);
+            } else if (got == 0) { // host EOF -> FIN to the guest
+                self.tcpSend(c, c.snd_nxt, TH_FIN | TH_ACK, &.{}, null);
+                c.snd_nxt +%= 1;
+                c.fin_sent = true;
+                c.state = .closing;
+            }
+        }
+    }
+
+    // --- outbound TCP NAT --------------------------------------------------
+    // The guest's connection terminates here; we bridge it to a host SOCK_STREAM.
+    // The in-process path to the guest is lossless, so no retransmit/congestion
+    // logic is needed - only seq/ack bookkeeping and the guest's receive window.
+    fn tcpOut(self: *Slirp, ip: []const u8, ihl: usize) void {
+        const tcp = ip[ihl..];
+        if (tcp.len < 20) return;
+        const sport = rd16(tcp[0..2]);
+        const dport = rd16(tcp[2..4]);
+        const seq = rd32(tcp[4..8]);
+        const ack = rd32(tcp[8..12]);
+        const doff = (tcp[12] >> 4) * 4;
+        if (doff < 20 or tcp.len < doff) return;
+        const flags = tcp[13];
+        const win: u32 = rd16(tcp[14..16]);
+        const payload = tcp[doff..];
+        var dst_ip: [4]u8 = ip[16..20][0..4].*;
+
+        self.lock.lock();
+        defer self.lock.unlock();
+        const conn = self.tcpFind(sport, &dst_ip, dport);
+
+        if (flags & TH_RST != 0) {
+            if (conn) |c| self.tcpClose(c);
+            return;
+        }
+        if (conn == null) {
+            if (flags & TH_SYN == 0) return; // unknown, not a SYN
+            _ = self.tcpOpen(sport, &dst_ip, dport, seq, win, tcp[20..doff]);
+            return; // SYN-ACK is sent from the poll loop once the host connect completes
+        }
+        const c = conn.?;
+        if (flags & TH_ACK != 0 and seqGt(ack, c.snd_una)) c.snd_una = ack;
+        c.guest_win = win;
+
+        if (payload.len > 0 and c.state == .established and seq == c.rcv_nxt) {
+            const n = sock.send(c.fd, payload.ptr, payload.len, 0);
+            if (n > 0) c.rcv_nxt +%= @intCast(n);
+        }
+        if (payload.len > 0 and c.state == .established) self.tcpSend(c, c.snd_nxt, TH_ACK, &.{}, null);
+
+        if (flags & TH_FIN != 0 and seq == c.rcv_nxt and !c.guest_fin) {
+            c.guest_fin = true;
+            c.rcv_nxt +%= 1;
+            _ = sock.shutdown(c.fd, sock.SHUT_WR); // host sees EOF
+            self.tcpSend(c, c.snd_nxt, TH_ACK, &.{}, null);
+            if (c.fin_sent) self.tcpClose(c);
+        }
+    }
+
+    fn tcpFind(self: *Slirp, sport: u16, dst_ip: *const [4]u8, dport: u16) ?*TcpConn {
+        for (&self.tcp) |*c| {
+            if (c.state != .free and c.guest_port == sport and c.dst_port == dport and eqIp(&c.dst_ip, dst_ip)) return c;
+        }
+        return null;
+    }
+
+    fn tcpOpen(self: *Slirp, sport: u16, dst_ip: *const [4]u8, dport: u16, guest_isn: u32, win: u32, opts: []const u8) ?*TcpConn {
+        var slot: ?*TcpConn = null;
+        for (&self.tcp) |*c| {
+            if (c.state == .free) {
+                slot = c;
+                break;
+            }
+        }
+        const c = slot orelse return null;
+        const fd = sock.socket(sock.AF_INET, sock.SOCK_STREAM, 0);
+        if (fd < 0) return null;
+        _ = sock.fcntl(fd, sock.F_SETFL, sock.O_NONBLOCK);
+        var sa = sock.sockaddr_in{ .port = std.mem.nativeToBig(u16, dport), .addr = ipToBe(dst_ip) };
+        _ = sock.connect(fd, &sa, 16); // EINPROGRESS expected; the poll loop finishes it
+        self.isn_ctr +%= 0x1_0000;
+        c.* = .{
+            .state = .connecting,
+            .fd = fd,
+            .guest_port = sport,
+            .dst_ip = dst_ip.*,
+            .dst_port = dport,
+            .snd_nxt = self.isn_ctr,
+            .snd_una = self.isn_ctr,
+            .rcv_nxt = guest_isn +% 1,
+            .guest_win = win,
+            .guest_mss = parseMss(opts),
+        };
+        return c;
+    }
+
+    fn tcpClose(self: *Slirp, c: *TcpConn) void {
+        _ = self;
+        if (c.fd >= 0) _ = sock.close(c.fd);
+        c.* = .{};
+    }
+
+    /// Build and send one TCP segment to the guest with the given seq/flags/data.
+    /// `mss` non-null adds an MSS option (for the SYN-ACK). Does not advance seq.
+    fn tcpSend(self: *Slirp, c: *TcpConn, seq: u32, flags: u8, payload: []const u8, mss: ?u16) void {
+        var buf: [2048]u8 = undefined;
+        const opt_len: usize = if (mss != null) 4 else 0;
+        const thl = 20 + opt_len;
+        const total = ETH_HDR + 20 + thl + payload.len;
+        if (total > buf.len) return;
+        @memcpy(buf[0..6], &self.guest_mac);
+        @memcpy(buf[6..12], &self.gateway_mac);
+        wr16(buf[12..14], ETHERTYPE_IPV4);
+        const ip = buf[ETH_HDR..];
+        ip[0] = 0x45;
+        ip[1] = 0;
+        wr16(ip[2..4], @intCast(20 + thl + payload.len));
+        wr16(ip[4..6], 0);
+        wr16(ip[6..8], 0);
+        ip[8] = 64;
+        ip[9] = IPPROTO_TCP;
+        wr16(ip[10..12], 0);
+        @memcpy(ip[12..16], &c.dst_ip); // src = the remote the guest dialed
+        @memcpy(ip[16..20], &self.guest_ip);
+        wr16(ip[10..12], checksum(ip[0..20]));
+        const t = ip[20..];
+        @memset(t[0..thl], 0);
+        wr16(t[0..2], c.dst_port);
+        wr16(t[2..4], c.guest_port);
+        wr32(t[4..8], seq);
+        wr32(t[8..12], c.rcv_nxt);
+        t[12] = @intCast((thl / 4) << 4);
+        t[13] = flags;
+        wr16(t[14..16], 0xffff); // our receive window (no scaling)
+        if (mss) |m| {
+            t[20] = 2;
+            t[21] = 4;
+            wr16(t[22..24], m);
+        }
+        @memcpy(t[thl..][0..payload.len], payload);
+        wr16(t[16..18], tcpChecksum(&c.dst_ip, &self.guest_ip, t[0 .. thl + payload.len]));
+        self.send(buf[0..total]);
     }
 
     /// Build Ethernet+IPv4+UDP from (src_ip:sport) to the guest:gport and send it.
@@ -422,6 +650,42 @@ fn eqIp(a: []const u8, b: []const u8) bool {
 /// order, which is exactly the array's memory layout).
 fn ipToBe(ip: *const [4]u8) u32 {
     return @bitCast(ip.*);
+}
+/// Serial-number greater-than (RFC 1982), for TCP sequence/ack comparisons.
+fn seqGt(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) > 0;
+}
+/// Scan TCP options for the MSS (kind 2); default 1460.
+fn parseMss(opts: []const u8) u16 {
+    var i: usize = 0;
+    while (i + 1 < opts.len) {
+        const kind = opts[i];
+        if (kind == 0) break; // end of options
+        if (kind == 1) {
+            i += 1;
+            continue;
+        } // nop
+        const len = opts[i + 1];
+        if (len < 2) break;
+        if (kind == 2 and len == 4 and i + 4 <= opts.len) return rd16(opts[i + 2 ..][0..2]);
+        i += len;
+    }
+    return 1460;
+}
+/// TCP checksum over the IPv4 pseudo-header + segment.
+fn tcpChecksum(src: *const [4]u8, dst: *const [4]u8, seg: []const u8) u16 {
+    var sum: u32 = 0;
+    sum += rd16(src[0..2]);
+    sum += rd16(src[2..4]);
+    sum += rd16(dst[0..2]);
+    sum += rd16(dst[2..4]);
+    sum += IPPROTO_TCP;
+    sum += @intCast(seg.len);
+    var i: usize = 0;
+    while (i + 1 < seg.len) : (i += 2) sum += rd16(seg[i..][0..2]);
+    if (i < seg.len) sum += @as(u32, seg[i]) << 8;
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return ~@as(u16, @truncate(sum));
 }
 
 fn ethReply(out: []u8, req_frame: []const u8, src_mac: *const [6]u8, ethertype: u16) void {

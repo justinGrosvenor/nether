@@ -141,7 +141,12 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
     ```sh
     nslookup example.com 10.0.2.3     # -> real records (forwarded to 8.8.8.8)
     ```
-    A poll thread relays replies back to the guest. TCP NAT (HTTP/git) is next.
+    A poll thread relays replies back to the guest.
+  - **Outbound TCP** works through slirp's TCP NAT (guest connections bridged to
+    host sockets) - real internet, no privilege:
+    ```sh
+    wget -O- http://example.com       # -> the actual page body
+    ```
 
 ## How the Linux boot works
 

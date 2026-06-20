@@ -339,9 +339,17 @@ The build-out arc (offline-first chunks):
      (10.0.2.3:53) are forwarded to a real upstream (8.8.8.8). Proven live:
      `nslookup example.com 10.0.2.3` returns real records. So the guest now has
      real name resolution and outbound UDP with no host networking setup.
-     **Remaining:** TCP NAT (a guest-facing connection state machine bridged to
-     host sockets) for HTTP/git/etc - the lossless in-process path means no
-     retransmit/congestion logic is needed, just correct seq/ack + the poll thread.
+   - **Outbound TCP NAT (DONE) - real internet.** The guest's TCP connections
+     terminate at a slirp-side state machine bridged to host `SOCK_STREAM` sockets:
+     on the guest SYN we start a non-blocking `connect()`; the poll thread completes
+     it (`getsockopt(SO_ERROR)`) and sends the SYN-ACK; data relays both ways with
+     correct seq/ack and respecting the guest's receive window; FIN/RST close it.
+     Window scaling is disabled (omitted from our SYN-ACK) so windows stay 16-bit,
+     and the lossless in-process path means no retransmit/congestion logic is
+     needed. Proven live: `wget -O- http://example.com` resolves the name (DNS NAT),
+     connects (TCP NAT), and returns the full page body - real internet in an
+     unprivileged guest. Known limits (fine for the sandbox use case): no window
+     scaling (64 KiB cap), no SACK/reordering (lossless path), no idle-conn reaper.
 6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs
    (`ARM_NUM_CPUS`, currently 4). Each core creates and runs its own vCPU on its
    own host thread (an HVF vCPU is bound to its creating thread), so the boot core
