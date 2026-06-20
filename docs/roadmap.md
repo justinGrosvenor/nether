@@ -137,9 +137,15 @@ done-line.
   RST and credit), and credit-based flow control, with a fixed-pool connection
   table and outbound staging ring (snapshot-friendly by construction) and a
   host-facing event/`send`/`connect`/`close` API decoupled from the transport.
-  It is unit- and fuzz-tested offline (the guest's TX packets are
-  attacker-controlled). Still pending: the device wiring (RX/TX virtqueue glue,
-  the `virtio.Backend`, guest_cid device config) and the swerver-side listener.
+  The device wiring is in too (`VsockDev`): a `virtio.Backend` over three
+  virtqueues (RX/TX/event) that copies guest TX packets into the engine and
+  drains staged output back onto the guest's RX buffers, carrying the first
+  two-threaded D3 per-device lock (vCPU-thread kicks vs host-thread `host*`
+  calls; the lock is released before the MSI signal, matching serial/IOAPIC).
+  It is wired into `main.zig` behind a `nether-vsock` marker as PCI 0:2.0 with an
+  echo exerciser on port 1234. Unit- and fuzz-tested offline (the guest's TX
+  packets are attacker-controlled); live boot verification and the real
+  swerver-side listener are the remaining steps.
 - **Snapshot-aware device models from Phase 3.** Don't ship a device whose state
   can't be serialized; snapshot-fork (boot once → clone per request) is the edge
   product, so the Phase 6 "snapshot" work is really a constraint applied early.

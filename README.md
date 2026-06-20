@@ -25,6 +25,11 @@ it:
 - **Continuous interactive stdin**: a host I/O thread feeds the serial RX and
   raises IRQ4 so an idle shell still receives input (offline-built and
   unit-tested; live verification pending the next box).
+- **virtio-vsock** (the swerver<->guest channel): a pure protocol engine
+  (header codec, connection state machine, credit flow control) plus the
+  three-queue device glue, wired behind a `nether-vsock` marker with a host echo
+  service on port 1234 (offline-built, unit- and fuzz-tested; live boot
+  verification pending).
 
 If no `vmlinux` is present the binary runs a comptime real-mode blob that prints
 over COM1 and triggers ACPI S5, as a smoke test. See

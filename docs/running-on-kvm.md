@@ -130,3 +130,13 @@ echo hello | dd of=/dev/vda bs=512 seek=1   # write path
   SSH tunnel). It is interactive: keystrokes in the page are mapped to terminal
   byte sequences and POSTed to the guest's serial RX. Without the marker, no port
   is bound.
+- **virtio-vsock**: `touch nether-vsock` before `zig build run` to present a
+  vsock device (PCI 0:2.0, guest CID 3) with a host echo service on port 1234.
+  The guest kernel needs `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`. From the
+  guest shell, connect to the host (CID 2) and confirm the echo:
+  ```sh
+  # guest: needs a vsock-aware tool (socat with VSOCK, or a few lines of python)
+  socat - VSOCK-CONNECT:2:1234     # type a line; it comes straight back
+  ```
+  This is the spine for the swerver<->guest channel; the echo is a placeholder
+  for the real listener.

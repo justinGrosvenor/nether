@@ -46,6 +46,7 @@ pub const VirtioRng = @import("virtio_rng.zig").Rng;
 pub const VirtioBlk = @import("virtio_blk.zig").Blk;
 pub const vsock = @import("virtio_vsock.zig");
 pub const Vsock = vsock.Vsock;
+pub const VsockDev = vsock.VsockDev;
 
 const power = @import("power.zig");
 pub const Power = power.Power;

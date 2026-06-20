@@ -1,21 +1,30 @@
-//! virtio-vsock protocol engine: the swerver<->guest channel (the thesis spine).
+//! virtio-vsock: the swerver<->guest channel (the thesis spine).
 //!
-//! This file is the *pure* protocol core. It parses and emits virtio_vsock
-//! packets (a 44-byte header plus payload), runs the per-connection state
-//! machine, and does credit-based flow control. It never touches guest memory
-//! or a virtqueue: inbound packets arrive as byte slices (the device layer
-//! copies them out of the TX ring first) and outbound packets are staged in a
-//! fixed ring that the device layer drains onto the RX ring. That keeps the
-//! whole protocol testable on the host and serializable for snapshots.
+//! Two layers live here:
 //!
-//! The device glue (RX/TX virtqueue plumbing, the virtio.Backend, guest_cid
-//! device config) lands in a follow-up chunk; this is the layer it sits on.
+//!   * `Vsock` is the *pure* protocol engine. It parses and emits virtio_vsock
+//!     packets (a 44-byte header plus payload), runs the per-connection state
+//!     machine, and does credit-based flow control. It never touches guest
+//!     memory or a virtqueue: inbound packets arrive as byte slices and
+//!     outbound packets are staged in a fixed ring. That keeps the protocol
+//!     testable on the host and serializable for snapshots.
+//!
+//!   * `VsockDev` is the device glue: a `virtio.Backend` over three virtqueues
+//!     (RX=0, TX=1, event=2) that copies guest TX packets into the engine and
+//!     drains the engine's staged output back onto the guest's RX buffers. It
+//!     carries the D3 per-device lock because, unlike virtio-blk, it is driven
+//!     from two threads: the vCPU thread (queue kicks) and the host thread
+//!     (swerver staging output via hostSend/hostConnect/hostClose).
 //!
 //! Single-guest model: the host CID is fixed at 2 and the guest CID is fixed
 //! per VM, so a connection is uniquely identified by its (host_port,
 //! guest_port) pair. STREAM sockets only.
 
 const std = @import("std");
+const virtio = @import("virtio.zig");
+const virtq = @import("virtq.zig");
+const Lock = @import("lock.zig").Lock;
+const trace = @import("trace.zig");
 
 pub const HOST_CID: u64 = 2;
 pub const HDR_LEN = 44;
@@ -438,6 +447,186 @@ pub const Vsock = struct {
     }
 };
 
+// --- device glue -----------------------------------------------------------
+
+pub const VIRTIO_ID_VSOCK = 19;
+pub const RXQ: u16 = 0; // host -> guest (device-initiated)
+pub const TXQ: u16 = 1; // guest -> host
+pub const EVQ: u16 = 2; // transport events (unused)
+
+/// Wraps the pure engine as a virtio device. Owns the D3 per-device lock that
+/// serializes the two threads that touch the engine and the queues: the vCPU
+/// thread (queue kicks, via `onNotify`) and the host thread (swerver, via the
+/// `host*` methods). The lock is never held across the MSI signal, matching the
+/// serial/IOAPIC discipline (interrupts are raised after unlocking).
+///
+/// Re-entrancy contract: the engine's `on_event` callback only ever fires from
+/// inside `engine.rx()`, which `VsockDev` only calls while holding the lock.
+/// So an event handler must NOT call the `host*` methods (it would deadlock on
+/// the non-recursive lock); to reply inline it calls the engine directly
+/// (`engine.send`/`engine.close`) - it is already serialized, and the kick that
+/// delivered the event flushes the staged reply to the guest before returning.
+pub const VsockDev = struct {
+    engine: *Vsock,
+    dev: *virtio.Device = undefined,
+    attached: bool = false,
+    lock: Lock = .{},
+    scratch: [PKT_CAP]u8 = undefined, // a guest TX chain gathered contiguously
+
+    pub fn backend(self: *VsockDev) virtio.Backend {
+        return .{
+            .ptr = self,
+            .device_id = VIRTIO_ID_VSOCK,
+            .num_queues = 3,
+            .device_features = 0,
+            .notify = onNotify,
+            .config_read = configRead,
+        };
+    }
+
+    /// Bind the transport so the host thread can push to the guest between
+    /// kicks. Call once, after the transport `Device` is created.
+    pub fn attach(self: *VsockDev, dev: *virtio.Device) void {
+        self.dev = dev;
+        self.attached = true;
+    }
+
+    fn configRead(ptr: *anyopaque, off: u16, size: u8) u32 {
+        return cast(ptr).engine.configRead(off, size);
+    }
+
+    fn onNotify(ptr: *anyopaque, dev: *virtio.Device, q: u16) void {
+        const self = cast(ptr);
+        self.dev = dev;
+        self.attached = true;
+        switch (q) {
+            TXQ => self.handleTx(dev),
+            RXQ => self.flush(), // guest replenished RX buffers; push pending
+            else => {}, // event queue: unused
+        }
+    }
+
+    /// vCPU thread: drain the guest's TX ring into the engine, then push any
+    /// output the engine staged (RESPONSE/CREDIT_UPDATE/RST, or an inline reply
+    /// from an event handler) back to the guest.
+    fn handleTx(self: *VsockDev, dev: *virtio.Device) void {
+        const mem = dev.memory();
+        const vq = dev.queue(TXQ);
+        self.lock.lock();
+        var consumed = false;
+        while (vq.next(mem)) |head| {
+            const n = self.gather(mem, vq, head);
+            trace.log("vsock tx head={d} len={d}", .{ head, n });
+            self.engine.rx(self.scratch[0..n]);
+            vq.complete(mem, head, 0); // TX buffers are device-read-only
+            consumed = true;
+        }
+        const delivered = self.drainToRx(dev);
+        self.lock.unlock();
+        if (consumed) dev.interruptQueue(TXQ);
+        if (delivered) dev.interruptQueue(RXQ);
+    }
+
+    /// Host thread (or an RX kick): push staged output onto the guest's RX
+    /// buffers. Safe to call before `attach` (no-op) so the host can fire it
+    /// freely after staging.
+    pub fn flush(self: *VsockDev) void {
+        if (!self.attached) return;
+        const dev = self.dev;
+        self.lock.lock();
+        const delivered = self.drainToRx(dev);
+        self.lock.unlock();
+        if (delivered) dev.interruptQueue(RXQ);
+    }
+
+    // --- host-facing API (locks; call from swerver's thread, NOT an event
+    // callback - see the re-entrancy contract above) ------------------------
+
+    pub fn hostListen(self: *VsockDev, port: u32) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.engine.listen(port);
+    }
+
+    pub fn hostConnect(self: *VsockDev, host_port: u32, guest_port: u32) ?u16 {
+        self.lock.lock();
+        const id = self.engine.connect(host_port, guest_port);
+        self.lock.unlock();
+        self.flush();
+        return id;
+    }
+
+    pub fn hostSend(self: *VsockDev, id: u16, data: []const u8) usize {
+        self.lock.lock();
+        const n = self.engine.send(id, data);
+        self.lock.unlock();
+        self.flush();
+        return n;
+    }
+
+    pub fn hostClose(self: *VsockDev, id: u16) void {
+        self.lock.lock();
+        self.engine.close(id);
+        self.lock.unlock();
+        self.flush();
+    }
+
+    // --- internals (assume the lock is held) -------------------------------
+
+    /// Gather a guest TX chain's device-readable bytes into `scratch`, capped at
+    /// the buffer. Returns the contiguous length the engine should parse.
+    fn gather(self: *VsockDev, mem: virtq.GuestMem, vq: *virtq.Virtqueue, head: u16) usize {
+        var n: usize = 0;
+        var it = vq.chain(mem, head);
+        while (it.next()) |b| {
+            if (b.writable) continue; // device writes those; TX is read-only
+            const src = mem.slice(b.addr, b.len) orelse continue;
+            const take = @min(self.scratch.len - n, src.len);
+            @memcpy(self.scratch[n..][0..take], src[0..take]);
+            n += take;
+            if (n == self.scratch.len) break;
+        }
+        return n;
+    }
+
+    /// Move staged packets onto available RX chains until one side runs dry.
+    /// Returns true if at least one packet was delivered.
+    fn drainToRx(self: *VsockDev, dev: *virtio.Device) bool {
+        const mem = dev.memory();
+        const vq = dev.queue(RXQ);
+        var delivered = false;
+        while (self.engine.peekOut()) |pkt| {
+            if (!vq.hasNext(mem)) break; // no RX buffer to place it in
+            const head = vq.next(mem).?;
+            const written = scatter(mem, vq, head, pkt);
+            vq.complete(mem, head, written);
+            trace.log("vsock rx head={d} len={d}", .{ head, written });
+            self.engine.popOut();
+            delivered = true;
+        }
+        return delivered;
+    }
+
+    /// Copy a staged packet across an RX chain's device-writable buffers.
+    fn scatter(mem: virtq.GuestMem, vq: *virtq.Virtqueue, head: u16, pkt: []const u8) u32 {
+        var off: usize = 0;
+        var it = vq.chain(mem, head);
+        while (it.next()) |b| {
+            if (!b.writable) continue; // RX buffers must be device-writable
+            if (off == pkt.len) break;
+            const dst = mem.slice(b.addr, b.len) orelse continue;
+            const take = @min(dst.len, pkt.len - off);
+            @memcpy(dst[0..take], pkt[off..][0..take]);
+            off += take;
+        }
+        return @intCast(off);
+    }
+};
+
+fn cast(ptr: *anyopaque) *VsockDev {
+    return @ptrCast(@alignCast(ptr));
+}
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -685,4 +874,114 @@ test "a lying length field cannot over-read the packet buffer" {
     var dbuf: [HDR_LEN + 4]u8 = undefined;
     vs.rx(guestPkt(&dbuf, .{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 50, .dst_port = 7, .op = Op.RW, .len = 1000 }, "data"));
     try testing.expectEqual(@as(usize, 4), rec.last_recv_len); // clamped to what arrived
+}
+
+// --- device-glue tests (full virtqueue path) -------------------------------
+//
+// Memory layout in the shared `ram` (guest base 0):
+//   TX queue: desc 0x0000, avail 0x0200, used 0x0400
+//   RX queue: desc 0x0600, avail 0x0800, used 0x0A00
+//   TX packet buffer 0x1000; RX buffers 0x2000 and 0x3000 (4 KiB each)
+
+const TX_DESC = 0x0000;
+const TX_AVAIL = 0x0200;
+const TX_USED = 0x0400;
+const RX_DESC = 0x0600;
+const RX_AVAIL = 0x0800;
+const RX_USED = 0x0A00;
+
+fn progQueue(dev: *virtio.Device, sel: u16, size: u16, desc: u32, avail: u32, used: u32) void {
+    dev.barWrite(0x16, 2, sel);
+    dev.barWrite(0x18, 2, size);
+    dev.barWrite(0x20, 4, desc);
+    dev.barWrite(0x28, 4, avail);
+    dev.barWrite(0x30, 4, used);
+    dev.barWrite(0x1c, 2, 1); // enable
+}
+
+fn wdesc(ram: []u8, at: usize, gpa: u64, len: u32, flags: u16, next: u16) void {
+    std.mem.writeInt(u64, ram[at..][0..8], gpa, .little);
+    std.mem.writeInt(u32, ram[at + 8 ..][0..4], len, .little);
+    std.mem.writeInt(u16, ram[at + 12 ..][0..2], flags, .little);
+    std.mem.writeInt(u16, ram[at + 14 ..][0..2], next, .little);
+}
+
+fn usedIdx(ram: []const u8, used: usize) u16 {
+    return std.mem.readInt(u16, ram[used + 2 ..][0..2], .little);
+}
+
+test "device: a guest REQUEST kick yields a RESPONSE on the RX ring" {
+    var ram = [_]u8{0} ** 16384;
+    var vs = Vsock{ .guest_cid = 3 };
+    _ = vs.listen(7);
+    var vdev = VsockDev{ .engine = &vs };
+    var dev = virtio.Device.init(vdev.backend(), .{ .bytes = &ram, .base = 0 });
+
+    // guest_cid is exposed in device config (u64 at offset 0).
+    try testing.expectEqual(@as(u32, 3), dev.barRead(0x3000, 4));
+
+    progQueue(&dev, RXQ, 8, RX_DESC, RX_AVAIL, RX_USED);
+    progQueue(&dev, TXQ, 8, TX_DESC, TX_AVAIL, TX_USED);
+
+    // RX: one device-writable 4 KiB buffer the host can place a packet in.
+    wdesc(&ram, RX_DESC, 0x2000, 0x1000, virtq.DESC_F_WRITE, 0);
+    std.mem.writeInt(u16, ram[RX_AVAIL + 4 ..][0..2], 0, .little); // ring[0] = desc 0
+    std.mem.writeInt(u16, ram[RX_AVAIL + 2 ..][0..2], 1, .little); // avail.idx = 1
+
+    // TX: a device-readable buffer holding a REQUEST to listened port 7.
+    const req = Hdr{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 50, .dst_port = 7, .op = Op.REQUEST, .buf_alloc = 4096 };
+    req.encode(ram[0x1000..][0..HDR_LEN]);
+    wdesc(&ram, TX_DESC, 0x1000, HDR_LEN, 0, 0);
+    std.mem.writeInt(u16, ram[TX_AVAIL + 4 ..][0..2], 0, .little);
+    std.mem.writeInt(u16, ram[TX_AVAIL + 2 ..][0..2], 1, .little);
+
+    dev.barWrite(0x2000, 4, TXQ); // kick the TX queue
+
+    // The connection is established and a RESPONSE landed in the RX buffer.
+    try testing.expectEqual(Conn.State.established, vs.conns[0].state);
+    try testing.expectEqual(@as(u16, 1), usedIdx(&ram, TX_USED)); // TX buffer reclaimed
+    try testing.expectEqual(@as(u16, 1), usedIdx(&ram, RX_USED)); // RX packet delivered
+    const resp = Hdr.decode(ram[0x2000..][0..HDR_LEN]).?;
+    try testing.expectEqual(Op.RESPONSE, resp.op);
+    try testing.expectEqual(@as(u32, 7), resp.src_port);
+    try testing.expectEqual(@as(u32, 50), resp.dst_port);
+    // The used-ring length is the full packet (header, no payload).
+    try testing.expectEqual(@as(u32, HDR_LEN), std.mem.readInt(u32, ram[RX_USED + 8 ..][0..4], .little));
+}
+
+test "device: host send is delivered to a posted RX buffer" {
+    var ram = [_]u8{0} ** 16384;
+    var vs = Vsock{ .guest_cid = 3 };
+    _ = vs.listen(7);
+    var vdev = VsockDev{ .engine = &vs };
+    var dev = virtio.Device.init(vdev.backend(), .{ .bytes = &ram, .base = 0 });
+    vdev.attach(&dev);
+
+    progQueue(&dev, RXQ, 8, RX_DESC, RX_AVAIL, RX_USED);
+    progQueue(&dev, TXQ, 8, TX_DESC, TX_AVAIL, TX_USED);
+
+    // Two RX buffers up front: the RESPONSE takes the first, host data the next.
+    wdesc(&ram, RX_DESC + 0, 0x2000, 0x1000, virtq.DESC_F_WRITE, 0);
+    wdesc(&ram, RX_DESC + 16, 0x3000, 0x1000, virtq.DESC_F_WRITE, 0);
+    std.mem.writeInt(u16, ram[RX_AVAIL + 4 ..][0..2], 0, .little); // ring[0] = desc 0
+    std.mem.writeInt(u16, ram[RX_AVAIL + 6 ..][0..2], 1, .little); // ring[1] = desc 1
+    std.mem.writeInt(u16, ram[RX_AVAIL + 2 ..][0..2], 2, .little); // avail.idx = 2
+
+    // Handshake (REQUEST -> RESPONSE) so the connection is established.
+    const req = Hdr{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 50, .dst_port = 7, .op = Op.REQUEST, .buf_alloc = 4096 };
+    req.encode(ram[0x1000..][0..HDR_LEN]);
+    wdesc(&ram, TX_DESC, 0x1000, HDR_LEN, 0, 0);
+    std.mem.writeInt(u16, ram[TX_AVAIL + 4 ..][0..2], 0, .little);
+    std.mem.writeInt(u16, ram[TX_AVAIL + 2 ..][0..2], 1, .little);
+    dev.barWrite(0x2000, 4, TXQ);
+    try testing.expectEqual(@as(u16, 1), usedIdx(&ram, RX_USED)); // RESPONSE used buffer 0
+
+    // Host (swerver) sends data on the established connection (id 0).
+    try testing.expectEqual(@as(usize, 4), vdev.hostSend(0, "ping"));
+    try testing.expectEqual(@as(u16, 2), usedIdx(&ram, RX_USED)); // delivered to buffer 1
+
+    const data = Hdr.decode(ram[0x3000..][0..HDR_LEN]).?;
+    try testing.expectEqual(Op.RW, data.op);
+    try testing.expectEqual(@as(u32, 4), data.len);
+    try testing.expectEqualStrings("ping", ram[0x3000 + HDR_LEN ..][0..4]);
 }

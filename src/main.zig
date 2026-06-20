@@ -108,6 +108,33 @@ pub fn main() !void {
         std.debug.print("[nether] virtio-blk: disk.img {d} bytes, BAR 0x{x}\n", .{ disk.len, blk_dev.barBase() });
     }
 
+    // virtio-vsock: the swerver<->guest channel. Opt-in via a `nether-vsock`
+    // marker. PCI function 0:2.0, BAR clear of virtio-blk's (base + 64 KiB), with
+    // a guest CID of 3 (host is 2). As a live exerciser the host listens on port
+    // 1234 and echoes; the engine is heap-allocated (it is large and snapshot
+    // state), the transport/glue are stack locals that outlive `run`.
+    var vsock_engine: ?*nether.Vsock = null;
+    defer if (vsock_engine) |v| allocator.destroy(v);
+    var vsdev: nether.VsockDev = undefined;
+    var vs_dev: nether.virtio.Device = undefined;
+    if (vsockEnabled()) {
+        const vs = try allocator.create(nether.Vsock);
+        vs.* = .{ .guest_cid = 3 };
+        vs.on_event = vsockEcho;
+        vs.on_event_ctx = vs;
+        vsock_engine = vs;
+        vsdev = .{ .engine = vs };
+        vs_dev = nether.virtio.Device.init(vsdev.backend(), .{ .bytes = low, .base = layout.ram_low.base });
+        vs_dev.assignBar(nether.memmap.pci_mmio32_base + 0x10000);
+        vs_dev.msi_ptr = &msi_sink;
+        vs_dev.msi_fn = MsiSink.send;
+        try pci_host.addFunction(vs_dev.function(2, 0));
+        try bus.addMmio(vs_dev.mmio());
+        vsdev.attach(&vs_dev);
+        _ = vsdev.hostListen(1234);
+        std.debug.print("[nether] virtio-vsock: guest CID 3, echo on port 1234, BAR 0x{x}\n", .{vs_dev.barBase()});
+    }
+
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
 
@@ -188,10 +215,32 @@ fn webInput(ctx: *anyopaque, bytes: []const u8) void {
 
 /// True if a `nether-web` marker file is present in the working directory.
 fn webEnabled() bool {
-    const fd = linux.open("nether-web", .{ .ACCMODE = .RDONLY }, 0);
+    return markerPresent("nether-web");
+}
+
+/// True if a `nether-vsock` marker file is present in the working directory.
+fn vsockEnabled() bool {
+    return markerPresent("nether-vsock");
+}
+
+fn markerPresent(path: [*:0]const u8) bool {
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd) != .SUCCESS) return false;
     _ = linux.close(@intCast(fd));
     return true;
+}
+
+/// vsock exerciser: echo whatever the guest sends back to it. Runs as the
+/// engine's `on_event` callback, which fires inside `engine.rx()` while the
+/// device lock is held, so it replies via the engine directly (not the locking
+/// host* API) per the VsockDev re-entrancy contract; the kick that delivered the
+/// data flushes the echo to the guest before returning.
+fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
+    const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
+    switch (ev) {
+        .recv => |r| _ = vs.send(r.conn, r.bytes),
+        else => {},
+    }
 }
 
 /// Print the teed console grid (non-empty rows) to stderr. Gated by trace so it

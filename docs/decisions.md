@@ -76,6 +76,17 @@ for every future device:
 - **No lock held across a blocking or slow syscall:** the serial TX `write`, the
   IRQ `signalMsi`, and the raise itself all happen after the relevant unlock.
 
+virtio-vsock (`VsockDev`) is the first *virtio* device to take the lock, and the
+pattern repeats cleanly: the vCPU thread processes queue kicks (`onNotify`) while
+the host thread stages output through the `host*` methods, both mutating the
+engine and the RX/TX rings under the device's `Lock`. The MSI completion
+(`interruptQueue`) is raised only after unlocking, as above. One vsock-specific
+wrinkle is the engine's `on_event` callback: it fires from inside `engine.rx()`,
+which only runs while the lock is held, so a handler must reply via the engine
+directly rather than the locking `host*` API (the spin lock is non-recursive) -
+documented as the VsockDev re-entrancy contract. The lock stays independent of
+the serial -> ioapic order because vsock never nests with them.
+
 ## D4 - virtio-gpu scope
 
 **Status:** open · **Recommendation:** 2D-only for core, or cut to a spike
