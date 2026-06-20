@@ -14,7 +14,9 @@ const std = @import("std");
 const Parser = @import("vt/Parser.zig");
 const Screen = @import("vt/Screen.zig");
 const virtq = @import("virtq.zig");
+const virtio = @import("virtio.zig");
 const vsock = @import("virtio_vsock.zig");
+const net = @import("virtio_net.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -204,5 +206,58 @@ test "vsock engine survives header-shaped fuzz" {
         h.encode(buf[0..vsock.HDR_LEN]);
         rand.bytes(buf[vsock.HDR_LEN..][0..payload]);
         feedVsock(&vs, buf[0 .. vsock.HDR_LEN + payload]);
+    }
+}
+
+// --- virtio-net device -----------------------------------------------------
+
+// Both net datapaths walk attacker-controlled guest descriptors: the TX kick
+// gathers a guest-built chain, and pushRx scatters into guest-posted RX buffers.
+// Every guest access is bounds-checked by GuestMem and the chain walk is capped
+// at the queue size, so a hostile ring must process without a safety trip. The
+// avail indices are bounded so the drain loop stays cheap; the ring contents,
+// descriptors, and buffer addresses are fully random.
+//   TX queue 1: desc 0x000, avail 0x100, used 0x180
+//   RX queue 0: desc 0x200, avail 0x300, used 0x380
+fn netSink(ctx: *anyopaque, frame: []const u8) void {
+    _ = ctx;
+    std.mem.doNotOptimizeAway(frame.len);
+}
+
+fn feedNet(ram: []u8, frame: []const u8) void {
+    var n = net.Net{ .on_tx = netSink };
+    var dev = virtio.Device.init(n.backend(), .{ .bytes = ram, .base = 0 });
+    n.attach(&dev);
+    dev.barWrite(0x16, 2, net.TXQ); // TX queue geometry
+    dev.barWrite(0x18, 2, 8);
+    dev.barWrite(0x20, 4, 0x000);
+    dev.barWrite(0x28, 4, 0x100);
+    dev.barWrite(0x30, 4, 0x180);
+    dev.barWrite(0x1c, 2, 1);
+    dev.barWrite(0x16, 2, net.RXQ); // RX queue geometry
+    dev.barWrite(0x18, 2, 8);
+    dev.barWrite(0x20, 4, 0x200);
+    dev.barWrite(0x28, 4, 0x300);
+    dev.barWrite(0x30, 4, 0x380);
+    dev.barWrite(0x1c, 2, 1);
+    dev.barWrite(0x2000, 4, net.TXQ); // kick TX: drain the hostile TX ring
+    _ = n.pushRx(frame); // place a frame into the hostile RX ring
+    std.mem.doNotOptimizeAway(dev.isr);
+}
+
+test "virtio-net survives hostile rings and frames" {
+    var prng = std.Random.DefaultPrng.init(0x4E700FF);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var ram: [4096]u8 = undefined;
+        rand.bytes(&ram);
+        // Bound the avail indices so the TX drain stays cheap; the rest is random.
+        std.mem.writeInt(u16, ram[0x102..][0..2], rand.uintLessThan(u16, 16), .little);
+        std.mem.writeInt(u16, ram[0x302..][0..2], rand.uintLessThan(u16, 16), .little);
+        var frame: [128]u8 = undefined;
+        const flen = rand.uintLessThan(usize, frame.len);
+        rand.bytes(frame[0..flen]);
+        feedNet(&ram, frame[0..flen]);
     }
 }

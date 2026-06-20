@@ -30,6 +30,10 @@ it:
   three-queue device glue, wired behind a `nether-vsock` marker with a host echo
   service on port 1234 (offline-built, unit- and fuzz-tested; live boot
   verification pending).
+- **virtio-net** (the last Phase 3 datapath device): a tap-backed NIC with the
+  two-queue datapath (guest TX frames written to a host tap, a reader thread
+  pushing inbound frames to the guest RX), wired behind a `nether-net` marker
+  (offline-built, unit- and fuzz-tested; live boot verification pending).
 
 If no `vmlinux` is present the binary runs a comptime real-mode blob that prints
 over COM1 and triggers ACPI S5, as a smoke test. See
@@ -94,6 +98,7 @@ src/virtio.zig     virtio-pci-modern transport (config, BAR, MSI-X)
 src/virtq.zig      split virtqueue (bounds-checked descriptor walk)
 src/virtio_blk.zig virtio-blk backend (read/write/flush)
 src/virtio_rng.zig virtio-rng backend
+src/virtio_net.zig virtio-net backend (tap-backed NIC)
 src/virtio_vsock.zig virtio-vsock protocol engine (swerver<->guest channel)
 src/elf.zig        ELF64 loader + PVH entry note
 src/pvh.zig        PVH direct boot: start_info, modules, orchestration

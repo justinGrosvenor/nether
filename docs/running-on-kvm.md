@@ -140,3 +140,25 @@ echo hello | dd of=/dev/vda bs=512 seek=1   # write path
   ```
   This is the spine for the swerver<->guest channel; the echo is a placeholder
   for the real listener.
+- **virtio-net**: `touch nether-net` before `zig build run` to present a
+  tap-backed NIC (PCI 0:3.0, MAC 52:54:00:12:34:56). The guest kernel needs the
+  virtio-net driver (`-e VIRTIO_NET` in the config recipe above). The host must
+  provide a configured `tap0` first:
+  ```sh
+  # host (run once, as root): create the tap and give it an address
+  ip tuntap add dev tap0 mode tap
+  ip addr add 10.0.0.1/24 dev tap0
+  ip link set tap0 up
+  # for outbound internet, also enable forwarding + NAT to your uplink:
+  sysctl -w net.ipv4.ip_forward=1
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+  ```
+  Then in the guest, bring the interface up and confirm the link:
+  ```sh
+  # guest shell:
+  ip addr add 10.0.0.2/24 dev eth0
+  ip link set eth0 up
+  ping -c1 10.0.0.1        # reaches the host tap
+  ```
+  Frames flow guest TX -> tap write, and a host reader thread feeds tap reads
+  into the guest RX. No offloads are negotiated, so frames are plain (MTU 1500).

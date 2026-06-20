@@ -8,9 +8,12 @@ bridge, claims its BAR, and the kernel reads/writes `/dev/vda` with MSI-X
 completions, writes landing on the host image). Built and unit-tested offline,
 awaiting live verification: **continuous interactive stdin** via a host I/O
 thread that feeds the serial RX and raises IRQ4 so an idle shell still receives
-input (the first concrete [D3](decisions.md) per-device-lock instance). See
-[decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the irqchip/IOAPIC,
-and D3 for the concurrency model.
+input (the first concrete [D3](decisions.md) per-device-lock instance);
+**virtio-vsock** (the swerver<->guest channel); and **virtio-net** (a tap-backed
+NIC), which completes the Phase 3 datapath device set (block + net + MSI-X) - so
+the win condition is now gated on a live boot of a networked image rather than on
+any missing device. See [decisions.md](decisions.md) D8 for the PVH gotchas, D6
+for the irqchip/IOAPIC, and D3 for the concurrency model.
 
 Re-cut from the original six-phase plan. Two changes from the first draft:
 

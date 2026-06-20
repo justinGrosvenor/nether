@@ -135,6 +135,34 @@ pub fn main() !void {
         std.debug.print("[nether] virtio-vsock: guest CID 3, echo on port 1234, BAR 0x{x}\n", .{vs_dev.barBase()});
     }
 
+    // virtio-net: opt-in via a `nether-net` marker, backed by a host tap device
+    // (`tap0`, which the host must pre-create and configure). PCI function 0:3.0,
+    // BAR clear of blk/vsock (base + 128 KiB). Guest TX frames are written to the
+    // tap; a reader thread (spawned below) pushes inbound frames to the guest RX.
+    var net_be: nether.VirtioNet = undefined;
+    var net_dev: nether.virtio.Device = undefined;
+    var tap_io: TapIo = undefined;
+    var net_running = false;
+    if (netEnabled()) {
+        if (openTap("tap0")) |tap_fd| {
+            net_be = .{};
+            net_dev = nether.virtio.Device.init(net_be.backend(), .{ .bytes = low, .base = layout.ram_low.base });
+            net_dev.assignBar(nether.memmap.pci_mmio32_base + 0x20000);
+            net_dev.msi_ptr = &msi_sink;
+            net_dev.msi_fn = MsiSink.send;
+            try pci_host.addFunction(net_dev.function(3, 0));
+            try bus.addMmio(net_dev.mmio());
+            net_be.attach(&net_dev);
+            tap_io = .{ .fd = tap_fd, .net = &net_be };
+            net_be.on_tx = TapIo.tx;
+            net_be.on_tx_ctx = &tap_io;
+            net_running = true;
+            std.debug.print("[nether] virtio-net: tap0, MAC 52:54:00:12:34:56, BAR 0x{x}\n", .{net_dev.barBase()});
+        } else {
+            std.debug.print("[nether] virtio-net: cannot open tap0 (need /dev/net/tun and a configured tap)\n", .{});
+        }
+    }
+
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
 
@@ -196,6 +224,18 @@ pub fn main() !void {
         }
     }
 
+    // virtio-net tap reader: a detached thread blocks on the tap fd and pushes
+    // each inbound frame to the guest's RX ring (frames are dropped until the
+    // guest posts buffers, which is harmless). Same lifetime model as the stdin
+    // and web threads: the process owns it.
+    if (net_running) {
+        if (std.Thread.spawn(.{}, TapIo.rxPump, .{&tap_io})) |t| {
+            t.detach();
+        } else |err| {
+            std.debug.print("[nether] net rx thread failed: {s}; net is send-only\n", .{@errorName(err)});
+        }
+    }
+
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         if (nether.trace.on()) dumpConsole(&console);
@@ -221,6 +261,11 @@ fn webEnabled() bool {
 /// True if a `nether-vsock` marker file is present in the working directory.
 fn vsockEnabled() bool {
     return markerPresent("nether-vsock");
+}
+
+/// True if a `nether-net` marker file is present in the working directory.
+fn netEnabled() bool {
+    return markerPresent("nether-net");
 }
 
 fn markerPresent(path: [*:0]const u8) bool {
@@ -254,6 +299,57 @@ fn dumpConsole(scr: *nether.vt.Screen) void {
         const line = std.mem.trimEnd(u8, scr.viewRow(i, &buf), " ");
         if (line.len > 0) std.debug.print("  {s}\n", .{line});
     }
+}
+
+/// virtio-net tap plumbing: the host side of the NIC. Guest TX frames are
+/// written to the tap fd; a reader thread pushes inbound frames to the guest.
+const TapIo = struct {
+    fd: i32,
+    net: *nether.VirtioNet,
+
+    /// on_tx sink (vCPU thread): write a guest frame to the tap. Best-effort,
+    /// like a NIC dropping on a full queue; runs outside the device lock.
+    fn tx(ctx: *anyopaque, frame: []const u8) void {
+        const self: *TapIo = @ptrCast(@alignCast(ctx));
+        _ = linux.write(self.fd, frame.ptr, frame.len);
+    }
+
+    /// I/O thread body: block on the tap and push each frame to the guest RX.
+    fn rxPump(self: *TapIo) void {
+        var buf: [nether.net.FRAME_MAX]u8 = undefined;
+        while (true) {
+            const n = linux.read(self.fd, &buf, buf.len);
+            switch (linux.errno(n)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return,
+            }
+            if (n == 0) return; // tap closed
+            _ = self.net.pushRx(buf[0..n]);
+        }
+    }
+};
+
+/// Open `/dev/net/tun` and bind it to an existing tap interface in TAP mode with
+/// no packet-info prefix, so reads/writes are raw Ethernet frames. Returns null
+/// if the tun device or the interface is unavailable.
+fn openTap(name: []const u8) ?i32 {
+    const fd_u = linux.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(fd_u) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_u);
+    // struct ifreq: char ifr_name[16]; then ifr_flags (u16); padded to 40 bytes.
+    var ifr = [_]u8{0} ** 40;
+    const m = @min(name.len, 15);
+    @memcpy(ifr[0..m], name[0..m]);
+    const IFF_TAP: u16 = 0x0002;
+    const IFF_NO_PI: u16 = 0x1000;
+    std.mem.writeInt(u16, ifr[16..18], IFF_TAP | IFF_NO_PI, .little);
+    const TUNSETIFF: u32 = 0x400454ca; // _IOW('T', 202, int)
+    if (linux.errno(linux.ioctl(fd, TUNSETIFF, @intFromPtr(&ifr))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
 }
 
 /// Delivers a virtio MSI-X completion by injecting it through KVM.
