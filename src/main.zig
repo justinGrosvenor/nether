@@ -973,7 +973,12 @@ fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (disk_size > 0) {
         if (!readExact(fd, blk_disk_storage[0..@intCast(disk_size)])) return error.BadSnapshot;
     }
-    hvf.sys_icache_invalidate(ram.ptr, ram.len); // host writes -> guest I-fetch
+    // No up-front I-cache invalidation: the RAM pages are demand-paged COW from
+    // the file (already at the point of unification) and a freshly created vCPU's
+    // I-cache is empty, so there is nothing stale to flush - unlike the boot path,
+    // which stores the kernel through the host mapping immediately before fetch.
+    // This keeps the restore lazy (no 512 MiB page-in).
+    _ = hvf;
 
     // Recreate vCPUs with their captured contexts. cpu0 is this thread; the rest
     // each create/restore on their own thread (HVF binds a vCPU to its creator).

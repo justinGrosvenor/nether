@@ -366,9 +366,15 @@ The build-out arc (offline-first chunks):
      `nether.snap` checksum is byte-identical afterwards; fork the same base again
      -> it sees the original state but not the first fork's writes (isolated COW
      views from one immutable base). Two independent sandboxes from one boot.
-   Known rough edges: same-host/same-build snapshot format; the restore still
-   touches all pages once for I-cache invalidation (correctness), so the COW win is
-   memory sharing + an untouched base rather than zero-read restore latency yet.
+   - **Lazy (near-instant) restore.** The restore does NOT invalidate the I-cache
+     over RAM up front: the pages are demand-paged COW from the file (already at the
+     point of unification) and a freshly created vCPU's I-cache is empty, so there
+     is nothing stale to flush (unlike the boot path, which stores the kernel
+     through the host mapping right before fetch). Dropping the 512 MiB page-in cut
+     time-to-RESTORED from ~1780 ms to ~90 ms (~20x); restore now mmaps + reads only
+     the ~1.2 MiB of metadata/GIC/disk, and RAM pages fault in on demand. Verified
+     the forked guest still runs correctly with no invalidation.
+   Known rough edge: same-host/same-build snapshot format.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track. SMP and snapshot on the KVM
