@@ -23,6 +23,13 @@ const Error = hvtypes.Error;
 
 /// ESR_EL2 exception classes we care about.
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
+const EC_HVC: u64 = 0x16; // HVC instruction from AArch64 (PSCI firmware calls)
+
+/// PSCI function IDs (the guest's "firmware" for power; the arm64 analog of the
+/// ACPI PM block). The guest calls these via `hvc #0` with the FID in w0/x0.
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+const PSCI_NOT_SUPPORTED: u64 = @bitCast(@as(i64, -1));
 
 /// Initial PSTATE: EL1h (M[3:0]=0b0101) with D,A,I,F masked (0xF<<6).
 const CPSR_EL1H_MASKED: u64 = 0x3c5;
@@ -110,11 +117,14 @@ pub const Vcpu = struct {
                 hvf.HV_EXIT_REASON_EXCEPTION => {
                     const esr = self.exit.exception.syndrome;
                     const ec = (esr >> 26) & 0x3f;
-                    if (ec != EC_DATA_ABORT_LOWER) {
-                        std.debug.print("[nether] unhandled exception EC=0x{x} ESR=0x{x} PC fault\n", .{ ec, esr });
-                        return error.UnhandledExit;
+                    switch (ec) {
+                        EC_DATA_ABORT_LOWER => self.handleDataAbort(bus, esr),
+                        EC_HVC => self.handlePsci(power),
+                        else => {
+                            std.debug.print("[nether] unhandled exception EC=0x{x} ESR=0x{x}\n", .{ ec, esr });
+                            return error.UnhandledExit;
+                        },
                     }
-                    self.handleDataAbort(bus, esr);
                 },
                 hvf.HV_EXIT_REASON_VTIMER_ACTIVATED => {}, // no timer model yet; resume
                 hvf.HV_EXIT_REASON_CANCELED => {}, // spurious wake; resume
@@ -152,10 +162,28 @@ pub const Vcpu = struct {
             }
         }
         // Step over the (4-byte for IL=1, else 2-byte) faulting instruction.
-        const step: u64 = if ((esr >> 25) & 1 == 1) 4 else 2;
+        self.stepPc(if ((esr >> 25) & 1 == 1) 4 else 2);
+    }
+
+    /// PSCI over HVC: the guest's power firmware. SYSTEM_OFF/RESET become a power
+    /// request the run loop observes (no PC step - the guest is going down);
+    /// anything else returns NOT_SUPPORTED and resumes past the hvc.
+    fn handlePsci(self: *Vcpu, power: *pwr.Power) void {
+        const fid = self.getX(0) & 0xffff_ffff;
+        switch (fid) {
+            PSCI_SYSTEM_OFF => power.request(.shutdown),
+            PSCI_SYSTEM_RESET => power.request(.reset),
+            else => {
+                self.setX(0, PSCI_NOT_SUPPORTED);
+                self.stepPc(4);
+            },
+        }
+    }
+
+    fn stepPc(self: *Vcpu, bytes: u64) void {
         var pc: u64 = 0;
         _ = hvf.hv_vcpu_get_reg(self.handle, hvf.HV_REG_PC, &pc);
-        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_PC, pc +% step);
+        _ = hvf.hv_vcpu_set_reg(self.handle, hvf.HV_REG_PC, pc +% bytes);
     }
 
     fn getX(self: *Vcpu, reg: u5) u64 {

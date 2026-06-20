@@ -206,8 +206,14 @@ The build-out arc (offline-first chunks):
    light on the Mac. build.zig links Hypervisor.framework on macOS; the binary is
    codesigned with the `com.apple.security.hypervisor` entitlement (ad-hoc for
    local dev). See [running-on-hvf.md](running-on-hvf.md).
-3. **aarch64 substrate.** Memory map, the framework GIC (`hv_gic`, the in-kernel
-   LAPIC analog), PL011 UART, the ARM generic timer, PSCI for power.
+3. **aarch64 substrate (in progress).** Done: **PSCI** power firmware (the run
+   loop decodes `hvc` exits - SYSTEM_OFF/RESET become power requests, the arm64
+   analog of the ACPI PM block) and a real **PL011 UART** (`pl011.zig`: DR/FR
+   plus the AMBA PrimeCell ID registers so Linux's driver binds; TX to a host
+   sink, an RX ring for host input, offline-tested). Remaining: the framework GIC
+   (`hv_gic`, the in-kernel LAPIC analog), the ARM generic timer (delivered via
+   the GIC), and a full aarch64 memory map - these are exercised by a real OS, so
+   they land with step 4.
 4. **aarch64 Linux boot.** Load `Image`, X0 = DTB, a minimal device-tree
    generator (the DTB analog of the ACPI generator).
 5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/

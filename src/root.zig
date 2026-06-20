@@ -55,6 +55,7 @@ pub const Power = power.Power;
 pub const PowerAction = power.Action;
 
 pub const Serial = @import("serial.zig").Serial;
+pub const Pl011 = @import("pl011.zig").Pl011;
 pub const Rtc = @import("rtc.zig").Rtc;
 pub const Pm = @import("pm.zig").Pm;
 pub const Reset = @import("reset.zig").Reset;
@@ -63,6 +64,7 @@ pub const FwCfg = @import("fw_cfg.zig").FwCfg;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
+    _ = @import("pl011.zig"); // aarch64 PL011 UART
     // Pull in the vendored VT files so their tests run too.
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");

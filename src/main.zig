@@ -466,10 +466,9 @@ fn readFile(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
 const arm_message = "Nether lives. Phase 0: aarch64 guest over MMIO UART.\n";
 
 // Standard arm64 "virt" addresses: RAM at 1 GiB, PL011 UART at 0x0900_0000.
-// A sentinel MMIO write powers off (PSCI lands with the substrate chunk).
+// Power is PSCI (hvc), so there is no MMIO poweroff device.
 const ARM_RAM_BASE: u64 = 0x4000_0000;
 const ARM_UART_BASE: u64 = 0x0900_0000;
-const ARM_POWEROFF_BASE: u64 = 0x0904_0000;
 
 /// First light under Apple HVF: load a tiny aarch64 blob that writes a message
 /// to a UART (MMIO, dispatched through the same Bus the x86 path uses) and then
@@ -488,11 +487,11 @@ fn macMain() !void {
     const ram = try vm.addMemory(0, ARM_RAM_BASE, 2 * nether.memmap.mib); // hv_vm_map
 
     var power = nether.Power{};
-    var uart = ArmUart{};
-    var off = ArmPoweroff{ .power = &power };
+    var uart = nether.Pl011{};
+    uart.out_fn = uartOut;
+    uart.out_ctx = &uart; // ctx is unused by uartOut; any non-null pointer
     var bus = nether.Bus{};
-    try bus.addMmio(uart.device());
-    try bus.addMmio(off.device());
+    try bus.addMmio(uart.device(ARM_UART_BASE));
 
     const blob = comptime buildArmBlob(arm_message);
     @memcpy(ram[0..blob.len], &blob);
@@ -509,45 +508,19 @@ fn macMain() !void {
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
 }
 
-/// Minimal aarch64 console: a write to the PL011 data register (offset 0) prints
-/// the byte. A placeholder for the real PL011 in the substrate chunk.
-const ArmUart = struct {
-    fn device(self: *ArmUart) nether.MmioDevice {
-        return .{ .ptr = self, .base = ARM_UART_BASE, .len = 0x1000, .read_fn = read, .write_fn = write };
-    }
-    fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
-        _ = ptr;
-        if (offset == 0 and data.len > 0) _ = std.c.write(1, data.ptr, 1);
-    }
-    fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
-        _ = ptr;
-        _ = offset;
-        @memset(data, 0);
-    }
-};
-
-/// Sentinel power device: any write requests shutdown (the run loop observes it).
-const ArmPoweroff = struct {
-    power: *nether.Power,
-    fn device(self: *ArmPoweroff) nether.MmioDevice {
-        return .{ .ptr = self, .base = ARM_POWEROFF_BASE, .len = 0x1000, .read_fn = read, .write_fn = write };
-    }
-    fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
-        _ = offset;
-        _ = data;
-        const self: *ArmPoweroff = @ptrCast(@alignCast(ptr));
-        self.power.request(.shutdown);
-    }
-    fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
-        _ = ptr;
-        _ = offset;
-        @memset(data, 0);
-    }
-};
+/// PL011 TX sink: write one guest byte to host stdout (libc is linked on macOS).
+fn uartOut(ctx: *anyopaque, byte: u8) void {
+    _ = ctx;
+    const b = [1]u8{byte};
+    _ = std.c.write(1, &b, 1);
+}
 
 // aarch64 instruction encoders (just what the blob needs).
 fn movzW(rd: u32, imm16: u32) u32 {
     return 0x52800000 | (imm16 << 5) | rd; // MOVZ Wd, #imm16
+}
+fn movkW(rd: u32, imm16: u32, hw: u32) u32 {
+    return 0x72800000 | (hw << 21) | (imm16 << 5) | rd; // MOVK Wd, #imm16, LSL #(16*hw)
 }
 fn movzX(rd: u32, imm16: u32, hw: u32) u32 {
     return 0xD2800000 | (hw << 21) | (imm16 << 5) | rd; // MOVZ Xd, #imm16, LSL #(16*hw)
@@ -556,11 +529,11 @@ fn strb(rt: u32, rn: u32) u32 {
     return 0x39000000 | (rn << 5) | rt; // STRB Wt, [Xn]
 }
 
-/// Comptime-assemble: load the UART base into x1, store each message byte to it,
-/// then store to the poweroff sentinel and spin. MOVZ immediates are absolute,
-/// so the blob is position-independent (it runs from ARM_RAM_BASE).
-fn buildArmBlob(comptime msg: []const u8) [(2 * msg.len + 4) * 4]u8 {
-    var buf: [(2 * msg.len + 4) * 4]u8 = undefined;
+/// Comptime-assemble: load the UART base into x1, store each message byte to its
+/// data register, then PSCI SYSTEM_OFF via `hvc #0`. MOVZ immediates are
+/// absolute, so the blob is position-independent (it runs from ARM_RAM_BASE).
+fn buildArmBlob(comptime msg: []const u8) [(2 * msg.len + 5) * 4]u8 {
+    var buf: [(2 * msg.len + 5) * 4]u8 = undefined;
     var p: usize = 0;
     const emit = struct {
         fn one(b: []u8, pos: *usize, instr: u32) void {
@@ -568,13 +541,14 @@ fn buildArmBlob(comptime msg: []const u8) [(2 * msg.len + 4) * 4]u8 {
             pos.* += 4;
         }
     }.one;
-    emit(&buf, &p, movzX(1, 0x0900, 1)); // x1 = 0x0900_0000 (UART base)
+    emit(&buf, &p, movzX(1, 0x0900, 1)); // x1 = 0x0900_0000 (UART base = PL011 DR)
     for (msg) |c| {
         emit(&buf, &p, movzW(0, c)); // w0 = char
         emit(&buf, &p, strb(0, 1)); // strb w0, [x1]
     }
-    emit(&buf, &p, movzX(2, 0x0904, 1)); // x2 = 0x0904_0000 (poweroff sentinel)
-    emit(&buf, &p, strb(0, 2)); // strb w0, [x2] -> shutdown
-    emit(&buf, &p, 0x14000000); // b . (fallback if shutdown is missed)
+    emit(&buf, &p, movzW(0, 0x0008)); // w0 = 0x8400_0008 (PSCI SYSTEM_OFF):
+    emit(&buf, &p, movkW(0, 0x8400, 1)); //   low half then high half
+    emit(&buf, &p, 0xD4000002); // hvc #0
+    emit(&buf, &p, 0x14000000); // b . (fallback if SYSTEM_OFF is missed)
     return buf;
 }
