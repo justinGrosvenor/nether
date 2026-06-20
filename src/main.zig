@@ -4,6 +4,7 @@
 //! and the vCPU runs until the guest halts or powers off.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const nether = @import("root.zig");
 
@@ -40,7 +41,18 @@ fn buildBlob(comptime msg: []const u8) [3 + msg.len * 3 + 8]u8 {
     return buf;
 }
 
+/// The entry forks by host OS at comptime: Linux drives the KVM/x86 path, macOS
+/// the HVF/aarch64 path. Only the selected branch is analyzed, so each side may
+/// use its own platform syscalls freely.
 pub fn main() !void {
+    switch (builtin.os.tag) {
+        .linux => try linuxMain(),
+        .macos => try macMain(),
+        else => @compileError("Nether needs a Linux (KVM) or macOS (HVF) host"),
+    }
+}
+
+fn linuxMain() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -447,4 +459,122 @@ fn readFile(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
         total += n;
     }
     return allocator.realloc(buf, total);
+}
+
+// === macOS / HVF / aarch64 ==================================================
+
+const arm_message = "Nether lives. Phase 0: aarch64 guest over MMIO UART.\n";
+
+// Standard arm64 "virt" addresses: RAM at 1 GiB, PL011 UART at 0x0900_0000.
+// A sentinel MMIO write powers off (PSCI lands with the substrate chunk).
+const ARM_RAM_BASE: u64 = 0x4000_0000;
+const ARM_UART_BASE: u64 = 0x0900_0000;
+const ARM_POWEROFF_BASE: u64 = 0x0904_0000;
+
+/// First light under Apple HVF: load a tiny aarch64 blob that writes a message
+/// to a UART (MMIO, dispatched through the same Bus the x86 path uses) and then
+/// powers off. Proves hv_vm_create/map, hv_vcpu_run, and the data-abort decode.
+fn macMain() !void {
+    const hvf = @import("hvf.zig");
+
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    nether.trace.init();
+
+    var vm = try nether.Vm.init(allocator); // hv_vm_create
+    defer vm.deinit();
+    const ram = try vm.addMemory(0, ARM_RAM_BASE, 2 * nether.memmap.mib); // hv_vm_map
+
+    var power = nether.Power{};
+    var uart = ArmUart{};
+    var off = ArmPoweroff{ .power = &power };
+    var bus = nether.Bus{};
+    try bus.addMmio(uart.device());
+    try bus.addMmio(off.device());
+
+    const blob = comptime buildArmBlob(arm_message);
+    @memcpy(ram[0..blob.len], &blob);
+    hvf.sys_icache_invalidate(ram.ptr, blob.len); // host write -> guest I-fetch
+
+    var vcpu = try vm.createVcpu(0); // hv_vcpu_create
+    defer vcpu.deinit();
+    try vcpu.setAarch64Entry(ARM_RAM_BASE, 0); // PC = blob, X0 = (no DTB yet)
+
+    const reason = vcpu.run(&bus, &power) catch |err| {
+        std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// Minimal aarch64 console: a write to the PL011 data register (offset 0) prints
+/// the byte. A placeholder for the real PL011 in the substrate chunk.
+const ArmUart = struct {
+    fn device(self: *ArmUart) nether.MmioDevice {
+        return .{ .ptr = self, .base = ARM_UART_BASE, .len = 0x1000, .read_fn = read, .write_fn = write };
+    }
+    fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
+        _ = ptr;
+        if (offset == 0 and data.len > 0) _ = std.c.write(1, data.ptr, 1);
+    }
+    fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
+        _ = ptr;
+        _ = offset;
+        @memset(data, 0);
+    }
+};
+
+/// Sentinel power device: any write requests shutdown (the run loop observes it).
+const ArmPoweroff = struct {
+    power: *nether.Power,
+    fn device(self: *ArmPoweroff) nether.MmioDevice {
+        return .{ .ptr = self, .base = ARM_POWEROFF_BASE, .len = 0x1000, .read_fn = read, .write_fn = write };
+    }
+    fn write(ptr: *anyopaque, offset: u64, data: []const u8) void {
+        _ = offset;
+        _ = data;
+        const self: *ArmPoweroff = @ptrCast(@alignCast(ptr));
+        self.power.request(.shutdown);
+    }
+    fn read(ptr: *anyopaque, offset: u64, data: []u8) void {
+        _ = ptr;
+        _ = offset;
+        @memset(data, 0);
+    }
+};
+
+// aarch64 instruction encoders (just what the blob needs).
+fn movzW(rd: u32, imm16: u32) u32 {
+    return 0x52800000 | (imm16 << 5) | rd; // MOVZ Wd, #imm16
+}
+fn movzX(rd: u32, imm16: u32, hw: u32) u32 {
+    return 0xD2800000 | (hw << 21) | (imm16 << 5) | rd; // MOVZ Xd, #imm16, LSL #(16*hw)
+}
+fn strb(rt: u32, rn: u32) u32 {
+    return 0x39000000 | (rn << 5) | rt; // STRB Wt, [Xn]
+}
+
+/// Comptime-assemble: load the UART base into x1, store each message byte to it,
+/// then store to the poweroff sentinel and spin. MOVZ immediates are absolute,
+/// so the blob is position-independent (it runs from ARM_RAM_BASE).
+fn buildArmBlob(comptime msg: []const u8) [(2 * msg.len + 4) * 4]u8 {
+    var buf: [(2 * msg.len + 4) * 4]u8 = undefined;
+    var p: usize = 0;
+    const emit = struct {
+        fn one(b: []u8, pos: *usize, instr: u32) void {
+            std.mem.writeInt(u32, b[pos.*..][0..4], instr, .little);
+            pos.* += 4;
+        }
+    }.one;
+    emit(&buf, &p, movzX(1, 0x0900, 1)); // x1 = 0x0900_0000 (UART base)
+    for (msg) |c| {
+        emit(&buf, &p, movzW(0, c)); // w0 = char
+        emit(&buf, &p, strb(0, 1)); // strb w0, [x1]
+    }
+    emit(&buf, &p, movzX(2, 0x0904, 1)); // x2 = 0x0904_0000 (poweroff sentinel)
+    emit(&buf, &p, strb(0, 2)); // strb w0, [x2] -> shutdown
+    emit(&buf, &p, 0x14000000); // b . (fallback if shutdown is missed)
+    return buf;
 }

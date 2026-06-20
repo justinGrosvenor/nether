@@ -198,10 +198,14 @@ The build-out arc (offline-first chunks):
    (macOS/aarch64), chosen in `backend.zig`. KVM is the full impl; HVF is a
    compiling scaffold (every op returns Unimplemented) so the macOS build and the
    offline test build are green today. See [decisions.md](decisions.md) D9.
-2. **HVF skeleton.** `hv_vm_create` + `hv_vm_map` (guest RAM), `hv_vcpu_create`/
-   run with data-abort (MMIO) decode, an aarch64 blob over a UART. First light on
-   the Mac (the first tooling step: native build, codesign with the
-   `com.apple.security.hypervisor` entitlement).
+2. **HVF skeleton (done).** `hvf.zig` (hand-rolled framework bindings) +
+   `hvf_backend.zig`: `hv_vm_create` + `hv_vm_map` (guest RAM), `hv_vcpu_create`
+   and a run loop that decodes data-abort (MMIO) exits to the device Bus and
+   steps the PC, plus an aarch64 boot entry (PC + PSTATE). A hand-assembled
+   aarch64 blob prints over an MMIO UART and powers off via a sentinel - first
+   light on the Mac. build.zig links Hypervisor.framework on macOS; the binary is
+   codesigned with the `com.apple.security.hypervisor` entitlement (ad-hoc for
+   local dev). See [running-on-hvf.md](running-on-hvf.md).
 3. **aarch64 substrate.** Memory map, the framework GIC (`hv_gic`, the in-kernel
    LAPIC analog), PL011 UART, the ARM generic timer, PSCI for power.
 4. **aarch64 Linux boot.** Load `Image`, X0 = DTB, a minimal device-tree

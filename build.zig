@@ -16,6 +16,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The HVF backend (macOS hosts) links Apple's Hypervisor.framework and needs
+    // libSystem. The binary must then be codesigned with the hypervisor
+    // entitlement before it can run; ad-hoc signing works for local dev:
+    //   codesign --sign - --entitlements nether.entitlements --force <binary>
+    if (target.result.os.tag == .macos) {
+        exe.root_module.linkFramework("Hypervisor", .{});
+        exe.root_module.link_libc = true;
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

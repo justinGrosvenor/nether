@@ -35,6 +35,13 @@ it:
   pushing inbound frames to the guest RX), wired behind a `nether-net` marker
   (offline-built, unit- and fuzz-tested; live boot verification pending).
 
+The hypervisor is now a **compile-time backend seam** (KVM on Linux/x86-64, Apple
+Hypervisor.framework on macOS/aarch64), and the macOS/HVF path has reached **first
+light**: a tiny aarch64 guest runs natively on Apple Silicon, prints over an MMIO
+UART, and powers off - exercising `hv_vm_create`/`hv_vm_map`, the vCPU run loop,
+and the data-abort (MMIO) decode. The aarch64 substrate (GIC, PL011, timer, PSCI)
+and Linux boot are the next chunks. See [`docs/running-on-hvf.md`](docs/running-on-hvf.md).
+
 If no `vmlinux` is present the binary runs a comptime real-mode blob that prints
 over COM1 and triggers ACPI S5, as a smoke test. See
 [`docs/bringup-notes.md`](docs/bringup-notes.md) for the hard-won KVM/PVH/virtio
@@ -66,6 +73,17 @@ DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build test
 
 Cross-compilation is unaffected, so plain `zig build` (and `zig build -Dtarget=`)
 still type-checks the Linux artifact without the prefix.
+
+On an Apple Silicon Mac the HVF backend is selected automatically; build natively,
+codesign with the hypervisor entitlement (ad-hoc is fine for local dev), and run:
+
+```sh
+DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=native
+codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
+./zig-out/bin/nether
+```
+
+See [`docs/running-on-hvf.md`](docs/running-on-hvf.md) for the macOS/aarch64 path.
 
 Expected smoke-test output (no `vmlinux` present) on a KVM host:
 
