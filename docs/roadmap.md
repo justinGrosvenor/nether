@@ -275,12 +275,32 @@ The build-out arc (offline-first chunks):
      prefetchable vs non-pref BAR/window, 32/64-bit windows, the I/O window
      (root-bus resources now match QEMU exactly), interrupt-map, GIC #address-cells,
      bus-range, pre-assign vs kernel-assign, `pci=realloc`, and
-     `linux,pci-probe-only=0`. **Next (needs kernel 6.12 source):** read
-     `drivers/pci/controller/pci-host-common.c` + `pci_host_probe` to see what
-     gates `pci_bus_assign_resources` vs `pci_bus_claim_resources` for generic
-     ECAM, since the DTB knobs that normally flip it have no effect here. The
-     transport/datapath is correct and reusable; only this last kernel-side gate
-     stands between enumeration and a bound virtio-pci device.
+     `linux,pci-probe-only=0`.
+   - **Kernel 6.12 source read (done) - and the contradiction.** Traced the full
+     call graph: `pci-host-common.c` calls `of_pci_check_probe_only()` then
+     `pci_host_probe()`, which claims first only if `bridge->preserve_config` and
+     then *unconditionally* calls `pci_assign_unassigned_root_bus_resources()`
+     ("if we didn't claim above, this will reassign everything").
+     `bridge->preserve_config = pci_preserve_config()` = `pci_acpi_preserve_config`
+     (false on a DT boot - no ACPI handle) OR `of_pci_preserve_config(pcie_node)`,
+     which with `linux,pci-probe-only=<0>` (confirmed in the blob via dtc) returns
+     false; `of_pci_check_probe_only` then clears the global `PCI_PROBE_ONLY`. So
+     **by the source the assign pass should run and reassign our BAR** - yet
+     setup-bus.c emits nothing for our device (no "assigned"/"no space") and the
+     BAR is never written, while QEMU's kernel (same Image, equivalent DT boot)
+     assigns and enables it. The source-level gates all say "assign" but the
+     runtime takes the claim path: a contradiction that source-reading and
+     guest-side tracing cannot resolve.
+   - **One structural diff remains:** QEMU's node has `msi-map` -> a
+     `arm,gic-v2m-frame` msi-controller; ours has none (the framework GIC's MSI
+     isn't described to the guest). Unproven whether it diverts resource
+     assignment, but it's the next lever. **Next:** (a) model the GIC MSI in the
+     DTB (a GICv3 ITS or v2m frame) + wire `hv_gic_send_msi`, then retest
+     assignment; or (b) use an instrumented/debuggable kernel (CONFIG_PCI_DEBUG
+     build, or a kgdb / QEMU-gdb session) to watch the assign decision directly,
+     since the stock kernel contradicts its own source here. The transport,
+     datapath, and DTB are correct and reusable; only this last kernel-side assign
+     gate stands between enumeration and a bound virtio-pci device.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.
