@@ -44,6 +44,8 @@ pub const WebConsole = webconsole.Server;
 pub const trace = @import("trace.zig");
 pub const virtq = @import("virtq.zig");
 pub const virtio = @import("virtio.zig");
+pub const virtio_mmio = @import("virtio_mmio.zig");
+pub const VirtioMmio = virtio_mmio.Mmio;
 pub const VirtioRng = @import("virtio_rng.zig").Rng;
 pub const VirtioBlk = @import("virtio_blk.zig").Blk;
 pub const net = @import("virtio_net.zig");
@@ -68,6 +70,7 @@ test {
     _ = @import("hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
     _ = @import("pl011.zig"); // aarch64 PL011 UART
     _ = @import("dtb.zig"); // aarch64 device-tree generator
+    _ = @import("virtio_mmio.zig"); // virtio-mmio transport
     // Pull in the vendored VT files so their tests run too.
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");

@@ -29,6 +29,12 @@ pub const uart_spi: u32 = 1; // SPI 1 (GIC interrupt id 32 + 1)
 /// GIC MSI region (GITS-style doorbell), above the redistributor region.
 pub const msi_base: u64 = 0x0C00_0000;
 
+/// virtio-mmio device window: one 0x200 region per device, each with its own SPI.
+/// Placed clear of the GIC/UART/MSI regions and below RAM.
+pub const virtio_mmio_base: u64 = 0x0D00_0000;
+pub const virtio_mmio_stride: u64 = 0x200;
+pub const virtio_spi_base: u32 = 2; // SPI 0/1 reserved (1 = UART); virtio starts at 2
+
 /// Main RAM starts at 1 GiB (below it is the MMIO/device region).
 pub const ram_base: u64 = 0x4000_0000;
 

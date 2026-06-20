@@ -234,8 +234,20 @@ The build-out arc (offline-first chunks):
    repacked as an initramfs with a tiny `/init`; recipe in
    [running-on-hvf.md](running-on-hvf.md)) it boots straight to a proper Alpine
    busybox shell as root. Next: virtio on aarch64 (step 5).
-5. **virtio on aarch64.** Reuse the device datapath; MSI via the GIC ITS. blk/
-   net/vsock/rng light up on the new arch.
+5. **virtio on aarch64 (transport built; kernel-gated).** A **virtio-mmio**
+   transport (`virtio_mmio.zig`) reuses the exact same device backends
+   (blk/net/rng/vsock), `virtq` datapath, and `virtio.Device` queue state as the
+   x86 PCI path - only the register window differs, and completions are a plain
+   GIC SPI (no PCIe/ITS). It is unit-tested (identity, queue kick runs the
+   backend, level interrupt asserts/clears) and wired into `macBootLinux` (rng +
+   an in-memory blk) with matching `virtio_mmio@...` DTB nodes - which the kernel
+   parses (they appear under `/proc/device-tree`). **Blocker:** the stock Alpine
+   `-virt` kernel has no `VIRTIO_MMIO` driver (it targets QEMU virtio-*PCI*), so
+   nothing binds. Two ways forward: (a) an arm64 kernel built with
+   `CONFIG_VIRTIO_MMIO=y` - the current code then lights up as-is; or (b) a
+   virtio-pci front end on aarch64 (reuse `pci.zig` ECAM + `virtio.zig`; MSI via
+   the framework GIC, whose MSI region is already configured, described to the
+   guest as a GICv2m frame). The transport is the reusable half either way.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

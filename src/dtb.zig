@@ -162,6 +162,10 @@ fn lo(x: u64) u32 {
 
 /// Parameters for the "virt" device tree. GIC region sizes come from the
 /// framework GIC at runtime; the initrd range is set when an initramfs is loaded.
+/// A virtio-mmio device to describe: its register window and SPI number (the
+/// GIC interrupt id relative to the SPI base, i.e. INTID = 32 + spi).
+pub const VirtioDev = struct { addr: u64, spi: u32 };
+
 pub const VirtConfig = struct {
     cmdline: []const u8,
     mem_base: u64,
@@ -171,6 +175,7 @@ pub const VirtConfig = struct {
     gicr_size: u64 = arm.gicr_size,
     initrd_start: u64 = 0,
     initrd_end: u64 = 0,
+    virtio: []const VirtioDev = &.{},
 };
 
 /// Build the "virt" device tree into `out` and return its size. Uses two
@@ -253,6 +258,16 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.propCells("clocks", &.{ CLK_PHANDLE, CLK_PHANDLE });
     b.propStrings("clock-names", &.{ "uartclk", "apb_pclk" });
     b.endNode();
+
+    for (cfg.virtio) |vd| {
+        var namebuf: [40]u8 = undefined;
+        const name = std.fmt.bufPrint(&namebuf, "virtio_mmio@{x}", .{vd.addr}) catch unreachable;
+        b.beginNode(name);
+        b.propString("compatible", "virtio,mmio");
+        b.propCells("reg", &.{ hi(vd.addr), lo(vd.addr), 0, @intCast(arm.virtio_mmio_stride) });
+        b.propCells("interrupts", &.{ 0, vd.spi, 0x04 }); // SPI, number, level-high
+        b.endNode();
+    }
 
     b.endNode(); // root
     return b.finish(out);

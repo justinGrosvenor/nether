@@ -501,6 +501,13 @@ const ARM_RAM_SIZE: usize = 512 * nether.memmap.mib;
 const ARM_DTB_OFF: u64 = 0x0800_0000;
 const ARM_INITRD_OFF: u64 = 0x0C00_0000;
 
+// virtio-mmio devices: rng at slot 0, blk at slot 1 (each its own region + SPI).
+const ARM_RNG_ADDR = nether.memmap_arm.virtio_mmio_base;
+const ARM_BLK_ADDR = nether.memmap_arm.virtio_mmio_base + nether.memmap_arm.virtio_mmio_stride;
+const ARM_RNG_SPI = nether.memmap_arm.virtio_spi_base; // DTB SPI number (INTID = 32 + spi)
+const ARM_BLK_SPI = nether.memmap_arm.virtio_spi_base + 1;
+const arm_disk_marker = "NETHER-AARCH64-VIRTIO-BLK";
+
 /// Boot an arm64 Linux kernel: place the Image, DTB, and initramfs in guest RAM,
 /// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
 fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]const u8) !void {
@@ -538,6 +545,10 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .gicr_size = vm.hv.gicr_size,
         .initrd_start = initrd_start,
         .initrd_end = initrd_end,
+        .virtio = &.{
+            .{ .addr = ARM_RNG_ADDR, .spi = ARM_RNG_SPI },
+            .{ .addr = ARM_BLK_ADDR, .spi = ARM_BLK_SPI },
+        },
     });
     @memcpy(ram[ARM_DTB_OFF..][0..dtb_len], dtb_buf[0..dtb_len]);
 
@@ -551,6 +562,30 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     uart.irq_ctx = &uart;
     var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
+
+    // virtio-mmio devices, reusing the same backends + virtq as the x86 PCI path;
+    // completions arrive as GIC SPIs. The guest RAM view (where the queues live)
+    // is `ram` based at ARM_RAM_BASE.
+    const gmem = nether.virtq.GuestMem{ .bytes = ram, .base = ARM_RAM_BASE };
+
+    var rng = nether.VirtioRng{};
+    var rng_dev = nether.virtio.Device.init(rng.backend(), gmem);
+    var rng_mmio = nether.VirtioMmio.init(&rng_dev, ARM_RNG_ADDR, 32 + ARM_RNG_SPI);
+    rng_mmio.spi_fn = armVirtioSpi;
+    rng_mmio.attach();
+    try bus.addMmio(rng_mmio.mmioDevice());
+
+    // virtio-blk over a small in-memory disk with a recognizable marker.
+    const disk = try allocator.alloc(u8, 1 * nether.memmap.mib);
+    defer allocator.free(disk);
+    @memset(disk, 0);
+    @memcpy(disk[0..arm_disk_marker.len], arm_disk_marker);
+    var blk = nether.VirtioBlk{ .disk = disk };
+    var blk_dev = nether.virtio.Device.init(blk.backend(), gmem);
+    var blk_mmio = nether.VirtioMmio.init(&blk_dev, ARM_BLK_ADDR, 32 + ARM_BLK_SPI);
+    blk_mmio.spi_fn = armVirtioSpi;
+    blk_mmio.attach();
+    try bus.addMmio(blk_mmio.mmioDevice());
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
@@ -650,6 +685,12 @@ fn armUartIrq(ctx: *anyopaque, level: bool) void {
     _ = ctx;
     const hvf = @import("hvf.zig");
     _ = hvf.hv_gic_set_spi(ARM_UART_INTID, level);
+}
+
+/// virtio-mmio completion line -> GIC SPI (level), by absolute INTID.
+fn armVirtioSpi(intid: u32, level: bool) void {
+    const hvf = @import("hvf.zig");
+    _ = hvf.hv_gic_set_spi(intid, level);
 }
 
 /// I/O thread: block on host stdin and push each chunk into the PL011 RX, which
