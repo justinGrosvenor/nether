@@ -45,6 +45,8 @@ pub const pci_mmio_base: u64 = 0x1100_0000;
 pub const pci_mmio_size: u64 = 0x0100_0000; // 16 MiB, 32-bit window
 pub const pci_mmio64_base: u64 = 0x80_0000_0000; // 512 GiB, 64-bit window
 pub const pci_mmio64_size: u64 = 0x0100_0000; // 16 MiB
+pub const pci_io_base: u64 = 0x3eff_0000; // PCI I/O window (CPU side), 64 KiB
+pub const pci_io_size: u64 = 0x0001_0000;
 pub const pci_intx_spi: u32 = 3; // legacy INTA -> SPI (INTID 35)
 
 /// Main RAM starts at 1 GiB (below it is the MMIO/device region).

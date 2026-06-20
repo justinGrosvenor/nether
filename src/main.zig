@@ -541,6 +541,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .pcie = .{
             .ecam_base = nether.memmap_arm.ecam_base,
             .ecam_size = nether.memmap_arm.ecam_size,
+            .io_base = nether.memmap_arm.pci_io_base,
+            .io_size = nether.memmap_arm.pci_io_size,
             .mmio_base = nether.memmap_arm.pci_mmio_base,
             .mmio_size = nether.memmap_arm.pci_mmio_size,
             .mmio64_base = nether.memmap_arm.pci_mmio64_base,

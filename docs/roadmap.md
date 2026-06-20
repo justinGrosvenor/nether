@@ -257,18 +257,30 @@ The build-out arc (offline-first chunks):
      a 32-bit non-prefetchable and a 64-bit window (both now emitted and
      registered by the kernel as root-bus resources); and `bus-range` is now
      consistent with the 1-bus ECAM. The blob validates clean under `dtc`.
-   - **Blocker (still open, narrowed to runtime).** Even with a QEMU-equivalent,
-     dtc-clean DTB - both windows registered, BAR sized correctly as 64-bit pref,
-     prefetch and space matched - the kernel **never runs BAR assignment**: it
-     goes straight from sizing BAR0 to "not claimed; can't enable device"
-     (`r->parent == NULL`, -EINVAL), whereas QEMU's kernel (same Image) prints
-     "BAR ... assigned". So the gap is no longer in the device tree; it is a
-     runtime difference in the PCI config-space access sequence or the kernel's
-     assign-vs-claim decision under Nether. **Next:** enable kernel PCI debug
-     (`CONFIG_PCI_DEBUG`/`dyndbg`) or trace-compare the config-space accesses
-     between a QEMU run and a Nether run (nether's `pci.zig` already logs cfg
-     rd/wr under the trace marker) to see why assignment is skipped. A focused
-     debugging session, not more DTB edits.
+   - **Root cause isolated via trace-diff (still open).** Captured Nether's
+     config-space accesses (trace marker) and QEMU's (`-trace pci_cfg_write`) for
+     the same kernel + an equivalent DTB, and ran the kernel's PCI setup `dyndbg`:
+       * Nether: the kernel sizes BAR0 (writes 0xffffffff, reads the mask, writes
+         the type bits back) and then goes **straight to the virtio-pci probe** -
+         no assignment write to BAR0, COMMAND register never enabled. The PCI
+         setup debug shows scan -> "resource 4/5" -> "not claimed", with **no
+         `pci_bus_assign_resources` pass at all**.
+       * QEMU: after sizing, a second pass **assigns** (`@0x20<-0x400c @0x24<-0x80`
+         -> BAR at 0x8000004000) and **enables** the device (`@0x4<-0x7` =
+         MEM|IO|BUS_MASTER), then `/dev/hwrng` works.
+     So Nether's `pci-host-generic` takes the **claim** path while QEMU's takes
+     **assign** - the device tree and the config-space emulation are both correct
+     (device enumerates, BAR sizes right); the difference is purely the kernel's
+     claim-vs-assign decision for this bus. Ruled out (tested, no effect):
+     prefetchable vs non-pref BAR/window, 32/64-bit windows, the I/O window
+     (root-bus resources now match QEMU exactly), interrupt-map, GIC #address-cells,
+     bus-range, pre-assign vs kernel-assign, `pci=realloc`, and
+     `linux,pci-probe-only=0`. **Next (needs kernel 6.12 source):** read
+     `drivers/pci/controller/pci-host-common.c` + `pci_host_probe` to see what
+     gates `pci_bus_assign_resources` vs `pci_bus_claim_resources` for generic
+     ECAM, since the DTB knobs that normally flip it have no effect here. The
+     transport/datapath is correct and reusable; only this last kernel-side gate
+     stands between enumeration and a bound virtio-pci device.
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track.

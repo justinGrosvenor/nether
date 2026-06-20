@@ -171,6 +171,8 @@ pub const VirtioDev = struct { addr: u64, spi: u32 };
 pub const PcieConfig = struct {
     ecam_base: u64,
     ecam_size: u64,
+    io_base: u64,
+    io_size: u64,
     mmio_base: u64,
     mmio_size: u64,
     mmio64_base: u64,
@@ -215,6 +217,11 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.beginNode("chosen");
     b.propString("bootargs", cfg.cmdline);
     b.propString("stdout-path", "/pl011@9000000");
+    // Force the kernel out of PCI_PROBE_ONLY so it *assigns* (not just claims)
+    // BARs. With a direct kernel boot there is no firmware to assign PCI
+    // resources; without this the generic host bridge leaves BARs unassigned and
+    // virtio-pci can't enable the device.
+    b.propU32("linux,pci-probe-only", 0);
     if (cfg.initrd_end > cfg.initrd_start) {
         b.propU64("linux,initrd-start", cfg.initrd_start);
         b.propU64("linux,initrd-end", cfg.initrd_end);
@@ -301,11 +308,14 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
         // ECAM is 1 MiB = exactly one bus, so the bus-range must be a single bus
         // (pci_ecam_create sizes the config space as (bus_max+1) << 20).
         b.propCells("bus-range", &.{ 0, 0 });
-        // Two MMIO windows, mirroring QEMU's virt board (both identity-mapped
-        // PCI<->CPU): a 32-bit non-prefetchable window (space 0x02000000; the
-        // host bridge requires one) and a 64-bit window (space 0x03000000) where
-        // the virtio 64-bit BAR is assigned.
+        // Three windows, mirroring QEMU's virt board (all identity-mapped
+        // PCI<->CPU): an I/O window (space 0x01000000), a 32-bit non-prefetchable
+        // window (0x02000000; the host bridge requires one), and a 64-bit window
+        // (0x03000000) where the virtio 64-bit BAR is assigned.
         b.propCells("ranges", &.{
+            0x0100_0000, 0,                 0,               // I/O: PCI addr 0
+            hi(p.io_base),                  lo(p.io_base), // CPU addr
+            0,                              @intCast(p.io_size), // size
             0x0200_0000, hi(p.mmio_base),   lo(p.mmio_base), // 32-bit: PCI addr
             hi(p.mmio_base),                lo(p.mmio_base), // CPU addr
             hi(p.mmio_size),                lo(p.mmio_size), // size
