@@ -4,6 +4,7 @@
 //! dropped (logged, not fatal), so firmware probing does not kill the vCPU.
 
 const std = @import("std");
+const Lock = @import("lock.zig").Lock;
 
 pub const max_pio = 16;
 pub const max_mmio = 16;
@@ -40,6 +41,10 @@ pub const Bus = struct {
     pio_count: usize = 0,
     mmio: [max_mmio]MmioDevice = undefined,
     mmio_count: usize = 0,
+    /// Serializes device dispatch so concurrent vCPU threads (SMP) cannot race on
+    /// device state. Device handlers are non-blocking, so a single coarse lock is
+    /// fine; host I/O threads that drive a device directly take its own lock.
+    lock: Lock = .{},
 
     pub fn addPio(self: *Bus, dev: PioDevice) error{BusFull}!void {
         if (self.pio_count == max_pio) return error.BusFull;
@@ -54,6 +59,8 @@ pub const Bus = struct {
     }
 
     pub fn pioOut(self: *Bus, port: u16, size: u8, value: u32) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         for (self.pio[0..self.pio_count]) |d| {
             if (d.contains(port)) {
                 d.out_fn(d.ptr, port, size, value);
@@ -63,6 +70,8 @@ pub const Bus = struct {
     }
 
     pub fn pioIn(self: *Bus, port: u16, size: u8) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
         for (self.pio[0..self.pio_count]) |d| {
             if (d.contains(port)) return d.in_fn(d.ptr, port, size);
         }
@@ -70,6 +79,8 @@ pub const Bus = struct {
     }
 
     pub fn mmioWrite(self: *Bus, addr: u64, data: []const u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         for (self.mmio[0..self.mmio_count]) |d| {
             if (d.contains(addr)) {
                 d.write_fn(d.ptr, addr - d.base, data);
@@ -79,6 +90,8 @@ pub const Bus = struct {
     }
 
     pub fn mmioRead(self: *Bus, addr: u64, data: []u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         for (self.mmio[0..self.mmio_count]) |d| {
             if (d.contains(addr)) {
                 d.read_fn(d.ptr, addr - d.base, data);

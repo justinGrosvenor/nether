@@ -299,6 +299,22 @@ The build-out arc (offline-first chunks):
        count climbs per RX) before MSI-X was added.
      **Remaining (optional):** a richer rootfs/kernel with `virtio_rng=y` (or
      modules in the initramfs) to drive the rng/blk/net backends directly over PCI.
+6. **SMP (DONE).** The aarch64 guest boots with multiple vCPUs
+   (`ARM_NUM_CPUS`, currently 4). Each core creates and runs its own vCPU on its
+   own host thread (an HVF vCPU is bound to its creating thread), so the boot core
+   spawns a parked thread per secondary; each creates its vCPU up front
+   (establishing its GIC redistributor) and the boot core waits on a barrier
+   before building the DTB, so all redistributors exist before the kernel's GIC
+   init. Secondaries come online via **PSCI CPU_ON** (`smp.zig` is the rendezvous;
+   `hvf_backend.zig handlePsci` adds CPU_ON/AFFINITY_INFO/FEATURES, 32- and 64-bit
+   FIDs); the DTB emits one `cpu@N` node per core with `reg` = MPIDR affinity and
+   `enable-method = psci`. `io.Bus` gained a coarse lock so concurrent-vCPU MMIO
+   cannot race on device state. Proven: `SMP: Total of 4 processors activated`,
+   `nproc` = 4, each secondary `Booted secondary processor 0x0N` with its own
+   redistributor (128 KiB stride), and the virtio-console datapath + MSI-X still
+   work under load. (Clean SMP teardown on guest shutdown is a known rough edge:
+   a secondary parked in WFI inside `hv_vcpu_run` is not force-stopped.)
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
-(a live networked boot) is independent of this track.
+(a live networked boot) is independent of this track. SMP on the KVM path
+(per-vCPU threads + INIT/SIPI) is the analogous follow-up there.

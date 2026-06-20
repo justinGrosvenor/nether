@@ -52,6 +52,7 @@ pub const net = @import("virtio_net.zig");
 pub const VirtioNet = net.Net;
 pub const console = @import("virtio_console.zig");
 pub const VirtioConsole = console.Console;
+pub const smp = @import("smp.zig");
 pub const vsock = @import("virtio_vsock.zig");
 pub const Vsock = vsock.Vsock;
 pub const VsockDev = vsock.VsockDev;
@@ -82,6 +83,7 @@ test {
     _ = @import("virtio_vsock.zig");
     _ = @import("virtio_net.zig");
     _ = @import("virtio_console.zig");
+    _ = @import("smp.zig");
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
     _ = @import("fuzz.zig");
 }

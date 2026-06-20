@@ -500,6 +500,10 @@ fn macMain() !void {
 const ARM_RAM_SIZE: usize = 512 * nether.memmap.mib;
 const ARM_DTB_OFF: u64 = 0x0800_0000;
 const ARM_INITRD_OFF: u64 = 0x0C00_0000;
+/// Number of vCPUs the aarch64 guest boots with. Secondaries come online via
+/// PSCI CPU_ON (see smp.zig); each vCPU is created and run on its own thread
+/// because an HVF vCPU is bound to its creating thread.
+const ARM_NUM_CPUS: u32 = 4;
 
 /// Boot an arm64 Linux kernel: place the Image, DTB, and initramfs in guest RAM,
 /// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
@@ -511,10 +515,36 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const ram = try vm.addMemory(0, ARM_RAM_BASE, ARM_RAM_SIZE);
     try vm.enableSplitIrqchip(); // hv_gic_create, before the vCPU
 
-    // The vCPU must exist before we can ask where the framework placed its GIC
-    // redistributor; the DTB has to describe that actual address.
+    // The boot vCPU must exist before we can ask where the framework placed its
+    // GIC redistributor; the DTB has to describe that actual address.
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
+
+    // SMP: one Cpu control block per core (boot core already "started"), and a
+    // secondary thread per extra core. Each secondary CREATES its own vCPU (HVF
+    // binds a vCPU to its creating thread) so all redistributors exist before the
+    // kernel's GIC init, then parks until PSCI CPU_ON releases it.
+    var cpus: [ARM_NUM_CPUS]nether.smp.Cpu = undefined;
+    for (&cpus, 0..) |*c, i| c.* = .{ .mpidr = 0x8000_0000 | @as(u64, i) };
+    cpus[0].started.store(true, .release); // boot core
+    var smpc = nether.smp.Smp{ .cpus = &cpus };
+    var created = std.atomic.Value(u32).init(0); // secondaries that finished createVcpu
+    var sec_ctx: [ARM_NUM_CPUS]SmpCtx = undefined;
+    var power = nether.Power{};
+    var bus = nether.Bus{};
+
+    var ci: u32 = 1;
+    while (ci < ARM_NUM_CPUS) : (ci += 1) {
+        sec_ctx[ci] = .{ .vm = &vm, .id = ci, .cpu = &cpus[ci], .bus = &bus, .power = &power, .smpc = &smpc, .created = &created };
+        (std.Thread.spawn(.{}, macSecondaryCpu, .{&sec_ctx[ci]}) catch |err| {
+            std.debug.print("[nether] secondary cpu {d} spawn failed: {s}\n", .{ ci, @errorName(err) });
+            return err;
+        }).detach();
+    }
+    // Wait until every secondary has created its vCPU (so all GIC redistributors
+    // are present) before building the DTB and starting the boot core.
+    while (created.load(.acquire) < ARM_NUM_CPUS - 1) _ = usleep(200);
+
     const queried = vcpu.redistributorBase();
     const gicr_base = if (queried != 0) queried else nether.memmap_arm.gicr_base;
 
@@ -538,6 +568,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .gicr_size = vm.hv.gicr_size,
         .initrd_start = initrd_start,
         .initrd_end = initrd_end,
+        .num_cpus = ARM_NUM_CPUS,
         .pcie = .{
             .ecam_base = nether.memmap_arm.ecam_base,
             .ecam_size = nether.memmap_arm.ecam_size,
@@ -559,13 +590,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     hvf.sys_icache_invalidate(ram.ptr, kernel.len); // host write -> guest I-fetch
 
-    var power = nether.Power{};
     var uart = nether.Pl011{};
     uart.out_fn = uartOut;
     uart.out_ctx = &uart;
     uart.irq_fn = armUartIrq; // RX data raises the PL011 SPI through the GIC
     uart.irq_ctx = &uart;
-    var bus = nether.Bus{};
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
     // virtio-pci: a generic-ECAM PCIe host bridge with a virtio-console function,
@@ -613,12 +642,43 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] stdin thread failed: {s}; console is output-only\n", .{@errorName(err)});
     }
 
-    std.debug.print("[nether] booting arm64 Image: kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
-    const reason = vcpu.run(&bus, &power) catch |err| {
+    std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ ARM_NUM_CPUS, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
+    const reason = vcpu.runSmp(&bus, &power, &smpc) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// Per-secondary-core thread context. The vCPU is created inside the thread (HVF
+/// binds a vCPU to its creating thread), so only the id and the shared VM/bus/
+/// power/smp handles cross the boundary.
+const SmpCtx = struct {
+    vm: *nether.Vm,
+    id: u32,
+    cpu: *nether.smp.Cpu,
+    bus: *nether.Bus,
+    power: *nether.Power,
+    smpc: *nether.smp.Smp,
+    created: *std.atomic.Value(u32),
+};
+
+/// A secondary core: create its vCPU (establishing its GIC redistributor), report
+/// readiness, then park until PSCI CPU_ON gives it an entry point and run from
+/// there. x0 = the PSCI context_id, per the boot protocol.
+fn macSecondaryCpu(ctx: *SmpCtx) void {
+    var vcpu = ctx.vm.createVcpu(ctx.id) catch {
+        _ = ctx.created.fetchAdd(1, .release); // count anyway so the boot core proceeds
+        return;
+    };
+    defer vcpu.deinit();
+    _ = ctx.created.fetchAdd(1, .release);
+    while (!ctx.cpu.started.load(.acquire)) {
+        if (ctx.power.action != null) return; // shutdown before we were ever turned on
+        _ = usleep(200);
+    }
+    vcpu.setAarch64Entry(ctx.cpu.entry, ctx.cpu.context) catch return;
+    _ = vcpu.runSmp(ctx.bus, ctx.power, ctx.smpc) catch {};
 }
 
 /// First light under Apple HVF: a tiny aarch64 blob writes a message to the PL011
@@ -661,6 +721,7 @@ const libc = struct {
     extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
 };
+extern "c" fn usleep(usec: c_uint) c_int;
 
 /// Read a whole file (macOS host side). Caller owns the slice.
 fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {

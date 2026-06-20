@@ -18,6 +18,7 @@ const pwr = @import("power.zig");
 const hvf = @import("hvf.zig");
 const arm = @import("memmap_arm.zig");
 const hvtypes = @import("hvtypes.zig");
+const smp = @import("smp.zig");
 
 const StopReason = hvtypes.StopReason;
 const Error = hvtypes.Error;
@@ -31,6 +32,12 @@ const EC_SYSREG: u64 = 0x18; // trapped MSR/MRS/system reg (emulate RAZ/WI)
 /// PSCI function IDs (the guest's "firmware" for power; the arm64 analog of the
 /// ACPI PM block). The guest calls these via `hvc #0` with the FID in w0/x0.
 const PSCI_VERSION: u64 = 0x8400_0000;
+const PSCI_CPU_OFF: u64 = 0x8400_0002;
+const PSCI_CPU_ON_32: u64 = 0x8400_0003;
+const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+const PSCI_AFFINITY_INFO_32: u64 = 0x8400_0004;
+const PSCI_AFFINITY_INFO_64: u64 = 0xc400_0004;
+const PSCI_FEATURES: u64 = 0x8400_000a;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_VERSION_1_0: u64 = 0x0001_0000; // major 1, minor 0
@@ -167,6 +174,12 @@ pub const Vcpu = struct {
     }
 
     pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power) !StopReason {
+        return self.runSmp(bus, power, null);
+    }
+
+    /// Run loop with optional SMP control (for PSCI CPU_ON routing). The single-CPU
+    /// `run` is this with `sc = null`.
+    pub fn runSmp(self: *Vcpu, bus: *io.Bus, power: *pwr.Power, sc: ?*smp.Smp) !StopReason {
         while (true) {
             try ok(hvf.hv_vcpu_run(self.handle), "hv_vcpu_run");
             switch (self.exit.reason) {
@@ -175,7 +188,7 @@ pub const Vcpu = struct {
                     const ec = (esr >> 26) & 0x3f;
                     switch (ec) {
                         EC_DATA_ABORT_LOWER => self.handleDataAbort(bus, esr),
-                        EC_HVC => self.handlePsci(power),
+                        EC_HVC => self.handlePsci(power, sc),
                         EC_WFX => self.stepPc(4), // idle wait; the GIC wakes us
                         EC_SYSREG => self.handleSysReg(esr),
                         else => {
@@ -226,12 +239,31 @@ pub const Vcpu = struct {
     /// PSCI over HVC: the guest's power firmware. Unlike a data abort, HV_REG_PC
     /// on an HVC exit already points past the `hvc` (ELR semantics), so we must
     /// NOT step it - the result just goes in x0.
-    fn handlePsci(self: *Vcpu, power: *pwr.Power) void {
+    fn handlePsci(self: *Vcpu, power: *pwr.Power, sc: ?*smp.Smp) void {
         const fid = self.getX(0) & 0xffff_ffff;
         switch (fid) {
             PSCI_VERSION => self.setX(0, PSCI_VERSION_1_0),
             PSCI_SYSTEM_OFF => power.request(.shutdown),
             PSCI_SYSTEM_RESET => power.request(.reset),
+            PSCI_CPU_ON_32, PSCI_CPU_ON_64 => {
+                // CPU_ON(target_mpidr, entry_point, context_id): wake the parked
+                // secondary so it begins executing the kernel's secondary entry.
+                const r: i64 = if (sc) |s| s.cpuOn(self.getX(1), self.getX(2), self.getX(3)) else smp.PSCI_NOT_SUPPORTED;
+                self.setX(0, @bitCast(r));
+            },
+            PSCI_AFFINITY_INFO_32, PSCI_AFFINITY_INFO_64 => {
+                const r: i64 = if (sc) |s| s.affinityInfo(self.getX(1)) else smp.AFFINITY_OFF;
+                self.setX(0, @bitCast(r));
+            },
+            PSCI_FEATURES => {
+                // Advertise the calls we implement (0 = present) so the guest uses
+                // PSCI for SMP bringup; everything else is unsupported.
+                const q = self.getX(1) & 0xffff_ffff;
+                const supported = q == PSCI_CPU_ON_32 or q == PSCI_CPU_ON_64 or
+                    q == PSCI_AFFINITY_INFO_32 or q == PSCI_AFFINITY_INFO_64 or
+                    q == PSCI_VERSION or q == PSCI_SYSTEM_OFF or q == PSCI_SYSTEM_RESET;
+                self.setX(0, if (supported) 0 else PSCI_NOT_SUPPORTED);
+            },
             else => self.setX(0, PSCI_NOT_SUPPORTED),
         }
     }

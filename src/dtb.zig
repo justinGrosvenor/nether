@@ -198,6 +198,7 @@ pub const VirtConfig = struct {
     gicr_size: u64 = arm.gicr_size,
     initrd_start: u64 = 0,
     initrd_end: u64 = 0,
+    num_cpus: u32 = 1,
     virtio: []const VirtioDev = &.{},
     pcie: ?PcieConfig = null,
     msi: ?MsiConfig = null,
@@ -258,12 +259,20 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.beginNode("cpus");
     b.propU32("#address-cells", 1);
     b.propU32("#size-cells", 0);
-    b.beginNode("cpu@0");
-    b.propString("device_type", "cpu");
-    b.propString("compatible", "arm,armv8");
-    b.propU32("reg", 0);
-    b.propString("enable-method", "psci");
-    b.endNode();
+    // One cpu node per vCPU. reg = the core's MPIDR affinity (Aff0 = id for the
+    // small core counts we run); enable-method = psci so the kernel uses PSCI
+    // CPU_ON to bring secondaries online.
+    var cpu: u32 = 0;
+    while (cpu < cfg.num_cpus) : (cpu += 1) {
+        var cpuname: [16]u8 = undefined;
+        const cn = std.fmt.bufPrint(&cpuname, "cpu@{x}", .{cpu}) catch unreachable;
+        b.beginNode(cn);
+        b.propString("device_type", "cpu");
+        b.propString("compatible", "arm,armv8");
+        b.propU32("reg", cpu);
+        b.propString("enable-method", "psci");
+        b.endNode();
+    }
     b.endNode();
 
     b.beginNode("intc@8000000"); // GICv3
