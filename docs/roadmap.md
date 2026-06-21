@@ -353,6 +353,16 @@ The build-out arc (offline-first chunks):
      platform spawns nether per sandbox and attaches to its control socket to exec
      and collect results. (Socket path is fixed for now; per-sandbox paths are a
      trivial follow-up.)
+   - **Metering (DONE) - the meter pillar.** A host-intercepted `__stats__` control
+     command reports per-sandbox usage so the platform can settle per consumption
+     (x402): `uptime_ms`, `ram_mb`, `cpus`, `commands` run, and `bytes_in/out`.
+     Counters live in a `Metering` struct shared by the control threads; the command
+     is answered by the host without touching the guest, and is not itself counted.
+     Proven live: after 3 commands, `__stats__` over the socket returns
+     `commands=3 bytes_in=27 bytes_out=287` etc. Nether exposes the usage; the
+     billing plane (the platform/x402) settles on it. (Compute-time per vCPU via
+     `hv_vcpu_get_exec_time` is the obvious richer metric; it is owning-thread only,
+     so a sampling hook in the run loop is the follow-up.)
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come

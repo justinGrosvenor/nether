@@ -370,10 +370,32 @@ fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
 const ControlCtx = struct {
     vsdev: *nether.VsockDev,
     agent: *AgentCtx,
+    meter: *Metering,
     path: [*:0]const u8,
     pipe_r: i32,
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 };
+
+/// Send one command line to the guest agent (waiting for it to connect), counting
+/// it for metering. The `__stats__` line is intercepted here and answered by the
+/// host without touching the guest.
+fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
+    if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
+        var rep: [512]u8 = undefined;
+        const n = ctx.meter.report(&rep);
+        _ = libc.write(c, rep[0..n].ptr, n);
+        _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        return;
+    }
+    var id = ctx.agent.conn_id.load(.acquire);
+    while (id < 0) {
+        _ = usleep(50_000);
+        id = ctx.agent.conn_id.load(.acquire);
+    }
+    _ = ctx.vsdev.hostSend(@intCast(id), line);
+    _ = ctx.meter.commands.fetchAdd(1, .release);
+    _ = ctx.meter.bytes_in.fetchAdd(line.len, .release);
+}
 
 fn controlListener(ctx: *ControlCtx) void {
     const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
@@ -395,16 +417,27 @@ fn controlListener(ctx: *ControlCtx) void {
         const c = libc.accept(fd, null, null);
         if (c < 0) continue;
         ctx.client.store(c, .release);
+        // Line-buffer the client stream so `__stats__` can be intercepted and each
+        // command metered; everything else is forwarded verbatim to the agent.
         var buf: [4096]u8 = undefined;
+        var len: usize = 0;
         while (true) {
-            const n = libc.read(c, &buf, buf.len);
-            if (n <= 0) break;
-            var id = ctx.agent.conn_id.load(.acquire);
-            while (id < 0) {
-                _ = usleep(50_000);
-                id = ctx.agent.conn_id.load(.acquire);
+            const r = libc.read(c, buf[len..].ptr, buf.len - len);
+            if (r <= 0) break;
+            len += @intCast(r);
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                if (buf[i] == '\n') {
+                    controlCommand(ctx, c, buf[start .. i + 1]);
+                    start = i + 1;
+                }
             }
-            _ = ctx.vsdev.hostSend(@intCast(id), buf[0..@intCast(n)]);
+            if (start > 0) {
+                std.mem.copyForwards(u8, buf[0 .. len - start], buf[start..len]);
+                len -= start;
+            }
+            if (len == buf.len) len = 0; // overlong line: drop
         }
         ctx.client.store(-1, .release);
         _ = libc.close(c);
@@ -419,7 +452,10 @@ fn controlRelay(ctx: *ControlCtx) void {
         const n = libc.read(ctx.pipe_r, &buf, buf.len);
         if (n <= 0) return;
         const c = ctx.client.load(.acquire);
-        if (c >= 0) _ = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
+        if (c >= 0) {
+            _ = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
+            _ = ctx.meter.bytes_out.fetchAdd(@intCast(n), .release);
+        }
     }
 }
 
@@ -876,10 +912,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // the agent's replies from the recv handler to the relay thread.
     var ctl_pipe: [2]c_int = undefined;
     var ctl_ctx: ControlCtx = undefined;
+    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ARM_RAM_SIZE / (1024 * 1024), .cpus = ARM_NUM_CPUS };
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .path = "/tmp/nether.sock", .pipe_r = ctl_pipe[0] };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = "/tmp/nether.sock", .pipe_r = ctl_pipe[0] };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
@@ -1357,6 +1394,49 @@ const SockaddrUn = extern struct {
     len: u8 = 0,
     family: u8 = AF_UNIX,
     path: [104]u8 = [_]u8{0} ** 104,
+};
+
+const timeval = extern struct { sec: i64, usec: i64 };
+extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
+fn nowMs() i64 {
+    var tv: timeval = undefined;
+    _ = gettimeofday(&tv, null);
+    return tv.sec * 1000 + @divTrunc(tv.usec, 1000);
+}
+
+/// Per-sandbox resource usage, exposed to the platform (which settles per use)
+/// via the `__stats__` control command. Counters are shared across the control
+/// threads; the platform reads them to meter compute, RAM, and I/O.
+const Metering = struct {
+    start_ms: i64 = 0,
+    ram_mb: u64 = 0,
+    cpus: u32 = 0,
+    commands: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    bytes_in: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // client -> sandbox
+    bytes_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // sandbox -> client
+
+    /// Render a stats report (text + the agent's 0x1e<exit>\n framing) into `buf`.
+    fn report(self: *Metering, buf: []u8) usize {
+        return (std.fmt.bufPrint(buf,
+            \\nether sandbox stats
+            \\uptime_ms={d}
+            \\ram_mb={d}
+            \\cpus={d}
+            \\commands={d}
+            \\bytes_in={d}
+            \\bytes_out={d}
+            \\{c}0
+            \\
+        , .{
+            nowMs() - self.start_ms,
+            self.ram_mb,
+            self.cpus,
+            self.commands.load(.acquire),
+            self.bytes_in.load(.acquire),
+            self.bytes_out.load(.acquire),
+            @as(u8, 0x1e),
+        }) catch return 0).len;
+    }
 };
 
 /// Read a whole file (macOS host side). Caller owns the slice.
