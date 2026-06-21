@@ -357,7 +357,12 @@ The build-out arc (offline-first chunks):
      path (a configured path also enables control mode without a marker), so many
      sandboxes run on one host. Proven: with `control_socket=/tmp/nether-sb7.sock`
      and no markers, nether binds that path and serves it. The platform writes one
-     config per sandbox and launches. `cpus` and `ram_mb` are also config-driven
+     config per sandbox and launches. Every mode is now config-driven too
+     (`net`/`vsock`/`agent`/`control`/`restore`/`snapshot` as `key=1`, markers kept
+     as a legacy fallback via `modeOn`), so a single `nether.conf` fully describes a
+     sandbox: proven with `cpus=2 ram_mb=384 control_socket=... net=1` (no markers)
+     bringing up vsock + net + the control socket and serving a wget end to end.
+     `cpus` and `ram_mb` are also config-driven
      (clamped to 1..8 vCPUs sized by MAX-sized SMP arrays, and RAM >= 256 MiB):
      proven with `cpus=2 ram_mb=384`, the guest reports `nproc` 2 and ~384 MiB and
      `SMP: Total of 2 processors activated`. So the platform sizes each sandbox.

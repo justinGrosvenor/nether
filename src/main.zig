@@ -663,7 +663,7 @@ fn macMain() !void {
     nether.trace.init();
 
     // A `nether-restore` marker forks a guest from nether.snap instead of booting.
-    if (macMarkerPresent("nether-restore")) {
+    if (modeOn("restore", "nether-restore")) {
         try macRestore(allocator, "nether.snap");
         return;
     }
@@ -850,10 +850,10 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var sock_path_buf: [256]u8 = undefined;
     const have_sock_conf = confGet("control_socket", &sock_path_buf) != null;
     const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
-    const control_on = macMarkerPresent("nether-control") or have_sock_conf;
-    const agent_repl = macMarkerPresent("nether-agent") and !control_on;
+    const control_on = modeOn("control", "nether-control") or have_sock_conf;
+    const agent_repl = modeOn("agent", "nether-agent") and !control_on;
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
-    const vsock_on = macMarkerPresent("nether-vsock") or agent_mode;
+    const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
@@ -880,7 +880,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var net_dev: nether.virtio.Device = undefined;
     var net_intx: IntxLine = undefined;
     var slirp_stack: nether.Slirp = undefined;
-    const net_on = macMarkerPresent("nether-net");
+    const net_on = modeOn("net", "nether-net");
     if (net_on) {
         net_be = .{};
         net_dev = nether.virtio.Device.init(net_be.backend(), gmem);
@@ -964,9 +964,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .blk_dev = &blk_dev,
         .blk_disk = blk.disk,
         .uart = &uart,
-        .save = macMarkerPresent("nether-snapshot-save"),
+        .save = modeOn("snapshot_save", "nether-snapshot-save"),
     };
-    if (macMarkerPresent("nether-snapshot") or snap_ctx.save) {
+    if (modeOn("snapshot", "nether-snapshot") or snap_ctx.save) {
         if (std.Thread.spawn(.{}, macSnapshotter, .{&snap_ctx})) |t| t.detach() else |_| {}
         std.debug.print("[nether] snapshot {s} armed\n", .{if (snap_ctx.save) "save-to-file" else "rewind demo"});
     }
@@ -1443,6 +1443,20 @@ fn confGetInt(key: []const u8, default: u64) u64 {
     var b: [32]u8 = undefined;
     if (confGet(key, &b)) |v| return std.fmt.parseInt(u64, v, 10) catch default;
     return default;
+}
+
+/// nether.conf boolean (`1`/`true`/`yes`) for `key`, false if absent.
+fn confBool(key: []const u8) bool {
+    var b: [16]u8 = undefined;
+    if (confGet(key, &b)) |v| {
+        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes");
+    }
+    return false;
+}
+
+/// A mode is on if its config key is set or its (legacy) marker file is present.
+fn modeOn(comptime conf_key: []const u8, comptime marker: [*:0]const u8) bool {
+    return confBool(conf_key) or macMarkerPresent(marker);
 }
 
 // macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
