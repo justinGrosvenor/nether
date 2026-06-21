@@ -312,6 +312,10 @@ fn slirpPollLoop(s: *nether.Slirp) void {
 /// connects on boot; we record its connection id so the stdin pump can drive it.
 const AgentCtx = struct {
     conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    /// Control-socket mode: agent replies are written raw to this pipe for the
+    /// relay thread to forward to the connected control client. -1 = REPL mode
+    /// (parse and print to stdout instead).
+    pipe_w: i32 = -1,
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
@@ -350,9 +354,72 @@ fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             a.conn_id.store(@intCast(id), .release);
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
-        .recv => |r| a.onRecv(r.bytes),
+        .recv => |r| if (a.pipe_w >= 0) {
+            _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
+        } else a.onRecv(r.bytes),
         .shutdown, .reset => a.conn_id.store(-1, .release),
         else => {},
+    }
+}
+
+/// Control plane: a Unix-domain socket the platform connects to in order to drive
+/// the in-guest agent without owning this process's stdio. One control client at
+/// a time: its command lines are forwarded to the agent over vsock, and the
+/// agent's framed replies are relayed back. The framing (output + 0x1e<exit>\n) is
+/// the agent's, so the client parses results just as a stdio driver would.
+const ControlCtx = struct {
+    vsdev: *nether.VsockDev,
+    agent: *AgentCtx,
+    path: [*:0]const u8,
+    pipe_r: i32,
+    client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+};
+
+fn controlListener(ctx: *ControlCtx) void {
+    const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        std.debug.print("[control] socket() failed\n", .{});
+        return;
+    }
+    _ = libc.unlink(ctx.path);
+    var addr = SockaddrUn{};
+    const p = std.mem.span(ctx.path);
+    @memcpy(addr.path[0..p.len], p);
+    addr.len = @intCast(2 + p.len + 1);
+    if (libc.bind(fd, &addr, addr.len) < 0 or libc.listen(fd, 4) < 0) {
+        std.debug.print("[control] bind/listen failed on {s}\n", .{ctx.path});
+        return;
+    }
+    std.debug.print("[control] listening on {s}\n", .{ctx.path});
+    while (true) {
+        const c = libc.accept(fd, null, null);
+        if (c < 0) continue;
+        ctx.client.store(c, .release);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = libc.read(c, &buf, buf.len);
+            if (n <= 0) break;
+            var id = ctx.agent.conn_id.load(.acquire);
+            while (id < 0) {
+                _ = usleep(50_000);
+                id = ctx.agent.conn_id.load(.acquire);
+            }
+            _ = ctx.vsdev.hostSend(@intCast(id), buf[0..@intCast(n)]);
+        }
+        ctx.client.store(-1, .release);
+        _ = libc.close(c);
+    }
+}
+
+/// Relay the guest agent's reply stream (from the recv pipe) to the current
+/// control client.
+fn controlRelay(ctx: *ControlCtx) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = libc.read(ctx.pipe_r, &buf, buf.len);
+        if (n <= 0) return;
+        const c = ctx.client.load(.acquire);
+        if (c >= 0) _ = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
     }
 }
 
@@ -731,13 +798,15 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
     var agent_ctx = AgentCtx{};
-    const agent_on = macMarkerPresent("nether-agent");
-    const vsock_on = macMarkerPresent("nether-vsock") or agent_on;
+    const control_on = macMarkerPresent("nether-control");
+    const agent_repl = macMarkerPresent("nether-agent") and !control_on;
+    const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
+    const vsock_on = macMarkerPresent("nether-vsock") or agent_mode;
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
-        vs.on_event = if (agent_on) agentEvent else vsockEcho;
-        vs.on_event_ctx = if (agent_on) @as(*anyopaque, &agent_ctx) else @as(*anyopaque, vs);
+        vs.on_event = if (agent_mode) agentEvent else vsockEcho;
+        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &agent_ctx) else @as(*anyopaque, vs);
         vs_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
@@ -748,7 +817,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         vs_dev.msi_fn = armSendMsi;
         try pci_host.addFunction(vs_dev.function(3, 0));
         vsdev.attach(&vs_dev);
-        _ = vsdev.hostListen(if (agent_on) 5000 else 1234); // 5000 = agent control port
+        _ = vsdev.hostListen(if (agent_mode) 5000 else 1234); // 5000 = agent control port
     }
 
     // Function 0:4.0 - virtio-net behind the in-VMM user-mode network stack
@@ -802,13 +871,27 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
-    // Host stdin: in agent mode it drives the guest agent (a REPL: stdin lines ->
-    // sandbox exec -> stdout), and the PL011 console is output-only. Otherwise it
-    // feeds the PL011 RX for an interactive guest shell.
+    // Control plane: in nether-control mode a Unix-domain socket drives the agent
+    // (the platform attaches without owning this process's stdio). A pipe carries
+    // the agent's replies from the recv handler to the relay thread.
+    var ctl_pipe: [2]c_int = undefined;
+    var ctl_ctx: ControlCtx = undefined;
+    if (control_on) {
+        if (libc.pipe(&ctl_pipe) == 0) {
+            agent_ctx.pipe_w = ctl_pipe[1];
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .path = "/tmp/nether.sock", .pipe_r = ctl_pipe[0] };
+            if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
+            if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
+        } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
+    }
+
+    // Host stdin: in agent-REPL mode it drives the guest agent (stdin -> sandbox
+    // exec -> stdout). Otherwise (interactive or control mode) it feeds the PL011
+    // RX for a guest shell; control mode drives the agent over the Unix socket.
     var agent_stdin = AgentStdinCtx{ .vsdev = &vsdev, .agent = &agent_ctx };
-    const saved_termios = if (agent_on) null else armEnableRawMode();
+    const saved_termios = if (agent_repl) null else armEnableRawMode();
     defer if (saved_termios) |s| armRestoreTermios(s);
-    if (agent_on) {
+    if (agent_repl) {
         if (std.Thread.spawn(.{}, agentStdinPump, .{&agent_stdin})) |t| t.detach() else |_| {}
     } else if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| {
         t.detach();
@@ -1258,8 +1341,23 @@ const libc = struct {
     extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
     extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
+    // Unix-domain control socket + a pipe to relay the guest agent's replies.
+    extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
+    extern "c" fn bind(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
+    extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
+    extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
+    extern "c" fn unlink(path: [*:0]const u8) c_int;
+    extern "c" fn pipe(fds: *[2]c_int) c_int;
 };
 extern "c" fn usleep(usec: c_uint) c_int;
+
+const AF_UNIX: c_int = 1;
+const SOCK_STREAM: c_int = 1;
+const SockaddrUn = extern struct {
+    len: u8 = 0,
+    family: u8 = AF_UNIX,
+    path: [104]u8 = [_]u8{0} ** 104,
+};
 
 /// Read a whole file (macOS host side). Caller owns the slice.
 fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {

@@ -343,6 +343,16 @@ The build-out arc (offline-first chunks):
      command's output ends and whether it succeeded. Proven: `true`/`false`/
      `sh -c 'exit 7'`/`ls /nonexistent` return exits 0/1/7/1 with stderr captured.
      This is the request/response shape the platform needs to drive the sandbox.
+   - **Control socket (DONE) - the programmatic API.** A `nether-control` boot opens
+     a Unix-domain socket (`/tmp/nether.sock`); a client connects and drives the
+     in-guest agent without owning this process's stdio. Command lines from the
+     client are forwarded to the agent over vsock (`controlListener`), and the
+     agent's framed replies are relayed back through a pipe (`controlRelay`). Proven
+     live: `nc -U /tmp/nether.sock` with `whoami/uname/.../false` returns each
+     command's output and `0x1e<exit>` framing (root, kernel, 42, exit 1). So the
+     platform spawns nether per sandbox and attaches to its control socket to exec
+     and collect results. (Socket path is fixed for now; per-sandbox paths are a
+     trivial follow-up.)
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come

@@ -12,3 +12,4 @@ nether-snapshot
 nether-snapshot-save
 nether-restore
 nether-agent
+nether-control
