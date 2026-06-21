@@ -120,6 +120,11 @@ pub const Slirp = struct {
     lock: Lock = .{},
     poll_scratch: [2048]u8 = undefined, // reply assembly on the poll thread
 
+    // Network egress metering: payload bytes that traverse the NAT to/from the
+    // real internet (a host-measurable billing dimension, unlike guest compute).
+    tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // guest -> internet
+    rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // internet -> guest
+
     /// Entry point: a raw Ethernet frame the guest transmitted.
     pub fn onGuestFrame(self: *Slirp, frame: []const u8) void {
         if (frame.len < ETH_HDR) return;
@@ -240,6 +245,7 @@ pub const Slirp = struct {
             flow.fd = fd;
         }
         _ = sock.send(flow.fd, payload.ptr, payload.len, 0);
+        _ = self.tx_bytes.fetchAdd(payload.len, .monotonic);
     }
 
     /// Find (or allocate) the UDP flow for this guest source port + destination.
@@ -307,6 +313,7 @@ pub const Slirp = struct {
         const gport = f.guest_port;
         self.lock.unlock();
         if (got <= 0) return;
+        _ = self.rx_bytes.fetchAdd(@intCast(got), .monotonic);
         self.injectUdpToGuest(&sip, sport, gport, self.poll_scratch[0..@intCast(got)]);
     }
 
@@ -338,6 +345,7 @@ pub const Slirp = struct {
             if (got > 0) {
                 self.tcpSend(c, c.snd_nxt, TH_PSH | TH_ACK, self.poll_scratch[0..@intCast(got)], null);
                 c.snd_nxt +%= @intCast(got);
+                _ = self.rx_bytes.fetchAdd(@intCast(got), .monotonic);
             } else if (got == 0) { // host EOF -> FIN to the guest
                 self.tcpSend(c, c.snd_nxt, TH_FIN | TH_ACK, &.{}, null);
                 c.snd_nxt +%= 1;
@@ -384,7 +392,10 @@ pub const Slirp = struct {
 
         if (payload.len > 0 and c.state == .established and seq == c.rcv_nxt) {
             const n = sock.send(c.fd, payload.ptr, payload.len, 0);
-            if (n > 0) c.rcv_nxt +%= @intCast(n);
+            if (n > 0) {
+                c.rcv_nxt +%= @intCast(n);
+                _ = self.tx_bytes.fetchAdd(@intCast(n), .monotonic);
+            }
         }
         if (payload.len > 0 and c.state == .established) self.tcpSend(c, c.snd_nxt, TH_ACK, &.{}, null);
 

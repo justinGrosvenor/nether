@@ -706,6 +706,10 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const num_cpus: u32 = @intCast(std.math.clamp(confGetInt("cpus", ARM_NUM_CPUS), 1, ARM_MAX_CPUS));
     const ram_size: usize = @intCast(@max(confGetInt("ram_mb", ARM_RAM_SIZE / nether.memmap.mib), 256) * nether.memmap.mib);
 
+    // Per-sandbox metering (declared early so the net block can point it at the
+    // NAT for egress byte counts; read by the __stats__ control command).
+    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ram_size / (1024 * 1024), .cpus = num_cpus };
+
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
     const ram = try vm.addMemory(0, ARM_RAM_BASE, ram_size);
@@ -892,6 +896,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
         net_be.on_tx_ctx = &slirp_stack;
+        meter.net = &slirp_stack; // expose NAT egress/ingress bytes via __stats__
         // Host thread: poll NAT sockets and inject replies back into the guest.
         if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
     }
@@ -924,7 +929,6 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // the agent's replies from the recv handler to the relay thread.
     var ctl_pipe: [2]c_int = undefined;
     var ctl_ctx: ControlCtx = undefined;
-    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ram_size / (1024 * 1024), .cpus = num_cpus };
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
@@ -1459,9 +1463,12 @@ const Metering = struct {
     commands: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     bytes_in: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // client -> sandbox
     bytes_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // sandbox -> client
+    net: ?*nether.Slirp = null, // network NAT, for egress/ingress byte counts
 
     /// Render a stats report (text + the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *Metering, buf: []u8) usize {
+        const net_tx = if (self.net) |s| s.tx_bytes.load(.monotonic) else 0;
+        const net_rx = if (self.net) |s| s.rx_bytes.load(.monotonic) else 0;
         return (std.fmt.bufPrint(buf,
             \\nether sandbox stats
             \\uptime_ms={d}
@@ -1470,6 +1477,8 @@ const Metering = struct {
             \\commands={d}
             \\bytes_in={d}
             \\bytes_out={d}
+            \\net_tx_bytes={d}
+            \\net_rx_bytes={d}
             \\{c}0
             \\
         , .{
@@ -1479,6 +1488,8 @@ const Metering = struct {
             self.commands.load(.acquire),
             self.bytes_in.load(.acquire),
             self.bytes_out.load(.acquire),
+            net_tx,
+            net_rx,
             @as(u8, 0x1e),
         }) catch return 0).len;
     }

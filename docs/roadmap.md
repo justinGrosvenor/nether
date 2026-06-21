@@ -368,9 +368,21 @@ The build-out arc (offline-first chunks):
      is answered by the host without touching the guest, and is not itself counted.
      Proven live: after 3 commands, `__stats__` over the socket returns
      `commands=3 bytes_in=27 bytes_out=287` etc. Nether exposes the usage; the
-     billing plane (the platform/x402) settles on it. (Compute-time per vCPU via
-     `hv_vcpu_get_exec_time` is the obvious richer metric; it is owning-thread only,
-     so a sampling hook in the run loop is the follow-up.)
+     billing plane (the platform/x402) settles on it.
+   - **Network egress metering (DONE).** slirp counts payload bytes that traverse
+     the NAT (`tx_bytes` guest->internet, `rx_bytes` internet->guest), surfaced via
+     `__stats__` as `net_tx_bytes`/`net_rx_bytes`. Bandwidth is a real
+     host-measurable billing dimension. Proven: a `wget http://example.com` over the
+     control socket moves the counters to `net_tx_bytes=145 net_rx_bytes=1014` (DHCP
+     stays 0, as it is handled internally, not NAT'd).
+   - **Compute metering: not feasible with `hv_vcpu_get_exec_time` (finding).** That
+     API does not count long *native* guest runs - guest code executes directly on
+     the host core under HVF, and a compute-bound loop takes few VM exits, so the
+     counter barely advances (3 s of tight-loop CPU registered ~4.6 ms). A
+     misleading compute number is worse than none, so it was dropped. A real compute
+     metric needs a different signal (e.g. periodic forced vCPU exits to sample, or a
+     future framework counter); bandwidth + uptime + command count are the working
+     billing dimensions for now.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come
