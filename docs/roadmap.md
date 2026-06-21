@@ -398,6 +398,22 @@ The build-out arc (offline-first chunks):
      slows the sender (lossless, no drops); burst ~250 ms smooths it. Unit-tested
      (refill/cap math, kbps->bytes) and proven live: a 4 MB fetch is ~2 s uncapped,
      ~9 s at 4000 kbps (500 KB/s), ~17 s at 2000 kbps - proportional and matching.
+   - **File push/pull over the agent channel (DONE) - the run pillar.** Getting a
+     task payload into the sandbox and artifacts back out, host-mediated so binary
+     never crosses the line-oriented control socket: the operator sends text commands
+     `__put__ <hostpath> <guestpath>` / `__get__ <guestpath> <hostpath>`; the host
+     moves the bytes over vsock with length framing. `tools/agent.c` grew a PUT/GET
+     state machine (`__PUT__ <path> <len>\n<raw bytes>` -> file; `__GET__ <path>` ->
+     `OK <len>\n<raw bytes>`); the host (`controlPut`/`controlGet`, a diverted
+     `Capture` of the agent's reply) reads/writes the host file. Two real vsock bugs
+     surfaced and were fixed: (1) host->guest packets exceeding the guest's 3776-byte
+     RX buffer were silently truncated by `scatter` (MAX_PAYLOAD 4096 -> 3072); (2)
+     the RX direction was coupled to that cap, so large guest->host packets truncated
+     and the 64 KiB advertised window stalled big pulls on dropped per-packet credit
+     updates - decoupled (RX scratch sized for a 64 KiB guest packet; advertised
+     window raised to 32 MiB since the host consumes synchronously). Proven live:
+     1 B / 100 KiB / 1 MiB / 8 MiB random files round-trip byte-identical (md5),
+     interleaved with normal commands; missing dir/file fail gracefully.
    - **Hardening pass: guest cannot panic the host (DONE).** Malformed guest input
      is the VMM threat model, so a focused pass closed the guest-reachable panics an
      external review found: (1) a guest-set virtqueue size of 0 divided-by-zero in

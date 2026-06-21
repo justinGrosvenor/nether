@@ -147,6 +147,17 @@ the datapaths by hand.
   This is the in-sandbox exec primitive (run code in an isolated guest, collect
   results over the control channel - no network/ssh/shared FS). The PL011 console
   is output-only in this mode since host stdin drives the agent.
+- **File push/pull** (over the control socket, host-mediated): get a task payload
+  into the sandbox and artifacts back out. The operator sends text commands; the
+  host moves the bytes over vsock with length framing (binary never crosses the
+  line-oriented socket):
+  ```sh
+  printf '__put__ /host/task.tar /work/task.tar\n' | nc -U /tmp/sb.sock  # host -> guest
+  printf '__get__ /work/out.bin /host/out.bin\n'   | nc -U /tmp/sb.sock  # guest -> host
+  ```
+  Each replies `OK <n> bytes -> <path>` or `ERR ...`. Proven byte-identical for
+  1 B..8 MiB binary files (16 MiB cap). The guest agent handles `__PUT__`/`__GET__`
+  on the same vsock connection as commands, so transfers interleave with exec.
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

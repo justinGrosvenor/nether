@@ -310,12 +310,65 @@ fn slirpPollLoop(s: *nether.Slirp) void {
 /// as commands to the in-guest agent (tools/agent.c) over vsock, and the command
 /// output the agent streams back is written to host stdout. The guest agent
 /// connects on boot; we record its connection id so the stdin pump can drive it.
+/// A diverted capture of the agent's reply, used by the host-mediated file
+/// transfer (`__put__`/`__get__`). While `AgentCtx.capture` points at one of these,
+/// agent reply bytes accumulate here instead of being relayed; the control thread
+/// waits on `done`, then reads the result. Single op at a time (the control
+/// protocol is serial), so no queue is needed.
+const Capture = struct {
+    is_get: bool, // GET parses "OK <len>\n" + body; PUT parses one "OK\n"/"ERR\n" line
+    buf: []u8, // accumulation (header+body for GET; tiny for PUT)
+    len: usize = 0,
+    body_off: usize = 0, // GET: where the file body starts (after the "OK <len>\n" header)
+    expect: usize = 0, // GET: total bytes expected (body_off + file len); 0 until parsed
+    err: bool = false,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn feed(self: *Capture, bytes: []const u8) void {
+        const n = @min(bytes.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], bytes[0..n]);
+        self.len += n;
+        if (!self.is_get) { // PUT: a single status line
+            if (std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') != null) {
+                self.err = !std.mem.startsWith(u8, self.buf[0..self.len], "OK");
+                self.done.store(true, .release);
+            }
+            return;
+        }
+        if (self.expect == 0) { // GET: still parsing the "OK <len>\n" / "ERR\n" header
+            const nl = std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') orelse return;
+            const hdr = self.buf[0..nl];
+            if (!std.mem.startsWith(u8, hdr, "OK ")) {
+                self.err = true;
+                self.done.store(true, .release);
+                return;
+            }
+            const flen = std.fmt.parseInt(usize, hdr[3..], 10) catch {
+                self.err = true;
+                self.done.store(true, .release);
+                return;
+            };
+            self.body_off = nl + 1;
+            if (flen > self.buf.len - self.body_off) { // larger than our cap
+                self.err = true;
+                self.done.store(true, .release);
+                return;
+            }
+            self.expect = self.body_off + flen;
+        }
+        if (self.expect != 0 and self.len >= self.expect) self.done.store(true, .release);
+    }
+};
+
 const AgentCtx = struct {
     conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     /// Control-socket mode: agent replies are written raw to this pipe for the
     /// relay thread to forward to the connected control client. -1 = REPL mode
     /// (parse and print to stdout instead).
     pipe_w: i32 = -1,
+    /// When set, agent reply bytes are diverted into this capture (file transfer)
+    /// instead of relayed/printed. Set/cleared by the control thread.
+    capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
@@ -354,7 +407,9 @@ fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             a.conn_id.store(@intCast(id), .release);
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
-        .recv => |r| if (a.pipe_w >= 0) {
+        .recv => |r| if (a.capture.load(.acquire)) |cap| {
+            cap.feed(r.bytes); // file transfer in progress: divert the reply
+        } else if (a.pipe_w >= 0) {
             _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
         } else a.onRecv(r.bytes),
         .shutdown, .reset => a.conn_id.store(-1, .release),
@@ -373,8 +428,112 @@ const ControlCtx = struct {
     meter: *Metering,
     path: [*:0]const u8,
     pipe_r: i32,
+    allocator: std.mem.Allocator,
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 };
+
+/// Max bytes a single `__put__`/`__get__` moves. Bounds host memory and frames the
+/// guest-side payload; large enough for typical task payloads/artifacts.
+const MAX_XFER: usize = 16 * 1024 * 1024;
+
+/// Send `data` to the guest agent, retrying as its staging ring drains (hostSend
+/// accepts only what fits). Returns false if the connection dies mid-send.
+fn hostSendAll(vsdev: *nether.VsockDev, id: u16, data: []const u8) bool {
+    var off: usize = 0;
+    var stalls: u32 = 0;
+    while (off < data.len) {
+        const sent = vsdev.hostSend(id, data[off..]);
+        if (sent == 0) {
+            stalls += 1;
+            if (stalls > 100_000) return false; // ~ guest not draining
+            _ = usleep(100);
+        } else {
+            off += sent;
+            stalls = 0;
+        }
+    }
+    return true;
+}
+
+/// Wait (bounded) for a diverted capture to complete.
+fn waitCapture(cap: *Capture) bool {
+    var spins: u32 = 0;
+    while (!cap.done.load(.acquire)) {
+        spins += 1;
+        if (spins > 600_000) return false; // ~60s ceiling
+        _ = usleep(100);
+    }
+    return true;
+}
+
+/// Copy a path slice into `buf` as a NUL-terminated C string for libc calls.
+fn cpath(buf: []u8, p: []const u8) ?[*:0]const u8 {
+    if (p.len + 1 > buf.len) return null;
+    @memcpy(buf[0..p.len], p);
+    buf[p.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+/// Host-mediated file push: read the host file and stream it to the guest agent as
+/// a __PUT__ request. `args` = "<hostpath> <guestpath>".
+fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
+    const sp = std.mem.indexOfScalar(u8, args, ' ') orelse return reply(c, "ERR bad __put__ (need <hostpath> <guestpath>)\n");
+    const hostpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
+    const guestpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
+    var pb: [1024]u8 = undefined;
+    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
+    const data = readFileMac(ctx.allocator, hp) catch return reply(c, "ERR cannot read host file\n");
+    defer ctx.allocator.free(data);
+    if (data.len > MAX_XFER) return reply(c, "ERR file too large\n");
+
+    var rbuf: [8]u8 = undefined;
+    var cap = Capture{ .is_get = false, .buf = &rbuf };
+    ctx.agent.capture.store(&cap, .release);
+    defer ctx.agent.capture.store(null, .release);
+
+    var hdr: [4096]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "__PUT__ {s} {d}\n", .{ guestpath, data.len }) catch return reply(c, "ERR guest path too long\n");
+    if (!hostSendAll(ctx.vsdev, id, h) or !hostSendAll(ctx.vsdev, id, data)) return reply(c, "ERR send failed\n");
+    if (!waitCapture(&cap) or cap.err) return reply(c, "ERR guest write failed\n");
+    var ok: [128]u8 = undefined;
+    reply(c, std.fmt.bufPrint(&ok, "OK put {d} bytes -> {s}\n", .{ data.len, guestpath }) catch "OK\n");
+}
+
+/// Host-mediated file pull: request a file from the guest agent and write it to the
+/// host. `args` = "<guestpath> <hostpath>".
+fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
+    const sp = std.mem.indexOfScalar(u8, args, ' ') orelse return reply(c, "ERR bad __get__ (need <guestpath> <hostpath>)\n");
+    const guestpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
+    const hostpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
+
+    const cbuf = ctx.allocator.alloc(u8, MAX_XFER + 64) catch return reply(c, "ERR out of memory\n");
+    defer ctx.allocator.free(cbuf);
+    var cap = Capture{ .is_get = true, .buf = cbuf };
+    ctx.agent.capture.store(&cap, .release);
+    defer ctx.agent.capture.store(null, .release);
+
+    var hdr: [4096]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "__GET__ {s}\n", .{guestpath}) catch return reply(c, "ERR guest path too long\n");
+    if (!hostSendAll(ctx.vsdev, id, h)) return reply(c, "ERR send failed\n");
+    if (!waitCapture(&cap) or cap.err) return reply(c, "ERR guest read failed (missing?)\n");
+    const body = cap.buf[cap.body_off..cap.expect];
+
+    var pb: [1024]u8 = undefined;
+    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
+    const O_WRONLY = 0x0001;
+    const O_CREAT = 0x0200;
+    const O_TRUNC = 0x0400;
+    const fd = libc.open(hp, O_WRONLY | O_CREAT | O_TRUNC, @as(c_int, 0o644));
+    if (fd < 0) return reply(c, "ERR cannot write host file\n");
+    defer _ = libc.close(fd);
+    if (!writeAll(fd, body)) return reply(c, "ERR write failed\n");
+    var ok: [128]u8 = undefined;
+    reply(c, std.fmt.bufPrint(&ok, "OK got {d} bytes -> {s}\n", .{ body.len, hostpath }) catch "OK\n");
+}
+
+fn reply(c: c_int, msg: []const u8) void {
+    _ = libc.write(c, msg.ptr, msg.len);
+}
 
 /// Send one command line to the guest agent (waiting for it to connect), counting
 /// it for metering. The `__stats__` line is intercepted here and answered by the
@@ -391,6 +550,18 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     while (id < 0) {
         _ = usleep(50_000);
         id = ctx.agent.conn_id.load(.acquire);
+    }
+    // File transfer (host-mediated): the bytes move over vsock with length framing,
+    // never through this line-oriented socket, so payloads can be binary/large.
+    if (std.mem.startsWith(u8, line, "__put__ ")) {
+        controlPut(ctx, c, @intCast(id), line["__put__ ".len..]);
+        _ = ctx.meter.commands.fetchAdd(1, .release);
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "__get__ ")) {
+        controlGet(ctx, c, @intCast(id), line["__get__ ".len..]);
+        _ = ctx.meter.commands.fetchAdd(1, .release);
+        return;
     }
     _ = ctx.vsdev.hostSend(@intCast(id), line);
     _ = ctx.meter.commands.fetchAdd(1, .release);
@@ -962,7 +1133,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0] };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});

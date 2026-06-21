@@ -29,9 +29,12 @@ const trace = @import("trace.zig");
 pub const HOST_CID: u64 = 2;
 pub const HDR_LEN = 44;
 
-/// Per-packet payload cap. The guest posts RX buffers at least this large, so
-/// one staged packet maps to one RX descriptor chain.
-pub const MAX_PAYLOAD = 4096;
+/// Per-packet payload cap. A staged packet (HDR_LEN + payload) must fit in ONE
+/// guest RX descriptor chain, or `scatter` truncates it and the guest drops the
+/// short packet (which silently stalled multi-packet transfers). The Linux guest's
+/// virtio-vsock RX buffers were measured at 3776 bytes of writable capacity, so
+/// keep HDR_LEN + MAX_PAYLOAD comfortably under that.
+pub const MAX_PAYLOAD = 3072;
 const PKT_CAP = HDR_LEN + MAX_PAYLOAD;
 
 /// Outbound staging ring depth and connection table size. Fixed pools (no
@@ -41,7 +44,18 @@ pub const MAX_CONNS = 64;
 const MAX_LISTEN = 16;
 
 /// Buffer space we advertise to the guest for each connection (our RX window).
-const DEFAULT_BUF_ALLOC: u32 = 64 * 1024;
+/// We consume guest->host payload synchronously (the event handler copies it out
+/// immediately), so this window is effectively unbounded; we advertise a large
+/// value so a big single transfer (a __get__ artifact pull) never stalls waiting
+/// for a per-packet credit update to make it back through the RX ring.
+const DEFAULT_BUF_ALLOC: u32 = 32 * 1024 * 1024;
+
+/// Largest guest->host packet we accept whole. The guest may coalesce its stream
+/// into packets up to VIRTIO_VSOCK_MAX_PKT_BUF_SIZE (64 KiB), independent of our
+/// (smaller) host->guest MAX_PAYLOAD. The RX scratch must hold one such packet or
+/// `gather` would truncate it and silently lose bytes mid-stream.
+const RX_MAX_PAYLOAD = 64 * 1024;
+const RX_PKT_CAP = HDR_LEN + RX_MAX_PAYLOAD;
 
 pub const Type = struct {
     pub const STREAM: u16 = 1;
@@ -199,9 +213,8 @@ pub const Vsock = struct {
             return;
         }
         const payload = blk: {
-            const want = @min(h.len, MAX_PAYLOAD);
-            const avail = pkt.len - HDR_LEN;
-            break :blk pkt[HDR_LEN..][0..@min(want, avail)];
+            const avail = pkt.len - HDR_LEN; // bounded by RX scratch (RX_PKT_CAP)
+            break :blk pkt[HDR_LEN..][0..@min(@as(usize, h.len), avail)];
         };
         switch (h.op) {
             Op.REQUEST => self.onRequest(h),
@@ -471,7 +484,7 @@ pub const VsockDev = struct {
     dev: *virtio.Device = undefined,
     attached: bool = false,
     lock: Lock = .{},
-    scratch: [PKT_CAP]u8 = undefined, // a guest TX chain gathered contiguously
+    scratch: [RX_PKT_CAP]u8 = undefined, // a guest TX chain gathered contiguously (RX direction)
 
     pub fn backend(self: *VsockDev) virtio.Backend {
         return .{
