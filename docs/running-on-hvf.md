@@ -97,17 +97,24 @@ mkdir -p lv && tar -xzf linux-virt-$V.apk -C lv 2>/dev/null
 off=$(($(od -An -tu4 -j8  -N4 lv/boot/vmlinuz-virt)))
 len=$(($(od -An -tu4 -j12 -N4 lv/boot/vmlinuz-virt)))
 tail -c +$((off+1)) lv/boot/vmlinuz-virt | head -c "$len" | gunzip > kernels/Image
-# add the leaf modules (modules are gzipped .ko.gz; insmod needs them decompressed)
-M=lv/lib/modules/$MV/kernel
-for ko in drivers/block/virtio_blk net/vmw_vsock/vsock \
-          net/vmw_vsock/vmw_vsock_virtio_transport_common \
-          net/vmw_vsock/vmw_vsock_virtio_transport; do
-  gunzip -c "$M/$ko.ko.gz" > "rootfs/$(basename $ko).ko"
-done
-# the static vsock client (busybox has no vsock tool):
+# install the WHOLE modules tree (with modules.dep) so the guest can `modprobe`
+# by name and have deps resolved (virtio_net pulls net_failover+failover; the
+# vsock transport pulls its common+core). The core virtio/virtio_pci/virtio_ring
+# are built into the kernel; only the higher-level drivers are modules.
+rm -rf rootfs/lib/modules && mkdir -p rootfs/lib/modules
+cp -R lv/lib/modules/$MV rootfs/lib/modules/
+# the persistent guest agent (exec-over-vsock) and the static vsock test client:
+zig cc -target aarch64-linux-musl -static -O2 tools/agent.c        -o rootfs/agent
 zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vsock_client
-( cd rootfs && find . | cpio -o -H newc --quiet | gzip ) > kernels/initramfs.cpio.gz
+( cd rootfs && find . | cpio -o -H newc --quiet | gzip -9 ) > kernels/initramfs.cpio.gz
 ```
+
+`rootfs/init` then brings the sandbox up automatically on every boot: it
+`modprobe`s `virtio_net` and `vmw_vsock_virtio_transport`, statically configures
+the first non-loopback interface with the slirp plan (`10.0.2.15/24`, gw
+`10.0.2.2`, DNS `10.0.2.3`), and starts `/agent`. So `net`, `vsock` and the agent
+need no manual module loading; the `insmod` examples below are only for poking at
+the datapaths by hand.
 
 - **virtio-blk** (`0:2.0`, in-memory disk): `insmod /virtio_blk.ko` -> `/dev/vda`
   (2048 512-byte sectors); `head -c 26 /dev/vda` reads back the
@@ -163,6 +170,20 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
     ```sh
     wget -O- http://example.com       # -> the actual page body
     ```
+  - **Egress firewall** (govern): by default an untrusted sandbox may reach the
+    public internet but not the host LAN, loopback, link-local, or cloud metadata
+    (169.254.169.254). A blocked TCP connect is RST (fast "connection refused"); a
+    blocked UDP datagram is dropped. Tunables in `nether.conf`:
+    ```ini
+    net_open  = 1                 # disable the firewall (trusted/open mode)
+    net_allow = 10.0.5.0/24,1.2.3.4/32   # allow exceptions (override default-deny)
+    net_block = 13.0.0.0/8        # deny otherwise-public destinations
+    ```
+    ```sh
+    wget -O- http://example.com   # allowed (public)
+    wget http://192.168.1.2/      # -> "Connection refused" (RST from the firewall)
+    ```
+    Denied attempts are counted as `net_blocked` in the `__stats__` report.
 
 ## How the Linux boot works
 

@@ -380,6 +380,25 @@ The build-out arc (offline-first chunks):
      host-measurable billing dimension. Proven: a `wget http://example.com` over the
      control socket moves the counters to `net_tx_bytes=145 net_rx_bytes=1014` (DHCP
      stays 0, as it is handled internally, not NAT'd).
+   - **Egress firewall (DONE) - the govern pillar.** An untrusted agent with
+     internet must not reach the host LAN, loopback, or cloud metadata
+     (169.254.169.254), and should be confinable to an allowlist. slirp's
+     `egressAllowed` denies special-use ranges by default (0/8, 10/8, 100.64/10,
+     127/8, 169.254/16, 172.16/12, 192.168/16, multicast, reserved) and permits the
+     public internet; `net_allow` CIDRs override the default-deny, `net_block` CIDRs
+     deny otherwise-public destinations, and `net_open=1` disables it. Enforced at
+     TCP connect (blocked SYN -> RST, fast connection-refused) and UDP send (drop);
+     denied attempts metered as `net_blocked`. Unit-tested (deny/allow/block/parse)
+     and proven live: guest fetches http://example.com (allowed), is refused on
+     http://192.168.1.2 with a RST, `__stats__` shows `net_blocked=1`.
+   - **Guest image: net/vsock/agent restored (DONE).** The initramfs had been
+     stripped of kernel modules (no `virtio_net` -> no eth0 -> no networking, and no
+     vsock). Rebuilt `kernels/initramfs.cpio.gz` from the matched `linux-virt`
+     `6.12.93-0-virt` apk: the full `/lib/modules` tree (so `modprobe` resolves
+     deps), the static `agent`, and an `init` that loads `virtio_net` + the vsock
+     transport, configures eth0 to the slirp plan, and starts the agent. Net, vsock
+     and the agent now come up automatically on every boot (procedure in
+     docs/running-on-hvf.md; `kernels/` is a local, git-ignored build asset).
    - **NAT idle reaper (DONE).** A long-running untrusted sandbox could exhaust the
      fixed 32-slot TCP/UDP NAT tables with abandoned or half-open connections. The
      poll loop now reaps entries idle past per-state thresholds (connecting 10 s,
