@@ -662,9 +662,17 @@ fn macMain() !void {
 
     nether.trace.init();
 
-    // A `nether-restore` marker forks a guest from nether.snap instead of booting.
+    // A `nether-restore` marker forks a guest from a snapshot instead of booting.
+    // `restore_from=<path>` in nether.conf selects the base image (defaults to
+    // nether.snap), so the platform can pre-bake several base snapshots
+    // (python-base.snap, node-base.snap, ...) and fork the right one per sandbox.
     if (modeOn("restore", "nether-restore")) {
-        try macRestore(allocator, "nether.snap");
+        var path_buf: [1024]u8 = undefined;
+        const path: [*:0]const u8 = if (confGet("restore_from", &path_buf)) |p|
+            @ptrCast(p.ptr)
+        else
+            "nether.snap";
+        try macRestore(allocator, path);
         return;
     }
 

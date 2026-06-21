@@ -396,6 +396,27 @@ The build-out arc (offline-first chunks):
      metric needs a different signal (e.g. periodic forced vCPU exits to sample, or a
      future framework counter); bandwidth + uptime + command count are the working
      billing dimensions for now.
+   - **Configurable base image (`restore_from`) (DONE).** `restore_from=<path>` in
+     nether.conf selects which snapshot a restore forks from (default `nether.snap`),
+     so the platform can pre-bake several base snapshots (python-base.snap,
+     node-base.snap, ...) and fork the right one per sandbox. Proven: snapshot,
+     rename to `base-a.snap`, restore with `restore_from=base-a.snap` (default
+     absent) -> responsive forked guest.
+   - **Cross-process restore is single-vCPU-reliable; SMP fork needs a safe-point
+     capture (finding).** A 1-CPU base restores cleanly 6/6 across on-disk gaps of
+     2-32 s (every fork shell-responsive); a 4-CPU base panics in the guest's hrtimer
+     rbtree (`rb_erase` <- `hrtimer_interrupt`) DETERMINISTICALLY per capture (a bad
+     snapshot panics 6/6, a good one survives - fixed by the capture instant, not the
+     gap). Root cause: `quiesce` forces vCPUs out of `hv_vcpu_run` at arbitrary PCs,
+     so an SMP capture can freeze the guest mid-update of a shared kernel structure.
+     Workaround now: bake base images with `cpus=1`. Fix later: capture only when all
+     vCPUs are parked at WFI/idle. (A CNTVOFF_EL2 rebase theory was investigated and
+     reverted - inert: HVF manages the vtimer offset itself.)
+   - **NAT throughput is not poll-limited (finding).** A guest fetch of a 20 MB
+     host-local file clocks ~69 MB/s via the NAT; internet fetches match host `curl`
+     (network-limited). The near-zero in-process RTT keeps the guest's ACKs flowing so
+     the TCP window stays open and `poll` returns immediately. An adaptive 5ms/200ms
+     poll was A/B'd (0.28 s vs 0.29 s for 20 MB - identical) and reverted; no fix needed.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come
