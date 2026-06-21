@@ -135,7 +135,9 @@ docs/references/   ghostty-patterns (embeddable-core / concurrency inspiration)
 
 ## Toolchain
 
-Targets **Zig 0.16.0 stable**. Note that the API diverges across 0.16 dev
-nightlies (e.g. `std.os.linux.PROT` shape, `std.Thread.Mutex` location), so a
-nightly in `PATH` will fail to build. Pin `zig` to a 0.16.0 stable install. See
-[`docs/bringup-notes.md`](docs/bringup-notes.md) ("Pin the stable toolchain").
+Targets **Zig 0.16.0 stable**, and also builds clean on recent 0.16 dev
+nightlies (verified on `0.16.0-dev.2135`) - the std-API churn that used to break
+nightlies (notably `std.atomic.Mutex`, which moved/disappeared) has been removed
+from the codebase: the per-device lock is now a plain `std.atomic.Value` spinlock
+(`src/lock.zig`). Pinning `zig` to a 0.16.0 stable install is still recommended for
+reproducibility. See [`docs/bringup-notes.md`](docs/bringup-notes.md).

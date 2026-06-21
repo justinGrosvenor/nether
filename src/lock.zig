@@ -1,29 +1,35 @@
-//! A minimal blocking spinlock. Stable Zig 0.16's only freestanding mutex
-//! (`std.atomic.Mutex`) exposes `tryLock`/`unlock` but no blocking acquire, and
-//! `std.Io.Mutex` needs an `Io` we do not thread through device models. Every
-//! critical section guarded by this is a handful of field writes (RX FIFO push,
-//! redirection-entry read), so spinning is the right shape: contention is rare
-//! and held for nanoseconds. This is the concretion of the D3 per-device lock.
+//! A minimal blocking spinlock built directly on `std.atomic.Value`, so it does
+//! not depend on a particular Zig std mutex type (the freestanding mutex surface
+//! has churned across 0.16 builds - `std.atomic.Mutex` exists in some and not
+//! others, which made the toolchain contract brittle). `std.atomic.Value` and its
+//! cmpxchg/spinLoopHint are stable. Every critical section guarded by this is a
+//! handful of field writes (RX FIFO push, redirection-entry read), so spinning is
+//! the right shape: contention is rare and held for nanoseconds. This is the
+//! concretion of the D3 per-device lock.
 
 const std = @import("std");
 
 pub const Lock = struct {
-    inner: std.atomic.Mutex = .unlocked,
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // 0 = free, 1 = held
+
+    pub fn tryLock(self: *Lock) bool {
+        return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
 
     pub fn lock(self: *Lock) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     }
 
     pub fn unlock(self: *Lock) void {
-        self.inner.unlock();
+        self.state.store(0, .release);
     }
 };
 
 test "lock excludes then releases" {
     var l = Lock{};
     l.lock();
-    try std.testing.expect(!l.inner.tryLock()); // held
+    try std.testing.expect(!l.tryLock()); // held
     l.unlock();
-    try std.testing.expect(l.inner.tryLock()); // free again
-    l.inner.unlock();
+    try std.testing.expect(l.tryLock()); // free again
+    l.unlock();
 }

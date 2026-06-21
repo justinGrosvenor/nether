@@ -78,7 +78,11 @@ pub const Blk = struct {
 
         var ok = true;
         var data_written: u32 = 0;
-        var off: usize = @intCast(sector * SECTOR);
+        const cap: u64 = self.disk.len;
+        // The sector is guest-controlled: compute the byte offset with an overflow
+        // check (sector*512 can wrap u64, or trap in safe builds). On overflow we
+        // park `off` past capacity so every bounds check below fails -> S_IOERR.
+        var off: u64 = std.math.mul(u64, sector, SECTOR) catch std.math.maxInt(u64);
 
         switch (req_type) {
             T_IN => for (bufs[1 .. n - 1]) |d| {
@@ -86,24 +90,27 @@ pub const Blk = struct {
                     ok = false;
                     break;
                 };
-                if (off + d.len <= self.disk.len) {
-                    @memcpy(dst, self.disk[off .. off + d.len]);
-                    data_written += d.len;
+                // Overflow-safe: never compute off+d.len; check against room left.
+                if (off <= cap and d.len <= cap - off) {
+                    const o: usize = @intCast(off);
+                    @memcpy(dst, self.disk[o..][0..d.len]);
+                    data_written +|= d.len;
                 } else {
                     @memset(dst, 0);
                     ok = false;
                 }
-                off += d.len;
+                off +|= d.len;
             },
             T_OUT => for (bufs[1 .. n - 1]) |d| {
                 const src = mem.slice(d.addr, d.len) orelse {
                     ok = false;
                     break;
                 };
-                if (off + d.len <= self.disk.len) {
-                    @memcpy(self.disk[off .. off + d.len], src);
+                if (off <= cap and d.len <= cap - off) {
+                    const o: usize = @intCast(off);
+                    @memcpy(self.disk[o..][0..d.len], src);
                 } else ok = false;
-                off += d.len;
+                off +|= d.len;
             },
             T_GET_ID => for (bufs[1 .. n - 1]) |d| {
                 const dst = mem.slice(d.addr, d.len) orelse {
@@ -114,7 +121,7 @@ pub const Blk = struct {
                 const m = @min(dst.len, id.len);
                 @memcpy(dst[0..m], id[0..m]);
                 if (dst.len > m) @memset(dst[m..], 0);
-                data_written += @intCast(dst.len);
+                data_written +|= @intCast(@min(dst.len, std.math.maxInt(u32)));
             },
             T_FLUSH => {}, // backing store is memory; nothing to flush
             else => ok = false,
@@ -122,7 +129,7 @@ pub const Blk = struct {
 
         if (mem.slice(status.addr, 1)) |s| s[0] = if (ok) S_OK else S_IOERR;
         trace.log("blk type={d} sector={d} bufs={d} written={d} ok={}", .{ req_type, sector, n, data_written, ok });
-        return data_written + 1; // device-written bytes: data + status
+        return data_written +| 1; // device-written bytes: data + status
     }
 };
 
@@ -195,4 +202,52 @@ fn writeDesc(buf: []u8, idx: usize, addr: u64, len: u32, flags: u16, nxt: u16) v
     std.mem.writeInt(u32, buf[a + 8 ..][0..4], len, .little);
     std.mem.writeInt(u16, buf[a + 12 ..][0..2], flags, .little);
     std.mem.writeInt(u16, buf[a + 14 ..][0..2], nxt, .little);
+}
+
+test "blk rejects an overflowing sector without crashing" {
+    var disk = [_]u8{0} ** 2048;
+    var ram = [_]u8{0} ** 4096;
+    var blk = Blk{ .disk = &disk };
+    var dev = virtio.Device.init(blk.backend(), .{ .bytes = &ram, .base = 0 });
+
+    dev.barWrite(0x16, 2, 0); // queue_select 0
+    dev.barWrite(0x18, 2, 8); // queue_size
+    dev.barWrite(0x20, 4, 0x0); // desc
+    dev.barWrite(0x28, 4, 0x100); // avail
+    dev.barWrite(0x30, 4, 0x200); // used
+    dev.barWrite(0x1c, 2, 1); // enable
+
+    writeDesc(&ram, 0, 0x400, 16, virtq.DESC_F_NEXT, 1);
+    writeDesc(&ram, 1, 0x600, 512, virtq.DESC_F_NEXT | virtq.DESC_F_WRITE, 2);
+    writeDesc(&ram, 2, 0x900, 1, virtq.DESC_F_WRITE, 0);
+    std.mem.writeInt(u32, ram[0x400..][0..4], 0, .little); // type=IN
+    std.mem.writeInt(u64, ram[0x408..][0..8], 0xFFFF_FFFF_FFFF_FFFF, .little); // sector*512 overflows u64
+    std.mem.writeInt(u16, ram[0x102..][0..2], 1, .little); // avail.idx
+    std.mem.writeInt(u16, ram[0x104..][0..2], 0, .little); // ring[0]=desc0
+
+    dev.barWrite(0x2000, 4, 0); // kick - must not panic
+    try std.testing.expectEqual(@as(u8, 1), ram[0x900]); // S_IOERR, request rejected
+}
+
+test "virtio refuses invalid queue sizes" {
+    var disk = [_]u8{0} ** 512;
+    var ram = [_]u8{0} ** 1024;
+    var blk = Blk{ .disk = &disk };
+    var dev = virtio.Device.init(blk.backend(), .{ .bytes = &ram, .base = 0 });
+    dev.barWrite(0x16, 2, 0); // queue_select 0
+
+    dev.barWrite(0x18, 2, 0); // size 0 -> rejected (parked at 0)
+    try std.testing.expectEqual(@as(u16, 0), dev.queue(0).size);
+    dev.barWrite(0x1c, 2, 1); // enable refused while size invalid
+    try std.testing.expectEqual(@as(u32, 0), dev.barRead(0x1c, 2));
+
+    dev.barWrite(0x18, 2, 3); // non-power-of-2 -> rejected
+    try std.testing.expectEqual(@as(u16, 0), dev.queue(0).size);
+    dev.barWrite(0x18, 2, 1024); // above max -> rejected
+    try std.testing.expectEqual(@as(u16, 0), dev.queue(0).size);
+
+    dev.barWrite(0x18, 2, 8); // valid power-of-2
+    try std.testing.expectEqual(@as(u16, 8), dev.queue(0).size);
+    dev.barWrite(0x1c, 2, 1); // now enable succeeds
+    try std.testing.expectEqual(@as(u32, 1), dev.barRead(0x1c, 2));
 }

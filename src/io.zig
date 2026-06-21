@@ -42,8 +42,16 @@ pub const Bus = struct {
     mmio: [max_mmio]MmioDevice = undefined,
     mmio_count: usize = 0,
     /// Serializes device dispatch so concurrent vCPU threads (SMP) cannot race on
-    /// device state. Device handlers are non-blocking, so a single coarse lock is
-    /// fine; host I/O threads that drive a device directly take its own lock.
+    /// device state. It is held across the whole handler, not just the lookup,
+    /// BECAUSE the device models are not individually thread-safe: a malicious guest
+    /// could otherwise hammer one device from several vCPUs at once and corrupt its
+    /// state. The known cost is that a handler which performs host I/O (a virtio
+    /// notify that drives net TX does a `send`) holds this lock across that syscall,
+    /// briefly serializing unrelated device access on other vCPUs. That is a
+    /// scalability limit, not a safety bug. The fix when it matters is per-device
+    /// locking (then this drops to a lookup-only lock), tracked as a govern/SMP
+    /// follow-up. Host I/O threads that drive a device directly take the device's
+    /// own lock (e.g. the virtio-net RX path), not this one.
     lock: Lock = .{},
 
     pub fn addPio(self: *Bus, dev: PioDevice) error{BusFull}!void {

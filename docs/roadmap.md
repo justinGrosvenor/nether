@@ -398,6 +398,22 @@ The build-out arc (offline-first chunks):
      slows the sender (lossless, no drops); burst ~250 ms smooths it. Unit-tested
      (refill/cap math, kbps->bytes) and proven live: a 4 MB fetch is ~2 s uncapped,
      ~9 s at 4000 kbps (500 KB/s), ~17 s at 2000 kbps - proportional and matching.
+   - **Hardening pass: guest cannot panic the host (DONE).** Malformed guest input
+     is the VMM threat model, so a focused pass closed the guest-reachable panics an
+     external review found: (1) a guest-set virtqueue size of 0 divided-by-zero in
+     the ring-index modulo - now `virtq.next`/`complete` guard size 0 and
+     `virtio.zig` only accepts/enables a nonzero power-of-2 size <= 256; (2)
+     guest-influenced address math could overflow/trap - `GuestMem.slice` is now
+     overflow-safe (compares against room left, never `off+len`), and `virtio_blk`
+     computes `sector*512` with `std.math.mul` and uses saturating adds + room-left
+     bounds; (3) the toolchain contract was brittle - `lock.zig` dropped the
+     version-volatile `std.atomic.Mutex` for a plain `std.atomic.Value` spinlock, so
+     the tree builds on both 0.16.0 stable and recent dev nightlies. New tests cover
+     size-0 queues, overflowing slices, an overflowing blk sector, and invalid queue
+     sizes (164 total). The coarse bus lock (held across handlers) is documented as
+     an intentional safety choice - device models aren't individually thread-safe, so
+     it serializes possibly-malicious concurrent vCPU access; per-device locking is
+     the scalability follow-up (see io.zig).
    - **Guest image: net/vsock/agent restored (DONE).** The initramfs had been
      stripped of kernel modules (no `virtio_net` -> no eth0 -> no networking, and no
      vsock). Rebuilt `kernels/initramfs.cpio.gz` from the matched `linux-virt`

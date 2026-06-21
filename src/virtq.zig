@@ -19,7 +19,9 @@ pub const GuestMem = struct {
     pub fn slice(self: GuestMem, gpa: u64, len: usize) ?[]u8 {
         if (gpa < self.base) return null;
         const off = gpa - self.base;
-        if (off + len > self.bytes.len) return null;
+        // Overflow-safe bound: a guest can make `gpa` (hence `off`) huge, so never
+        // compute off+len (it could wrap past the end). Compare against the room left.
+        if (off > self.bytes.len or len > self.bytes.len - off) return null;
         return self.bytes[@intCast(off)..][0..len];
     }
     fn r16(self: GuestMem, gpa: u64) u16 {
@@ -68,6 +70,7 @@ pub const Virtqueue = struct {
 
     /// Pop the head descriptor index of the next available chain, or null.
     pub fn next(self: *Virtqueue, m: GuestMem) ?u16 {
+        if (self.size == 0) return null; // guest may set size 0; never modulo by it
         if (!self.hasNext(m)) return null;
         const slot = self.last_avail % self.size;
         const head = m.r16(self.avail + 4 + @as(u64, slot) * 2);
@@ -86,6 +89,7 @@ pub const Virtqueue = struct {
 
     /// Publish a completed chain (head index, bytes written) to the used ring.
     pub fn complete(self: *Virtqueue, m: GuestMem, head: u16, written: u32) void {
+        if (self.size == 0) return; // never modulo by a guest-chosen zero size
         const slot = self.used_idx % self.size;
         const r = self.used + 4 + @as(u64, slot) * 8;
         m.w32(r, head); // used elem id
@@ -182,4 +186,23 @@ test "out-of-range guest access is rejected" {
     try std.testing.expect(m.slice(0x1000, 65) == null); // past end
     try std.testing.expect(m.slice(0x0, 8) == null); // below base
     try std.testing.expect(m.slice(0x100000, 8) == null); // far above
+}
+
+test "size-0 queue never divides by zero" {
+    var ram = [_]u8{0} ** 256;
+    const m = GuestMem{ .bytes = &ram, .base = 0 };
+    // A malicious guest leaves size 0 but advertises an available chain.
+    std.mem.writeInt(u16, ram[0x40 + 2 ..][0..2], 1, .little); // avail.idx = 1
+    var vq = Virtqueue{ .size = 0, .desc = 0, .avail = 0x40, .used = 0x80 };
+    try std.testing.expect(vq.next(m) == null); // guarded: no %0 panic
+    vq.complete(m, 0, 0); // no-op: no %0 panic
+}
+
+test "slice rejects overflowing gpa/len instead of wrapping" {
+    var ram = [_]u8{0} ** 64;
+    const m = GuestMem{ .bytes = &ram, .base = 0 };
+    try std.testing.expect(m.slice(0xFFFF_FFFF_FFFF_FFF0, 64) == null); // off huge
+    try std.testing.expect(m.slice(0, std.math.maxInt(usize)) == null); // len huge
+    try std.testing.expect(m.slice(60, 8) == null); // off+len would exceed end
+    try std.testing.expect(m.slice(56, 8) != null); // exactly fits
 }

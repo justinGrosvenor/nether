@@ -144,6 +144,17 @@ pub const Device = struct {
         return @min(self.queue_select, max_queues - 1);
     }
 
+    /// Largest queue the device advertises (also the reset default). A driver may
+    /// negotiate any power-of-2 down from here.
+    pub const QUEUE_SIZE_MAX: u16 = 256;
+
+    /// virtio requires a queue size that is a nonzero power of two within the
+    /// advertised max. Anything else (notably 0) must never reach the virtq code,
+    /// where it would divide-by-zero on the ring-index modulo.
+    fn validQueueSize(sz: u16) bool {
+        return sz != 0 and sz <= QUEUE_SIZE_MAX and (sz & (sz - 1)) == 0;
+    }
+
     pub fn queue(self: *Device, i: u16) *virtq.Virtqueue {
         return &self.queues[@min(i, max_queues - 1)];
     }
@@ -395,10 +406,18 @@ pub const Device = struct {
                 }
             },
             0x16 => self.queue_select = @truncate(value),
-            0x18 => self.queues[s].size = @truncate(value),
+            // Only accept a valid (nonzero power-of-2, in-range) queue size; an
+            // invalid size is parked at 0 so the queue stays inert and can't be
+            // driven into the virtq ring math.
+            0x18 => {
+                const sz: u16 = @truncate(value);
+                self.queues[s].size = if (validQueueSize(sz)) sz else 0;
+            },
             0x1a => self.queue_vector[s] = @truncate(value),
             0x1c => {
-                self.qenable[s] = value & 1 != 0;
+                // Refuse to enable a queue whose size isn't valid (defense in depth
+                // with the 0x18 check, so notify never drives a malformed queue).
+                self.qenable[s] = (value & 1 != 0) and validQueueSize(self.queues[s].size);
                 if (self.qenable[s]) trace.log("queue[{d}] enable size={d} desc=0x{x} avail=0x{x} used=0x{x} vec={d}", .{ s, self.queues[s].size, self.queues[s].desc, self.queues[s].avail, self.queues[s].used, self.queue_vector[s] });
             },
             0x20 => self.queues[s].desc = (self.queues[s].desc & 0xffffffff_00000000) | value,
