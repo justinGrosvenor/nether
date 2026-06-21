@@ -1445,10 +1445,11 @@ fn confGetInt(key: []const u8, default: u64) u64 {
     return default;
 }
 
-const timeval = extern struct { sec: i64, usec: i64 };
+// macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
+const timeval = extern struct { sec: i64, usec: i32 };
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
 fn nowMs() i64 {
-    var tv: timeval = undefined;
+    var tv: timeval = .{ .sec = 0, .usec = 0 };
     _ = gettimeofday(&tv, null);
     return tv.sec * 1000 + @divTrunc(tv.usec, 1000);
 }

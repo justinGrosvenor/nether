@@ -375,6 +375,14 @@ The build-out arc (offline-first chunks):
      host-measurable billing dimension. Proven: a `wget http://example.com` over the
      control socket moves the counters to `net_tx_bytes=145 net_rx_bytes=1014` (DHCP
      stays 0, as it is handled internally, not NAT'd).
+   - **NAT idle reaper (DONE).** A long-running untrusted sandbox could exhaust the
+     fixed 32-slot TCP/UDP NAT tables with abandoned or half-open connections. The
+     poll loop now reaps entries idle past per-state thresholds (connecting 10 s,
+     closing 10 s, established 5 min, UDP flow 1 min): each entry stamps `last_ms`
+     on activity and `reapStale` frees the rest. Unit-tested; live wget unaffected.
+     (Fixed a latent bug found here: the `timeval` struct had `usec` as i64 but
+     macOS `suseconds_t` is i32, so `nowMs` read stack garbage - it had only
+     "worked" for the metering uptime by luck of a zeroed stack.)
    - **Compute metering: not feasible with `hv_vcpu_get_exec_time` (finding).** That
      API does not count long *native* guest runs - guest code executes directly on
      the host core under HVF, and a compute-bound loop takes few VM exits, so the

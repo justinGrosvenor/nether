@@ -49,6 +49,21 @@ const sock = struct {
     extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
 };
 
+// macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
+const timeval = extern struct { sec: i64, usec: i32 };
+extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
+fn nowMs() u64 {
+    var tv: timeval = .{ .sec = 0, .usec = 0 };
+    _ = gettimeofday(&tv, null);
+    return @intCast(tv.sec * 1000 + @divTrunc(tv.usec, 1000));
+}
+// Idle reap thresholds (ms): stale NAT entries are freed so a long-running
+// sandbox can't exhaust the fixed tables with abandoned/half-open connections.
+const REAP_CONNECTING_MS: u64 = 10_000; // host connect never completed
+const REAP_CLOSING_MS: u64 = 10_000; // FIN sent, peer never finished the close
+const REAP_ESTABLISHED_MS: u64 = 300_000; // idle established conn (5 min)
+const REAP_UDP_MS: u64 = 60_000; // idle UDP flow (1 min)
+
 const ETH_HDR = 14;
 const ETHERTYPE_ARP = 0x0806;
 const ETHERTYPE_IPV4 = 0x0800;
@@ -78,6 +93,7 @@ const TcpConn = struct {
     guest_mss: u16 = 1460,
     guest_fin: bool = false,
     fin_sent: bool = false,
+    last_ms: u64 = 0, // last activity, for the idle reaper
 };
 
 const MAX_UDP = 32;
@@ -90,6 +106,7 @@ const UdpFlow = struct {
     /// socket talks to upstream_dns.
     seen_ip: [4]u8 = .{ 0, 0, 0, 0 },
     seen_port: u16 = 0,
+    last_ms: u64 = 0, // last activity, for the idle reaper
 };
 
 pub const Slirp = struct {
@@ -233,6 +250,7 @@ pub const Slirp = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const flow = self.udpFlow(sport, &dst_ip, dport) orelse return;
+        flow.last_ms = nowMs();
         if (flow.fd < 0) {
             const fd = sock.socket(sock.AF_INET, sock.SOCK_DGRAM, 0);
             if (fd < 0) return;
@@ -262,12 +280,34 @@ pub const Slirp = struct {
 
     /// Host thread: poll all NAT sockets (UDP flows + TCP conns) and move data
     /// between them and the guest. Returns after one poll cycle (caller loops).
+    /// Free NAT entries idle past their reap threshold so a long-running sandbox
+    /// can't exhaust the fixed tables with abandoned/half-open connections.
+    /// Caller holds the lock.
+    fn reapStale(self: *Slirp, now: u64) void {
+        for (&self.tcp) |*c| {
+            const limit: u64 = switch (c.state) {
+                .free => continue,
+                .connecting => REAP_CONNECTING_MS,
+                .closing => REAP_CLOSING_MS,
+                .established => REAP_ESTABLISHED_MS,
+            };
+            if (now -% c.last_ms > limit) self.tcpClose(c);
+        }
+        for (&self.udp) |*f| {
+            if (f.used and now -% f.last_ms > REAP_UDP_MS) {
+                if (f.fd >= 0) _ = sock.close(f.fd);
+                f.* = .{};
+            }
+        }
+    }
+
     pub fn pollOnce(self: *Slirp, timeout_ms: i32) void {
         const N = MAX_UDP + MAX_TCP;
         var fds: [N]sock.pollfd = undefined;
         var tag: [N]u32 = undefined; // bit 31 = TCP; low bits = table index
         var n: u32 = 0;
         self.lock.lock();
+        self.reapStale(nowMs());
         for (&self.udp, 0..) |*f, i| {
             if (f.used and f.fd >= 0) {
                 fds[n] = .{ .fd = f.fd, .events = sock.POLLIN };
@@ -308,6 +348,7 @@ pub const Slirp = struct {
         self.lock.lock();
         const f = &self.udp[i];
         const got = if (f.used and f.fd >= 0) sock.recv(f.fd, self.poll_scratch[0..1500].ptr, 1500, 0) else -1;
+        if (got > 0) f.last_ms = nowMs();
         const sip = f.seen_ip;
         const sport = f.seen_port;
         const gport = f.guest_port;
@@ -321,6 +362,7 @@ pub const Slirp = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const c = &self.tcp[i];
+        c.last_ms = nowMs();
         if (c.state == .connecting) {
             var err: c_int = 0;
             var len: u32 = 4;
@@ -387,6 +429,7 @@ pub const Slirp = struct {
             return; // SYN-ACK is sent from the poll loop once the host connect completes
         }
         const c = conn.?;
+        c.last_ms = nowMs();
         if (flags & TH_ACK != 0 and seqGt(ack, c.snd_una)) c.snd_una = ack;
         c.guest_win = win;
 
@@ -441,6 +484,7 @@ pub const Slirp = struct {
             .rcv_nxt = guest_isn +% 1,
             .guest_win = win,
             .guest_mss = parseMss(opts),
+            .last_ms = nowMs(),
         };
         return c;
     }
@@ -786,6 +830,17 @@ test "DHCP DISCOVER yields an OFFER with the guest address and options" {
     try testing.expectEqualSlices(u8, &s.guest_ip, obootp[16..20]); // yiaddr
     try testing.expectEqual(@as(u8, 53), obootp[240]);
     try testing.expectEqual(@as(u8, 2), obootp[242]); // OFFER
+}
+
+test "reaper frees stale NAT entries and keeps fresh ones" {
+    var s = Slirp{};
+    s.tcp[0] = .{ .state = .closing, .fd = -1, .last_ms = 0 }; // idle past threshold
+    s.tcp[1] = .{ .state = .established, .fd = -1, .last_ms = 1_000_000 }; // fresh
+    s.udp[0] = .{ .used = true, .fd = -1, .last_ms = 0 }; // stale flow
+    s.reapStale(1_000_001);
+    try testing.expectEqual(TcpState.free, s.tcp[0].state); // closing reaped
+    try testing.expectEqual(TcpState.established, s.tcp[1].state); // fresh kept
+    try testing.expect(!s.udp[0].used); // stale udp reaped
 }
 
 test "ICMP echo to the gateway is answered" {
