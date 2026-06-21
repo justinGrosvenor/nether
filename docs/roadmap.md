@@ -391,6 +391,13 @@ The build-out arc (offline-first chunks):
      denied attempts metered as `net_blocked`. Unit-tested (deny/allow/block/parse)
      and proven live: guest fetches http://example.com (allowed), is refused on
      http://192.168.1.2 with a RST, `__stats__` shows `net_blocked=1`.
+   - **Bandwidth cap (DONE) - govern.** `net_rate_kbps` token-bucket-limits the
+     download (internet->guest) rate, so an untrusted sandbox can't saturate the
+     host uplink or run up unbounded bandwidth cost (the metered dimension). When the
+     bucket empties the poll loop stops reading host sockets and TCP backpressure
+     slows the sender (lossless, no drops); burst ~250 ms smooths it. Unit-tested
+     (refill/cap math, kbps->bytes) and proven live: a 4 MB fetch is ~2 s uncapped,
+     ~9 s at 4000 kbps (500 KB/s), ~17 s at 2000 kbps - proportional and matching.
    - **Guest image: net/vsock/agent restored (DONE).** The initramfs had been
      stripped of kernel modules (no `virtio_net` -> no eth0 -> no networking, and no
      vsock). Rebuilt `kernels/initramfs.cpio.gz` from the matched `linux-virt`

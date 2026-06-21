@@ -196,6 +196,17 @@ pub const Slirp = struct {
     block_n: usize = 0,
     blocked_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // denied outbound attempts
 
+    // Download rate limit (govern): a token bucket capping how fast the poll thread
+    // injects internet->guest data, so an untrusted sandbox can't saturate the host
+    // uplink or run up unbounded bandwidth cost. When the bucket is empty the poll
+    // loop simply stops reading the host sockets, and TCP backpressure slows the
+    // sender (lossless). `rate_bps`=0 disables it. These fields are touched only on
+    // the poll thread (refill/consume) plus a one-time setup, so they need no lock.
+    rate_bps: u64 = 0, // bytes/sec; 0 = unlimited
+    rate_tokens: i64 = 0,
+    rate_burst: i64 = 0,
+    rate_last_ms: u64 = 0, // 0 = lazy-init the bucket on first refill
+
     /// Entry point: a raw Ethernet frame the guest transmitted.
     pub fn onGuestFrame(self: *Slirp, frame: []const u8) void {
         if (frame.len < ETH_HDR) return;
@@ -234,6 +245,41 @@ pub const Slirp = struct {
         self.block[self.block_n] = c;
         self.block_n += 1;
         return true;
+    }
+
+    /// Set the download cap in kilobits/sec (0 = unlimited). Burst tolerates ~250 ms
+    /// (>= 64 KiB) so the rate is smooth without stalling on a single window's read.
+    pub fn setRateKbps(self: *Slirp, kbps: u64) void {
+        self.rate_bps = kbps * 1000 / 8; // kilobits/s -> bytes/s
+        self.rate_burst = @intCast(@max(self.rate_bps / 4, 65536));
+        self.rate_tokens = self.rate_burst;
+        self.rate_last_ms = 0;
+    }
+
+    /// Refill the bucket for `dt_ms` elapsed and cap at `burst` (pure, for testing).
+    fn rateAdd(tokens: i64, burst: i64, dt_ms: u64, rate_bps: u64) i64 {
+        const add: i64 = @intCast(dt_ms * rate_bps / 1000);
+        return @min(tokens + add, burst);
+    }
+
+    /// Refill the token bucket and report whether downloads are currently throttled
+    /// (bucket empty). Poll-thread only.
+    fn rateThrottled(self: *Slirp) bool {
+        if (self.rate_bps == 0) return false;
+        const now = nowMs();
+        if (self.rate_last_ms == 0) {
+            self.rate_last_ms = now;
+            self.rate_tokens = self.rate_burst;
+        } else {
+            self.rate_tokens = rateAdd(self.rate_tokens, self.rate_burst, now - self.rate_last_ms, self.rate_bps);
+            self.rate_last_ms = now;
+        }
+        return self.rate_tokens <= 0;
+    }
+
+    /// Debit `n` injected bytes from the bucket (may go negative; repaid by refill).
+    fn rateConsume(self: *Slirp, n: usize) void {
+        if (self.rate_bps != 0) self.rate_tokens -= @intCast(n);
     }
 
     fn send(self: *Slirp, frame: []const u8) void {
@@ -397,10 +443,13 @@ pub const Slirp = struct {
         var fds: [N]sock.pollfd = undefined;
         var tag: [N]u32 = undefined; // bit 31 = TCP; low bits = table index
         var n: u32 = 0;
+        // Download token bucket: when empty, stop reading host sockets this round so
+        // the rate is capped (TCP backpressure slows the sender; no data is lost).
+        const limited = self.rateThrottled();
         self.lock.lock();
         self.reapStale(nowMs());
         for (&self.udp, 0..) |*f, i| {
-            if (f.used and f.fd >= 0) {
+            if (f.used and f.fd >= 0 and !limited) {
                 fds[n] = .{ .fd = f.fd, .events = sock.POLLIN };
                 tag[n] = @intCast(i);
                 n += 1;
@@ -410,9 +459,10 @@ pub const Slirp = struct {
             const ev: sock.pollfd = switch (c.state) {
                 .connecting => .{ .fd = c.fd, .events = sock.POLLOUT },
                 .established => blk: {
-                    // Only read from the host while the guest's window has room,
-                    // so a full window does not spin the poll loop.
-                    if (c.guest_win > (c.snd_nxt -% c.snd_una)) break :blk .{ .fd = c.fd, .events = sock.POLLIN };
+                    // Read from the host only while the guest's window has room and
+                    // the rate bucket has tokens, so neither a full window nor the
+                    // download cap spins the poll loop.
+                    if (!limited and c.guest_win > (c.snd_nxt -% c.snd_una)) break :blk .{ .fd = c.fd, .events = sock.POLLIN };
                     continue;
                 },
                 else => continue,
@@ -422,11 +472,14 @@ pub const Slirp = struct {
             n += 1;
         }
         self.lock.unlock();
+        // While throttled, wake promptly to resume once the bucket refills, instead
+        // of sleeping out the caller's (idle-tuned) timeout.
+        const eff_timeout = if (limited and timeout_ms > 20) 20 else timeout_ms;
         if (n == 0) {
-            _ = sock.poll(&fds, 0, timeout_ms);
+            _ = sock.poll(&fds, 0, eff_timeout);
             return;
         }
-        if (sock.poll(&fds, n, timeout_ms) <= 0) return;
+        if (sock.poll(&fds, n, eff_timeout) <= 0) return;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
             if (fds[k].revents == 0) continue;
@@ -446,6 +499,7 @@ pub const Slirp = struct {
         self.lock.unlock();
         if (got <= 0) return;
         _ = self.rx_bytes.fetchAdd(@intCast(got), .monotonic);
+        self.rateConsume(@intCast(got));
         self.injectUdpToGuest(&sip, sport, gport, self.poll_scratch[0..@intCast(got)]);
     }
 
@@ -479,6 +533,7 @@ pub const Slirp = struct {
                 self.tcpSend(c, c.snd_nxt, TH_PSH | TH_ACK, self.poll_scratch[0..@intCast(got)], null);
                 c.snd_nxt +%= @intCast(got);
                 _ = self.rx_bytes.fetchAdd(@intCast(got), .monotonic);
+                self.rateConsume(@intCast(got));
             } else if (got == 0) { // host EOF -> FIN to the guest
                 self.tcpSend(c, c.snd_nxt, TH_FIN | TH_ACK, &.{}, null);
                 c.snd_nxt +%= 1;
@@ -1006,4 +1061,26 @@ test "parseCidr handles prefixes and rejects garbage" {
     try testing.expect(parseCidr("1.2.3") == null);
     try testing.expect(parseCidr("1.2.3.4/33") == null);
     try testing.expect(parseCidr("x.y.z.w/8") == null);
+}
+
+test "rate limiter token bucket refills and caps at burst" {
+    const burst: i64 = 100_000;
+    const rate: u64 = 125_000; // bytes/sec (1 Mbit/s)
+    // 1 s of refill from empty is capped at the burst.
+    try testing.expectEqual(@as(i64, 100_000), Slirp.rateAdd(0, burst, 1000, rate));
+    // 200 ms adds 25_000 (under burst).
+    try testing.expectEqual(@as(i64, 25_000), Slirp.rateAdd(0, burst, 200, rate));
+    // Negative debt is repaid by refill: -10_000 + 25_000 = 15_000.
+    try testing.expectEqual(@as(i64, 15_000), Slirp.rateAdd(-10_000, burst, 200, rate));
+    // Zero elapsed adds nothing.
+    try testing.expectEqual(@as(i64, 42), Slirp.rateAdd(42, burst, 0, rate));
+}
+
+test "setRateKbps converts kilobits to bytes/sec and sizes the burst" {
+    var s: Slirp = .{};
+    s.setRateKbps(8000); // 8 Mbit/s
+    try testing.expectEqual(@as(u64, 1_000_000), s.rate_bps); // 8000*1000/8
+    try testing.expectEqual(@as(i64, 250_000), s.rate_burst); // rate_bps/4
+    s.setRateKbps(0);
+    try testing.expectEqual(@as(u64, 0), s.rate_bps); // disabled
 }

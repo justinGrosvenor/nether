@@ -178,12 +178,19 @@ the datapaths by hand.
     net_open  = 1                 # disable the firewall (trusted/open mode)
     net_allow = 10.0.5.0/24,1.2.3.4/32   # allow exceptions (override default-deny)
     net_block = 13.0.0.0/8        # deny otherwise-public destinations
+    net_rate_kbps = 4000          # cap the download rate (kilobits/s; 0 = unlimited)
     ```
     ```sh
     wget -O- http://example.com   # allowed (public)
     wget http://192.168.1.2/      # -> "Connection refused" (RST from the firewall)
     ```
     Denied attempts are counted as `net_blocked` in the `__stats__` report.
+  - **Bandwidth cap** (govern): `net_rate_kbps` token-bucket-limits the download
+    (internet->guest) rate so an untrusted sandbox can't saturate the host uplink.
+    When the bucket empties the poll loop stops reading host sockets and TCP
+    backpressure slows the sender (lossless). Proven: a 4 MB fetch takes ~2 s
+    uncapped, ~9 s at 4000 kbps (500 KB/s), ~17 s at 2000 kbps - proportional and
+    matching the cap.
 
 ## How the Linux boot works
 

@@ -919,6 +919,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 if (t.len > 0 and !slirp_stack.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
             }
         }
+        // Download bandwidth cap (govern): net_rate_kbps kilobits/sec, 0 = unlimited.
+        const rate_kbps = confGetInt("net_rate_kbps", 0);
+        if (rate_kbps > 0) slirp_stack.setRateKbps(rate_kbps);
         slirp_stack.out_fn = slirpToNet;
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
@@ -947,7 +950,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
     if (vsock_on) std.debug.print("[nether] virtio-vsock: guest CID 3, host echo on port 1234 (PCI 0:3.0)\n", .{});
-    if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0); egress firewall {s} (allow={d} block={d})\n", .{ if (slirp_stack.fw_enabled) "on" else "OFF", slirp_stack.allow_n, slirp_stack.block_n });
+    if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0); egress firewall {s} (allow={d} block={d}); rate {d} kbps\n", .{ if (slirp_stack.fw_enabled) "on" else "OFF", slirp_stack.allow_n, slirp_stack.block_n, slirp_stack.rate_bps * 8 / 1000 });
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
