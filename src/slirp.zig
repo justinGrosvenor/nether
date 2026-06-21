@@ -109,6 +109,47 @@ const UdpFlow = struct {
     last_ms: u64 = 0, // last activity, for the idle reaper
 };
 
+// Egress firewall rule: an IPv4 prefix (host byte order) for allow/block lists.
+const MAX_RULES = 16;
+const Cidr = struct { addr: u32 = 0, mask: u32 = 0 };
+
+fn ipToU32(ip: *const [4]u8) u32 {
+    return (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) | (@as(u32, ip[2]) << 8) | ip[3];
+}
+
+/// Special-use IPv4 ranges an untrusted sandbox is denied by default: this-host,
+/// the three RFC1918 private blocks, CGNAT, loopback, link-local (incl. the
+/// 169.254.169.254 cloud-metadata endpoint), multicast and reserved space.
+fn isSpecialRange(a: u32) bool {
+    return (a & 0xFF00_0000) == 0x0000_0000 or // 0.0.0.0/8
+        (a & 0xFF00_0000) == 0x0A00_0000 or // 10.0.0.0/8
+        (a & 0xFFC0_0000) == 0x6440_0000 or // 100.64.0.0/10 (CGNAT)
+        (a & 0xFF00_0000) == 0x7F00_0000 or // 127.0.0.0/8 (loopback = the host)
+        (a & 0xFFFF_0000) == 0xA9FE_0000 or // 169.254.0.0/16 (link-local + metadata)
+        (a & 0xFFF0_0000) == 0xAC10_0000 or // 172.16.0.0/12
+        (a & 0xFFFF_0000) == 0xC0A8_0000 or // 192.168.0.0/16
+        (a & 0xF000_0000) == 0xE000_0000 or // 224.0.0.0/4 (multicast)
+        (a & 0xF000_0000) == 0xF000_0000; // 240.0.0.0/4 (reserved)
+}
+
+/// Parse "a.b.c.d/n" (or "a.b.c.d" = /32) into a Cidr, or null if malformed.
+fn parseCidr(s: []const u8) ?Cidr {
+    const slash = std.mem.indexOfScalar(u8, s, '/');
+    const ip_part = if (slash) |i| s[0..i] else s;
+    const bits: u6 = if (slash) |i| (std.fmt.parseInt(u6, s[i + 1 ..], 10) catch return null) else 32;
+    if (bits > 32) return null;
+    var octets: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, ip_part, '.');
+    var n: usize = 0;
+    while (it.next()) |o| : (n += 1) {
+        if (n >= 4) return null;
+        octets[n] = std.fmt.parseInt(u8, o, 10) catch return null;
+    }
+    if (n != 4) return null;
+    const mask: u32 = if (bits == 0) 0 else ~@as(u32, 0) << @intCast(32 - bits);
+    return .{ .addr = ipToU32(&octets) & mask, .mask = mask };
+}
+
 pub const Slirp = struct {
     guest_ip: [4]u8 = .{ 10, 0, 2, 15 },
     gateway_ip: [4]u8 = .{ 10, 0, 2, 2 },
@@ -142,6 +183,19 @@ pub const Slirp = struct {
     tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // guest -> internet
     rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // internet -> guest
 
+    // Egress firewall (the "govern" pillar): an untrusted agent must not be able to
+    // reach the host LAN, loopback, or cloud metadata (169.254.169.254) and should
+    // be confinable to an allowlist. When `fw_enabled`, outbound TCP/UDP to private,
+    // link-local, loopback, multicast and reserved ranges is denied by default;
+    // `allow` rules override that (e.g. to reach one internal service) and `block`
+    // rules deny otherwise-public destinations. `net_open=1` disables it entirely.
+    fw_enabled: bool = true,
+    allow: [MAX_RULES]Cidr = [_]Cidr{.{}} ** MAX_RULES,
+    allow_n: usize = 0,
+    block: [MAX_RULES]Cidr = [_]Cidr{.{}} ** MAX_RULES,
+    block_n: usize = 0,
+    blocked_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // denied outbound attempts
+
     /// Entry point: a raw Ethernet frame the guest transmitted.
     pub fn onGuestFrame(self: *Slirp, frame: []const u8) void {
         if (frame.len < ETH_HDR) return;
@@ -150,6 +204,36 @@ pub const Slirp = struct {
             ETHERTYPE_IPV4 => self.handleIpv4(frame),
             else => {},
         }
+    }
+
+    /// Egress firewall decision for an outbound destination IP. Explicit allow
+    /// rules win, then explicit block rules, then the default-deny of special-use
+    /// ranges; everything else (public internet) is permitted. With the firewall
+    /// disabled (`net_open=1`) everything is allowed.
+    pub fn egressAllowed(self: *const Slirp, ip: *const [4]u8) bool {
+        if (!self.fw_enabled) return true;
+        const a = ipToU32(ip);
+        for (self.allow[0..self.allow_n]) |r| if (a & r.mask == r.addr) return true;
+        for (self.block[0..self.block_n]) |r| if (a & r.mask == r.addr) return false;
+        return !isSpecialRange(a);
+    }
+
+    /// Add an allowlist CIDR (e.g. "10.0.5.0/24"); returns false if malformed/full.
+    pub fn addAllow(self: *Slirp, cidr: []const u8) bool {
+        if (self.allow_n >= MAX_RULES) return false;
+        const c = parseCidr(cidr) orelse return false;
+        self.allow[self.allow_n] = c;
+        self.allow_n += 1;
+        return true;
+    }
+
+    /// Add a blocklist CIDR (denies an otherwise-public destination).
+    pub fn addBlock(self: *Slirp, cidr: []const u8) bool {
+        if (self.block_n >= MAX_RULES) return false;
+        const c = parseCidr(cidr) orelse return false;
+        self.block[self.block_n] = c;
+        self.block_n += 1;
+        return true;
     }
 
     fn send(self: *Slirp, frame: []const u8) void {
@@ -246,6 +330,13 @@ pub const Slirp = struct {
         // A query to our virtual DNS address is forwarded to the real upstream.
         const is_dns = eqIp(&dst_ip, &self.dns_ip) and dport == 53;
         const real_ip = if (is_dns) self.upstream_dns else dst_ip;
+
+        // Govern: drop datagrams to a denied destination (the real upstream is
+        // checked, so DNS via the virtual resolver is judged by the upstream's IP).
+        if (!self.egressAllowed(&real_ip)) {
+            _ = self.blocked_count.fetchAdd(1, .monotonic);
+            return;
+        }
 
         self.lock.lock();
         defer self.lock.unlock();
@@ -425,6 +516,14 @@ pub const Slirp = struct {
         }
         if (conn == null) {
             if (flags & TH_SYN == 0) return; // unknown, not a SYN
+            if (!self.egressAllowed(&dst_ip)) {
+                // Govern: refuse the connection with a RST so the guest fails fast
+                // (connection refused) instead of waiting out a SYN timeout.
+                _ = self.blocked_count.fetchAdd(1, .monotonic);
+                var tmp = TcpConn{ .dst_ip = dst_ip, .dst_port = dport, .guest_port = sport, .rcv_nxt = seq +% 1 };
+                self.tcpSend(&tmp, 0, TH_RST | TH_ACK, &.{}, null);
+                return;
+            }
             _ = self.tcpOpen(sport, &dst_ip, dport, seq, win, tcp[20..doff]);
             return; // SYN-ACK is sent from the poll loop once the host connect completes
         }
@@ -866,4 +965,45 @@ test "ICMP echo to the gateway is answered" {
     try testing.expectEqualSlices(u8, &s.guest_ip, oip[16..20]); // to guest
     try testing.expectEqual(@as(u8, 0), oip[20]); // echo reply
     try testing.expectEqual(@as(u16, 0), checksum(oip[20..])); // valid ICMP checksum
+}
+
+test "egress firewall default-denies special ranges, allows public" {
+    var s: Slirp = .{};
+    // Public destinations are allowed.
+    try testing.expect(s.egressAllowed(&.{ 8, 8, 8, 8 }));
+    try testing.expect(s.egressAllowed(&.{ 93, 184, 216, 34 })); // example.com
+    // Special / private / metadata ranges are denied.
+    try testing.expect(!s.egressAllowed(&.{ 169, 254, 169, 254 })); // cloud metadata
+    try testing.expect(!s.egressAllowed(&.{ 127, 0, 0, 1 })); // loopback (the host)
+    try testing.expect(!s.egressAllowed(&.{ 10, 1, 2, 3 })); // RFC1918
+    try testing.expect(!s.egressAllowed(&.{ 192, 168, 1, 2 })); // host LAN
+    try testing.expect(!s.egressAllowed(&.{ 172, 16, 0, 1 })); // RFC1918
+    try testing.expect(!s.egressAllowed(&.{ 100, 64, 0, 1 })); // CGNAT
+}
+
+test "egress firewall allow rule overrides default-deny; block rule denies public" {
+    var s: Slirp = .{};
+    try testing.expect(s.addAllow("192.168.5.0/24"));
+    try testing.expect(s.addBlock("8.8.8.0/24"));
+    try testing.expect(s.egressAllowed(&.{ 192, 168, 5, 10 })); // allow exception
+    try testing.expect(!s.egressAllowed(&.{ 192, 168, 6, 10 })); // still denied (other subnet)
+    try testing.expect(!s.egressAllowed(&.{ 8, 8, 8, 8 })); // explicitly blocked public
+    try testing.expect(s.egressAllowed(&.{ 8, 8, 4, 4 })); // public, not in block range
+}
+
+test "egress firewall disabled allows everything" {
+    var s: Slirp = .{ .fw_enabled = false };
+    try testing.expect(s.egressAllowed(&.{ 169, 254, 169, 254 }));
+    try testing.expect(s.egressAllowed(&.{ 127, 0, 0, 1 }));
+}
+
+test "parseCidr handles prefixes and rejects garbage" {
+    const c = parseCidr("10.20.30.40/16").?;
+    try testing.expectEqual(@as(u32, 0x0A140000), c.addr); // masked to /16
+    try testing.expectEqual(@as(u32, 0xFFFF0000), c.mask);
+    const h = parseCidr("1.2.3.4").?; // bare = /32
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), h.mask);
+    try testing.expect(parseCidr("1.2.3") == null);
+    try testing.expect(parseCidr("1.2.3.4/33") == null);
+    try testing.expect(parseCidr("x.y.z.w/8") == null);
 }

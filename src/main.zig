@@ -900,6 +900,25 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         try pci_host.addFunction(net_dev.function(4, 0));
         net_be.attach(&net_dev);
         slirp_stack = .{};
+        // Egress firewall (govern): default-deny private/loopback/link-local/metadata.
+        // net_open=1 disables it; net_allow / net_block add CIDR exceptions.
+        if (confBool("net_open")) slirp_stack.fw_enabled = false;
+        var fw_allow: [1024]u8 = undefined;
+        if (confGet("net_allow", &fw_allow)) |v| {
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |c| {
+                const t = std.mem.trim(u8, c, " \t");
+                if (t.len > 0 and !slirp_stack.addAllow(t)) std.debug.print("[nether] net_allow: bad/full rule '{s}'\n", .{t});
+            }
+        }
+        var fw_block: [1024]u8 = undefined;
+        if (confGet("net_block", &fw_block)) |v| {
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |c| {
+                const t = std.mem.trim(u8, c, " \t");
+                if (t.len > 0 and !slirp_stack.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
+            }
+        }
         slirp_stack.out_fn = slirpToNet;
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
@@ -928,7 +947,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
     if (vsock_on) std.debug.print("[nether] virtio-vsock: guest CID 3, host echo on port 1234 (PCI 0:3.0)\n", .{});
-    if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0)\n", .{});
+    if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0); egress firewall {s} (allow={d} block={d})\n", .{ if (slirp_stack.fw_enabled) "on" else "OFF", slirp_stack.allow_n, slirp_stack.block_n });
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
@@ -1569,6 +1588,7 @@ const Metering = struct {
     fn report(self: *Metering, buf: []u8) usize {
         const net_tx = if (self.net) |s| s.tx_bytes.load(.monotonic) else 0;
         const net_rx = if (self.net) |s| s.rx_bytes.load(.monotonic) else 0;
+        const net_blocked = if (self.net) |s| s.blocked_count.load(.monotonic) else 0;
         return (std.fmt.bufPrint(buf,
             \\nether sandbox stats
             \\uptime_ms={d}
@@ -1579,6 +1599,7 @@ const Metering = struct {
             \\bytes_out={d}
             \\net_tx_bytes={d}
             \\net_rx_bytes={d}
+            \\net_blocked={d}
             \\{c}0
             \\
         , .{
@@ -1590,6 +1611,7 @@ const Metering = struct {
             self.bytes_out.load(.acquire),
             net_tx,
             net_rx,
+            net_blocked,
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
