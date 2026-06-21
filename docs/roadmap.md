@@ -402,16 +402,20 @@ The build-out arc (offline-first chunks):
      node-base.snap, ...) and fork the right one per sandbox. Proven: snapshot,
      rename to `base-a.snap`, restore with `restore_from=base-a.snap` (default
      absent) -> responsive forked guest.
-   - **Cross-process restore is single-vCPU-reliable; SMP fork needs a safe-point
-     capture (finding).** A 1-CPU base restores cleanly 6/6 across on-disk gaps of
-     2-32 s (every fork shell-responsive); a 4-CPU base panics in the guest's hrtimer
-     rbtree (`rb_erase` <- `hrtimer_interrupt`) DETERMINISTICALLY per capture (a bad
-     snapshot panics 6/6, a good one survives - fixed by the capture instant, not the
-     gap). Root cause: `quiesce` forces vCPUs out of `hv_vcpu_run` at arbitrary PCs,
-     so an SMP capture can freeze the guest mid-update of a shared kernel structure.
-     Workaround now: bake base images with `cpus=1`. Fix later: capture only when all
-     vCPUs are parked at WFI/idle. (A CNTVOFF_EL2 rebase theory was investigated and
-     reverted - inert: HVF manages the vtimer offset itself.)
+   - **Safe-point SMP snapshot (DONE).** An SMP (4-CPU) cross-process restore used to
+     panic in the guest's hrtimer rbtree (`rb_erase` <- `hrtimer_interrupt`)
+     DETERMINISTICALLY per capture, because `quiesce` forced vCPUs out at arbitrary PCs
+     and could freeze the guest mid-update of a shared kernel structure. `quiesceSafe`
+     (main.zig) now captures only at a consistent point: it force-quiesces, then checks
+     every vCPU was caught in its idle loop (instruction at PC-4 is the `WFI` - HVF
+     emulates WFI and advances PC, so an idle CPU lands at WFI+4). Reading that
+     instruction needs a guest page-table walk (TTBR1, 4 KiB/48-bit). If any vCPU isn't
+     idle it resumes briefly and retries; an idle guest converges immediately, a busy
+     one falls back to best-effort. (HVF absorbs WFI internally - 0 EC_WFX exits/s
+     while idle - so we detect the idle PC after the fact rather than parking at a WFI
+     exit.) Proven: a 4-CPU base restores 6/6 clean (nproc=4, responsive), 0 panics
+     across 3 further fresh captures; the rewind demo is unaffected. The `cpus=1`
+     workaround is no longer needed.
    - **NAT throughput is not poll-limited (finding).** A guest fetch of a 20 MB
      host-local file clocks ~69 MB/s via the NAT; internet fetches match host `curl`
      (network-limited). The near-zero in-process RTT keeps the guest's ACKs flowing so

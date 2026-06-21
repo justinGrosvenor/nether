@@ -1059,6 +1059,80 @@ fn quiesce(sn: anytype, handles: []const u64, n: u32, phase: u8) void {
     }
 }
 
+/// Read 8 bytes from guest physical address `pa` via the host RAM mapping.
+fn readGuestU64(ram: []const u8, pa: u64) ?u64 {
+    if (pa < ARM_RAM_BASE or pa + 8 > ARM_RAM_BASE + ram.len) return null;
+    const off: usize = @intCast(pa - ARM_RAM_BASE);
+    return std.mem.readInt(u64, ram[off..][0..8], .little);
+}
+
+/// Translate a guest kernel VA (TTBR1 space) to a physical address by walking the
+/// guest's page tables in RAM. 4 KiB granule, 48-bit VA, 4-level (Linux arm64
+/// virt). Returns null on any invalid descriptor or out-of-RAM table.
+fn translateKernelVa(ram: []const u8, ttbr1: u64, va: u64) ?u64 {
+    var table = ttbr1 & 0x0000_FFFF_FFFF_F000;
+    const shifts = [_]u6{ 39, 30, 21, 12 };
+    inline for (shifts, 0..) |sh, lvl| {
+        const idx = (va >> sh) & 0x1ff;
+        const desc = readGuestU64(ram, table + idx * 8) orelse return null;
+        if (desc & 1 == 0) return null; // invalid descriptor
+        const out = desc & 0x0000_FFFF_FFFF_F000;
+        if (lvl == 3) return out | (va & 0xfff); // L3 page
+        if (lvl != 0 and desc & 3 == 1) { // L1/L2 block
+            const bsize = @as(u64, 1) << sh;
+            return (out & ~(bsize - 1)) | (va & (bsize - 1));
+        }
+        table = out; // table descriptor; descend
+    }
+    return null;
+}
+
+/// Read the guest instruction word at kernel VA `va` (or null if unmapped).
+fn readGuestInsn(ram: []const u8, ttbr1: u64, va: u64) ?u32 {
+    const pa = translateKernelVa(ram, ttbr1, va) orelse return null;
+    if (pa < ARM_RAM_BASE or pa + 4 > ARM_RAM_BASE + ram.len) return null;
+    const off: usize = @intCast(pa - ARM_RAM_BASE);
+    return std.mem.readInt(u32, ram[off..][0..4], .little);
+}
+
+const WFI_INSN: u32 = 0xd503_207f;
+// Comptime index of TTBR1_EL1 within the snapshot sys-reg order.
+const TTBR1_SNAP_IDX = blk: {
+    for (@import("hvf.zig").SNAPSHOT_SYS_REGS, 0..) |r, i| if (r == 0xc101) break :blk i;
+    @compileError("TTBR1_EL1 missing from SNAPSHOT_SYS_REGS");
+};
+
+/// Quiesce for a CONSISTENT SMP capture. Forcing vCPUs out at arbitrary PCs can
+/// freeze a CPU mid-update of a shared kernel structure (the hrtimer rbtree),
+/// which oopses on restore. Here we force-quiesce, then verify every vCPU was
+/// caught at a WFI instruction (its idle loop: holding no locks, not mid-update).
+/// If any wasn't, we resume briefly and retry, so an idle guest converges on an
+/// all-idle capture. A busy guest that never converges within `max_attempts`
+/// falls through with the last (best-effort) capture. Returns true if all-idle.
+fn quiesceSafe(sn: anytype, ram: []const u8, handles: []const u64, n: u32, max_attempts: u32) bool {
+    const hvfb = @import("hvf_backend.zig");
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        quiesce(sn, handles, n, @intFromEnum(hvfb.SnapPhase.quiesce));
+        // A CPU caught in its idle loop has just retired the WFI (HVF emulates it
+        // and advances PC), so the instruction at PC-4 is the WFI. That means the
+        // CPU holds no locks and isn't mid shared-structure update -> safe.
+        var idle: u32 = 0;
+        for (0..n) |i| {
+            const c = &sn.cpu[i];
+            if (readGuestInsn(ram, c.sys[TTBR1_SNAP_IDX], c.pc -% 4) == WFI_INSN) idle += 1;
+        }
+        if (idle == n) return true;
+        if (attempt + 1 >= max_attempts) {
+            std.debug.print("[nether] quiesceSafe: {d}/{d} vCPUs idle after {d} tries; using best-effort\n", .{ idle, n, attempt + 1 });
+            return false;
+        }
+        // Resume so any CPU caught in the kernel moves on, then re-quiesce.
+        sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+        _ = usleep(3000);
+    }
+}
+
 /// Snapshot/restore demonstration (opt-in via a `nether-snapshot` marker). After
 /// the guest is up: quiesce all vCPUs and capture the full machine state (RAM, per
 /// vCPU register context, framework GIC state, virtio device state); let the guest
@@ -1075,7 +1149,10 @@ fn macSnapshotter(ctx: *SnapCtx) void {
     while (t < 200) : (t += 1) _ = usleep(100_000); // ~20s: let the guest reach the shell
 
     // --- CAPTURE -----------------------------------------------------------
-    quiesce(sn, ctx.handles, n, @intFromEnum(hvfb.SnapPhase.quiesce));
+    // Quiesce at a consistent SMP point (all vCPUs caught at their idle WFI) so the
+    // captured hrtimer rbtree etc. isn't frozen mid-update (which oopses on restore).
+    const safe = quiesceSafe(sn, ctx.ram, ctx.handles, n, 200);
+    std.debug.print("[nether] snapshot quiesce: {s}\n", .{if (safe) "all vCPUs idle at WFI (consistent)" else "best-effort (some vCPU not idle)"});
     const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
     const ram_snap = ctx.allocator.alloc(u8, ctx.ram.len) catch {
         std.debug.print("[nether] snapshot: out of memory for RAM copy\n", .{});
