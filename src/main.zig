@@ -312,6 +312,36 @@ fn slirpPollLoop(s: *nether.Slirp) void {
 /// connects on boot; we record its connection id so the stdin pump can drive it.
 const AgentCtx = struct {
     conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
+    exit_buf: [16]u8 = undefined,
+    exit_len: usize = 0,
+
+    /// Parse the agent's framed reply stream: raw output up to 0x1e, then the
+    /// command's exit code, printed as a `[exit N]` line.
+    fn onRecv(a: *AgentCtx, bytes: []const u8) void {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            if (a.parsing_exit) {
+                if (bytes[i] == '\n') {
+                    std.debug.print("[exit {s}]\n", .{a.exit_buf[0..a.exit_len]});
+                    a.parsing_exit = false;
+                    a.exit_len = 0;
+                } else if (a.exit_len < a.exit_buf.len) {
+                    a.exit_buf[a.exit_len] = bytes[i];
+                    a.exit_len += 1;
+                }
+                i += 1;
+            } else {
+                const start = i;
+                while (i < bytes.len and bytes[i] != 0x1e) i += 1;
+                if (i > start) _ = std.c.write(1, bytes[start..].ptr, i - start);
+                if (i < bytes.len) { // hit the 0x1e separator
+                    a.parsing_exit = true;
+                    i += 1;
+                }
+            }
+        }
+    }
 };
 fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const a: *AgentCtx = @ptrCast(@alignCast(ctx));
@@ -320,7 +350,7 @@ fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             a.conn_id.store(@intCast(id), .release);
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
-        .recv => |r| _ = std.c.write(1, r.bytes.ptr, r.bytes.len), // command output
+        .recv => |r| a.onRecv(r.bytes),
         .shutdown, .reset => a.conn_id.store(-1, .release),
         else => {},
     }

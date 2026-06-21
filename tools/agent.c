@@ -12,6 +12,7 @@
  *   zig cc -target aarch64-linux-musl -static -O2 tools/agent.c -o agent
  */
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -30,22 +31,31 @@ struct sockaddr_vm {
     unsigned char svm_zero[4];
 };
 
+/* Run one command and frame the reply: stream stdout+stderr, then a trailer
+ * 0x1e<exit-code>\n so the host can tell where the output ends and whether the
+ * command succeeded. (0x1e = ASCII record separator, won't appear in text.) */
 static void run(int s, const char *cmd) {
     char shell[4160];
     snprintf(shell, sizeof shell, "%s 2>&1", cmd);
     FILE *p = popen(shell, "r");
-    if (!p) { const char *m = "agent: popen failed\n"; write(s, m, strlen(m)); return; }
-    char buf[4096];
-    size_t r;
-    while ((r = fread(buf, 1, sizeof buf, p)) > 0) {
-        size_t off = 0;
-        while (off < r) {
-            ssize_t w = write(s, buf + off, r - off);
-            if (w <= 0) { off = r; break; }
-            off += (size_t)w;
+    int code = 127;
+    if (p) {
+        char buf[4096];
+        size_t r;
+        while ((r = fread(buf, 1, sizeof buf, p)) > 0) {
+            size_t off = 0;
+            while (off < r) {
+                ssize_t w = write(s, buf + off, r - off);
+                if (w <= 0) { off = r; break; }
+                off += (size_t)w;
+            }
         }
+        int st = pclose(p);
+        code = WIFEXITED(st) ? WEXITSTATUS(st) : 128;
     }
-    pclose(p);
+    char tr[24];
+    int m = snprintf(tr, sizeof tr, "\x1e%d\n", code);
+    write(s, tr, (size_t)m);
 }
 
 int main(void) {

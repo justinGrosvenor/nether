@@ -336,6 +336,13 @@ The build-out arc (offline-first chunks):
      over the control channel, no network/ssh/shared FS - the host<->guest mechanism
      the agent platform is built on. `VsockDev.hostSend` is the locked host-thread
      path; the agent connection is the proven guest->host direction.
+   - **Agent control protocol v1 (DONE) - framing + exit status.** The agent now
+     frames each reply: it streams the command's stdout+stderr, then a trailer
+     `0x1e<exit-code>\n`. The host (`AgentCtx.onRecv`) parses it - printing the
+     output and an `[exit N]` line - so a programmatic driver can tell where a
+     command's output ends and whether it succeeded. Proven: `true`/`false`/
+     `sh -c 'exit 7'`/`ls /nonexistent` return exits 0/1/7/1 with stderr captured.
+     This is the request/response shape the platform needs to drive the sandbox.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come
