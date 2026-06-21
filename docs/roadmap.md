@@ -414,6 +414,18 @@ The build-out arc (offline-first chunks):
      an intentional safety choice - device models aren't individually thread-safe, so
      it serializes possibly-malicious concurrent vCPU access; per-device locking is
      the scalability follow-up (see io.zig).
+   - **virtio transport-state lock (DONE).** A concurrency review found a real data
+     race: `Device.interruptQueue` (called from host RX threads) and the guest's
+     MMIO MSI-X/ISR/queue-vector writes (vCPU thread) share isr/msix_enabled/
+     queue_vector/msix_table with no common lock (the bus lock covers only the vCPU
+     side). Added `Device.irq_lock` guarding exactly those fields at interruptQueue,
+     the ISR read/clear, msixWrite, MSI-X enable, reset, and queue_vector writes -
+     held only across the field accesses, never a drain or syscall. Consistent lock
+     order (bus->irq on vCPU, irq alone on host); a 50k-iteration concurrent test
+     guards against deadlock/corruption. Deferred (tradeoffs, not bugs): the coarse
+     bus-lock-across-handlers (needs immutable registry + per-device locks first),
+     slirp's lock held across socket syscalls (snapshot-under-lock + inject-after),
+     and unbounded per-notify ring drains (per-notify budget).
    - **Guest image: net/vsock/agent restored (DONE).** The initramfs had been
      stripped of kernel modules (no `virtio_net` -> no eth0 -> no networking, and no
      vsock). Rebuilt `kernels/initramfs.cpio.gz` from the matched `linux-virt`

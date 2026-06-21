@@ -10,6 +10,7 @@ const virtq = @import("virtq.zig");
 const io = @import("io.zig");
 const pci = @import("pci.zig");
 const trace = @import("trace.zig");
+const Lock = @import("lock.zig").Lock;
 
 pub const max_queues = 8;
 pub const num_vectors = 4; // MSI-X table entries
@@ -70,6 +71,13 @@ pub const Device = struct {
     config_vector: u16 = no_vector,
     queue_vector: [max_queues]u16 = [_]u16{no_vector} ** max_queues,
     msix_table: [num_vectors]MsixEntry = [_]MsixEntry{.{}} ** num_vectors,
+    /// Guards the interrupt/transport state (isr, msix_enabled, queue_vector,
+    /// msix_table) shared between `interruptQueue` - called from host I/O threads
+    /// (virtio-net/vsock RX) - and the guest's MMIO config/MSI-X/ISR writes on the
+    /// vCPU thread. The bus lock only covers the vCPU side, so without this the two
+    /// race (torn MSI-X entries, lost ISR bits, missed interrupts). Held only across
+    /// these field accesses, never across a queue drain or a syscall.
+    irq_lock: Lock = .{},
 
     // Legacy IRQ callback (unused once MSI-X is on) and the MSI sink.
     irq_ptr: ?*anyopaque = null,
@@ -235,6 +243,8 @@ pub const Device = struct {
     /// Raise the completion interrupt for queue `q`: MSI-X if enabled, else the
     /// legacy ISR/IRQ. Backends call this after publishing to the used ring.
     pub fn interruptQueue(self: *Device, q: u16) void {
+        self.irq_lock.lock();
+        defer self.irq_lock.unlock();
         self.isr |= 1;
         if (self.msix_enabled) {
             const vec = if (q < max_queues) self.queue_vector[q] else no_vector;
@@ -289,7 +299,9 @@ pub const Device = struct {
             // MSI-X message control: bit 15 enable, bit 14 function mask.
             const mc: u16 = @truncate(value);
             std.mem.writeInt(u16, self.config[cap_msix + 2 ..][0..2], mc, .little);
+            self.irq_lock.lock();
             self.msix_enabled = mc & 0x8000 != 0;
+            self.irq_lock.unlock();
             trace.log("msix enable={}", .{self.msix_enabled});
         }
     }
@@ -309,6 +321,8 @@ pub const Device = struct {
     pub fn barRead(self: *Device, off: u64, size: u8) u32 {
         if (off < isr_off) return self.commonRead(@intCast(off));
         if (off < notify_off) {
+            self.irq_lock.lock();
+            defer self.irq_lock.unlock();
             const v = self.isr;
             self.isr = 0;
             if (self.intx_fn) |f| f(self.intx_ptr.?, false); // INTx level low after ISR read
@@ -349,6 +363,8 @@ pub const Device = struct {
     fn msixWrite(self: *Device, off: u32, value: u32) void {
         const entry = off / 16;
         if (entry >= num_vectors) return;
+        self.irq_lock.lock();
+        defer self.irq_lock.unlock();
         const e = &self.msix_table[entry];
         switch (off % 16) {
             0 => e.addr = (e.addr & 0xffffffff_00000000) | value,
@@ -399,8 +415,10 @@ pub const Device = struct {
                 trace.log("status=0x{x}", .{self.status});
                 if (self.status == 0) {
                     self.driver_features = 0;
+                    self.irq_lock.lock();
                     self.isr = 0;
                     self.msix_enabled = false;
+                    self.irq_lock.unlock();
                     self.resetQueues();
                     if (self.intx_fn) |f| f(self.intx_ptr.?, false); // line low on reset
                 }
@@ -413,7 +431,11 @@ pub const Device = struct {
                 const sz: u16 = @truncate(value);
                 self.queues[s].size = if (validQueueSize(sz)) sz else 0;
             },
-            0x1a => self.queue_vector[s] = @truncate(value),
+            0x1a => {
+                self.irq_lock.lock();
+                self.queue_vector[s] = @truncate(value);
+                self.irq_lock.unlock();
+            },
             0x1c => {
                 // Refuse to enable a queue whose size isn't valid (defense in depth
                 // with the 0x18 check, so notify never drives a malformed queue).
@@ -578,4 +600,52 @@ test "MSI-X delivers a queue completion to the programmed vector" {
     dev.barWrite(msix_off + 16 + 12, 4, 1); // mask entry 1
     dev.interruptQueue(0);
     try std.testing.expectEqual(@as(u32, 1), sink.hits);
+}
+
+fn irqHammer(dev: *Device, n: usize) void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) dev.interruptQueue(0);
+}
+
+test "interruptQueue races safely with MMIO transport writes" {
+    // interruptQueue runs on host I/O threads; the MSI-X/ISR/queue-vector writes run
+    // on the vCPU thread. They share isr/msix_enabled/queue_vector/msix_table and are
+    // synchronized only by irq_lock (the bus lock covers just the vCPU side). This
+    // exercises both under contention: it must not deadlock (lock-order regression)
+    // and must not trip a bounds/safety check from a torn read.
+    var ram = [_]u8{0} ** 64;
+    const Noop = struct {
+        fn notify(p: *anyopaque, d: *Device, q: u16) void {
+            _ = p;
+            _ = d;
+            _ = q;
+        }
+        fn cfg(p: *anyopaque, o: u16, s: u8) u32 {
+            _ = p;
+            _ = o;
+            _ = s;
+            return 0;
+        }
+        fn msi(p: *anyopaque, a: u64, d: u32) void {
+            _ = p;
+            _ = a;
+            _ = d;
+        }
+    };
+    var dummy: u8 = 0;
+    var dev = Device.init(.{ .ptr = &dummy, .device_id = 2, .num_queues = 1, .device_features = 0, .notify = Noop.notify, .config_read = Noop.cfg }, .{ .bytes = &ram, .base = 0 });
+    dev.msi_ptr = &dev;
+    dev.msi_fn = Noop.msi;
+    dev.msix_enabled = true; // make interruptQueue read msix_table[queue_vector[0]]
+
+    const N = 50_000;
+    const t = try std.Thread.spawn(.{}, irqHammer, .{ &dev, N });
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        dev.msixWrite(0, @truncate(i)); // races msix_table[0] vs interruptQueue's read
+        _ = dev.barRead(isr_off, 4); // races isr clear vs interruptQueue's set
+        dev.commonWrite(0x1a, 0); // races queue_vector[0]
+    }
+    t.join();
+    try std.testing.expect(dev.isr <= 1); // isr is only ever set to 1 or cleared to 0
 }

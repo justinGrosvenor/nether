@@ -50,8 +50,10 @@ pub const Bus = struct {
     /// briefly serializing unrelated device access on other vCPUs. That is a
     /// scalability limit, not a safety bug. The fix when it matters is per-device
     /// locking (then this drops to a lookup-only lock), tracked as a govern/SMP
-    /// follow-up. Host I/O threads that drive a device directly take the device's
-    /// own lock (e.g. the virtio-net RX path), not this one.
+    /// follow-up. Host I/O threads that drive a device directly do NOT take this
+    /// lock: the interrupt/transport state they share with the vCPU side (ISR,
+    /// MSI-X table, queue vectors) is guarded by the device's own `irq_lock`
+    /// (see virtio.zig), and backends hold their own locks for backend state.
     lock: Lock = .{},
 
     pub fn addPio(self: *Bus, dev: PioDevice) error{BusFull}!void {
