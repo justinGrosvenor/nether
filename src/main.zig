@@ -686,13 +686,14 @@ fn macMain() !void {
 // Guest layout for the Linux boot: kernel at the RAM base (Image text_offset 0),
 // the DTB at +128 MiB, and the initramfs at +192 MiB, all clear of the ~35 MiB
 // kernel image.
-const ARM_RAM_SIZE: usize = 512 * nether.memmap.mib;
+const ARM_RAM_SIZE: usize = 512 * nether.memmap.mib; // default; nether.conf ram_mb overrides
 const ARM_DTB_OFF: u64 = 0x0800_0000;
 const ARM_INITRD_OFF: u64 = 0x0C00_0000;
-/// Number of vCPUs the aarch64 guest boots with. Secondaries come online via
-/// PSCI CPU_ON (see smp.zig); each vCPU is created and run on its own thread
-/// because an HVF vCPU is bound to its creating thread.
+/// Default and ceiling vCPU counts. Secondaries come online via PSCI CPU_ON (see
+/// smp.zig); each vCPU runs on its own thread (an HVF vCPU is bound to its
+/// creating thread). The actual count is from nether.conf, clamped to MAX.
 const ARM_NUM_CPUS: u32 = 4;
+const ARM_MAX_CPUS: u32 = 8; // == hvf_backend.MAX_SNAP_CPUS; sizes the SMP arrays
 
 /// Boot an arm64 Linux kernel: place the Image, DTB, and initramfs in guest RAM,
 /// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
@@ -700,9 +701,14 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const hvf = @import("hvf.zig");
     const hvfb = @import("hvf_backend.zig");
 
+    // Per-sandbox sizing from nether.conf (cpus, ram_mb), with sane clamps. RAM is
+    // kept >= 256 MiB so the DTB/initrd offsets (192 MiB) fit.
+    const num_cpus: u32 = @intCast(std.math.clamp(confGetInt("cpus", ARM_NUM_CPUS), 1, ARM_MAX_CPUS));
+    const ram_size: usize = @intCast(@max(confGetInt("ram_mb", ARM_RAM_SIZE / nether.memmap.mib), 256) * nether.memmap.mib);
+
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
-    const ram = try vm.addMemory(0, ARM_RAM_BASE, ARM_RAM_SIZE);
+    const ram = try vm.addMemory(0, ARM_RAM_BASE, ram_size);
     try vm.enableSplitIrqchip(); // hv_gic_create, before the vCPU
 
     // The boot vCPU must exist before we can ask where the framework placed its
@@ -714,20 +720,21 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // secondary thread per extra core. Each secondary CREATES its own vCPU (HVF
     // binds a vCPU to its creating thread) so all redistributors exist before the
     // kernel's GIC init, then parks until PSCI CPU_ON releases it.
-    var cpus: [ARM_NUM_CPUS]nether.smp.Cpu = undefined;
-    for (&cpus, 0..) |*c, i| c.* = .{ .mpidr = 0x8000_0000 | @as(u64, i) };
+    var cpus_buf: [ARM_MAX_CPUS]nether.smp.Cpu = undefined;
+    const cpus = cpus_buf[0..num_cpus];
+    for (cpus, 0..) |*c, i| c.* = .{ .mpidr = 0x8000_0000 | @as(u64, i) };
     cpus[0].started.store(true, .release); // boot core
-    var smpc = nether.smp.Smp{ .cpus = &cpus };
+    var smpc = nether.smp.Smp{ .cpus = cpus };
     var created = std.atomic.Value(u32).init(0); // secondaries that finished createVcpu
-    var sec_ctx: [ARM_NUM_CPUS]SmpCtx = undefined;
+    var sec_ctx: [ARM_MAX_CPUS]SmpCtx = undefined;
     var power = nether.Power{};
     var bus = nether.Bus{};
     var snapctl = hvfb.SnapCtl{}; // snapshot/restore rendezvous across vCPU threads
-    var handles: [ARM_NUM_CPUS]u64 = undefined; // vCPU handles for hv_vcpus_exit
+    var handles: [ARM_MAX_CPUS]u64 = undefined; // vCPU handles for hv_vcpus_exit
     handles[0] = vcpu.handle;
 
     var ci: u32 = 1;
-    while (ci < ARM_NUM_CPUS) : (ci += 1) {
+    while (ci < num_cpus) : (ci += 1) {
         sec_ctx[ci] = .{ .vm = &vm, .id = ci, .cpu = &cpus[ci], .bus = &bus, .power = &power, .smpc = &smpc, .created = &created, .handles = &handles, .snap = &snapctl };
         (std.Thread.spawn(.{}, macSecondaryCpu, .{&sec_ctx[ci]}) catch |err| {
             std.debug.print("[nether] secondary cpu {d} spawn failed: {s}\n", .{ ci, @errorName(err) });
@@ -736,7 +743,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     }
     // Wait until every secondary has created its vCPU (so all GIC redistributors
     // are present) before building the DTB and starting the boot core.
-    while (created.load(.acquire) < ARM_NUM_CPUS - 1) _ = usleep(200);
+    while (created.load(.acquire) < num_cpus - 1) _ = usleep(200);
 
     const queried = vcpu.redistributorBase();
     const gicr_base = if (queried != 0) queried else nether.memmap_arm.gicr_base;
@@ -755,13 +762,13 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
         .cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000",
         .mem_base = ARM_RAM_BASE,
-        .mem_size = ARM_RAM_SIZE,
+        .mem_size = ram_size,
         .gicd_size = vm.hv.gicd_size,
         .gicr_base = gicr_base,
         .gicr_size = vm.hv.gicr_size,
         .initrd_start = initrd_start,
         .initrd_end = initrd_end,
-        .num_cpus = ARM_NUM_CPUS,
+        .num_cpus = num_cpus,
         .pcie = .{
             .ecam_base = nether.memmap_arm.ecam_base,
             .ecam_size = nether.memmap_arm.ecam_size,
@@ -917,7 +924,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // the agent's replies from the recv handler to the relay thread.
     var ctl_pipe: [2]c_int = undefined;
     var ctl_ctx: ControlCtx = undefined;
-    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ARM_RAM_SIZE / (1024 * 1024), .cpus = ARM_NUM_CPUS };
+    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ram_size / (1024 * 1024), .cpus = num_cpus };
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
@@ -946,8 +953,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var snap_ctx = SnapCtx{
         .allocator = allocator,
         .ram = ram,
-        .handles = &handles,
-        .num_cpus = ARM_NUM_CPUS,
+        .handles = handles[0..num_cpus],
+        .num_cpus = num_cpus,
         .snap = &snapctl,
         .con_dev = &con_dev,
         .blk_dev = &blk_dev,
@@ -960,7 +967,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] snapshot {s} armed\n", .{if (snap_ctx.save) "save-to-file" else "rewind demo"});
     }
 
-    std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ ARM_NUM_CPUS, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
+    std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ num_cpus, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.runSmp(&bus, &power, &smpc, &snapctl) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
@@ -1228,14 +1235,14 @@ fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const gic_size = std.mem.readInt(u64, hdr[32..40], .little);
     const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
     const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
-    if (num_cpus > hvfb.MAX_SNAP_CPUS or ram_size != ARM_RAM_SIZE) return error.BadSnapshot;
+    if (num_cpus > hvfb.MAX_SNAP_CPUS or ram_size == 0) return error.BadSnapshot;
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
-    // Map RAM copy-on-write from the snapshot file: the fork shares the base
-    // image's pages and only copies what it writes, so restore is instant (no
-    // 512 MiB read) and forks are memory-cheap.
-    const ram = try vm.hv.mapMemoryCow(ARM_RAM_BASE, ARM_RAM_SIZE, fd, ram_off);
+    // Map RAM copy-on-write from the snapshot file (at the snapshot's own size):
+    // the fork shares the base image's pages and only copies what it writes, so
+    // restore is instant (no full read) and forks are memory-cheap.
+    const ram = try vm.hv.mapMemoryCow(ARM_RAM_BASE, @intCast(ram_size), fd, ram_off);
     try vm.enableSplitIrqchip(); // create the GIC before vCPUs (state restored below)
 
     // Read the small metadata sequentially (cpus, con, blk, uart, gic, disk); RAM
@@ -1425,6 +1432,13 @@ fn confGet(key: []const u8, out: []u8) ?[]const u8 {
         return out[0..v.len];
     }
     return null;
+}
+
+/// nether.conf integer value for `key`, or `default` if absent/unparseable.
+fn confGetInt(key: []const u8, default: u64) u64 {
+    var b: [32]u8 = undefined;
+    if (confGet(key, &b)) |v| return std.fmt.parseInt(u64, v, 10) catch default;
+    return default;
 }
 
 const timeval = extern struct { sec: i64, usec: i64 };

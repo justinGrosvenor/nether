@@ -357,7 +357,10 @@ The build-out arc (offline-first chunks):
      path (a configured path also enables control mode without a marker), so many
      sandboxes run on one host. Proven: with `control_socket=/tmp/nether-sb7.sock`
      and no markers, nether binds that path and serves it. The platform writes one
-     config per sandbox and launches.
+     config per sandbox and launches. `cpus` and `ram_mb` are also config-driven
+     (clamped to 1..8 vCPUs sized by MAX-sized SMP arrays, and RAM >= 256 MiB):
+     proven with `cpus=2 ram_mb=384`, the guest reports `nproc` 2 and ~384 MiB and
+     `SMP: Total of 2 processors activated`. So the platform sizes each sandbox.
    - **Metering (DONE) - the meter pillar.** A host-intercepted `__stats__` control
      command reports per-sandbox usage so the platform can settle per consumption
      (x402): `uptime_ms`, `ram_mb`, `cpus`, `commands` run, and `bytes_in/out`.
