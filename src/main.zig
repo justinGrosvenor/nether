@@ -834,7 +834,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
     var agent_ctx = AgentCtx{};
-    const control_on = macMarkerPresent("nether-control");
+    // Control socket path from nether.conf (per-sandbox), else the default. A
+    // configured path also enables control mode (no marker needed).
+    var sock_path_buf: [256]u8 = undefined;
+    const have_sock_conf = confGet("control_socket", &sock_path_buf) != null;
+    const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
+    const control_on = macMarkerPresent("nether-control") or have_sock_conf;
     const agent_repl = macMarkerPresent("nether-agent") and !control_on;
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
     const vsock_on = macMarkerPresent("nether-vsock") or agent_mode;
@@ -916,7 +921,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = "/tmp/nether.sock", .pipe_r = ctl_pipe[0] };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0] };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
@@ -1395,6 +1400,32 @@ const SockaddrUn = extern struct {
     family: u8 = AF_UNIX,
     path: [104]u8 = [_]u8{0} ** 104,
 };
+
+/// Read a `key=value` from `nether.conf` in the cwd into `out` (NUL-terminated for
+/// socket binds), returning the value or null if the file/key is absent. The
+/// platform writes one config per sandbox (e.g. a distinct `control_socket` path)
+/// so many sandboxes run on one host. Minimal: `key = value` lines, `#` comments.
+fn confGet(key: []const u8, out: []u8) ?[]const u8 {
+    const fd = libc.open("nether.conf", 0, @as(c_int, 0));
+    if (fd < 0) return null;
+    defer _ = libc.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = libc.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    var it = std.mem.splitScalar(u8, buf[0..@intCast(n)], '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trim(u8, line, " \t\r");
+        if (l.len == 0 or l[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, l, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, l[0..eq], " \t"), key)) continue;
+        const v = std.mem.trim(u8, l[eq + 1 ..], " \t");
+        if (v.len + 1 > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        out[v.len] = 0; // NUL terminator for [*:0] consumers
+        return out[0..v.len];
+    }
+    return null;
+}
 
 const timeval = extern struct { sec: i64, usec: i64 };
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;

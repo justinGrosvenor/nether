@@ -351,8 +351,13 @@ The build-out arc (offline-first chunks):
      live: `nc -U /tmp/nether.sock` with `whoami/uname/.../false` returns each
      command's output and `0x1e<exit>` framing (root, kernel, 42, exit 1). So the
      platform spawns nether per sandbox and attaches to its control socket to exec
-     and collect results. (Socket path is fixed for now; per-sandbox paths are a
-     trivial follow-up.)
+     and collect results.
+   - **Per-sandbox config (DONE).** A `nether.conf` (`key=value`, `#` comments) read
+     from the cwd lets the platform give each sandbox a distinct `control_socket`
+     path (a configured path also enables control mode without a marker), so many
+     sandboxes run on one host. Proven: with `control_socket=/tmp/nether-sb7.sock`
+     and no markers, nether binds that path and serves it. The platform writes one
+     config per sandbox and launches.
    - **Metering (DONE) - the meter pillar.** A host-intercepted `__stats__` control
      command reports per-sandbox usage so the platform can settle per consumption
      (x402): `uptime_ms`, `ram_mb`, `cpus`, `commands` run, and `bytes_in/out`.
