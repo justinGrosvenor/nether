@@ -323,6 +323,16 @@ The build-out arc (offline-first chunks):
      (`VSOCK_ECHO: HELLO_FROM_GUEST_VSOCK`) - the full vsock datapath (3 queues,
      connection state machine, credit flow control, MSI-X) over virtio-pci. Boot,
      SMP, and virtio-blk re-verified on the refreshed kernel.
+   - **Agent runtime (DONE) - exec-over-vsock.** The keystone that makes the
+     sandbox an agent runtime: a guest agent (`tools/agent.c`, static aarch64)
+     connects to the host's agent control port (5000); the host sends it a command
+     (`agentEvent` in main.zig, opt-in via a `nether-agent` marker) and the agent
+     runs it through `/bin/sh` and streams the output back over the same vsock
+     connection. Proven live: the host drives the guest to run `uname -srm; id` and
+     prints the returned `Linux 6.12.93-0-virt aarch64 / uid=0(root) / AGENT_EXEC_OK`
+     - in-sandbox code execution with the result collected over the control channel,
+     no network/ssh/shared FS. This is the host<->guest mechanism the agent platform
+     is built on.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come

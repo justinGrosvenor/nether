@@ -124,6 +124,13 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
   ```
   That round-trip (guest connects to host CID 2:1234, sends, host echoes back)
   exercises the full vsock datapath and is the host<->guest control channel.
+- **Agent runtime** (opt-in via a `nether-agent` marker; the host listens on the
+  agent port 5000): a guest agent (`tools/agent.c`, build like the vsock client and
+  drop `agent` in the initramfs) connects to the host, which sends it a command;
+  the agent runs it through `/bin/sh` and streams the output back over vsock. After
+  loading the vsock modules: `/agent` -> the host prints `[agent] <output>`. This
+  is the in-sandbox exec primitive (run code in an isolated guest, collect the
+  result over the control channel - no network/ssh/shared FS).
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

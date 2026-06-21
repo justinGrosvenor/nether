@@ -306,6 +306,26 @@ fn slirpPollLoop(s: *nether.Slirp) void {
     while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
 }
 
+/// Host-side agent control: on a guest agent connection, send it a command; print
+/// the command output the agent streams back over vsock. This is the host end of
+/// the in-sandbox exec primitive (the guest side is tools/agent.c).
+const AGENT_CMD = "uname -srm; id; echo AGENT_EXEC_OK\n";
+fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
+    const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
+    switch (ev) {
+        .accept => |id| {
+            std.debug.print("[agent] guest connected (conn {d}); sending command\n", .{id});
+            _ = vs.send(id, AGENT_CMD);
+        },
+        .recv => |r| {
+            _ = std.c.write(1, "[agent] ", 8);
+            _ = std.c.write(1, r.bytes.ptr, r.bytes.len);
+        },
+        .shutdown, .reset => |id| std.debug.print("[agent] conn {d} closed\n", .{id}),
+        else => {},
+    }
+}
+
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
     switch (ev) {
@@ -664,11 +684,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vsdev: nether.VsockDev = undefined;
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
-    const vsock_on = macMarkerPresent("nether-vsock");
+    const agent_on = macMarkerPresent("nether-agent");
+    const vsock_on = macMarkerPresent("nether-vsock") or agent_on;
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
-        vs.on_event = vsockEcho;
+        vs.on_event = if (agent_on) agentEvent else vsockEcho;
         vs.on_event_ctx = vs;
         vs_engine = vs;
         vsdev = .{ .engine = vs };
@@ -680,7 +701,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         vs_dev.msi_fn = armSendMsi;
         try pci_host.addFunction(vs_dev.function(3, 0));
         vsdev.attach(&vs_dev);
-        _ = vsdev.hostListen(1234);
+        _ = vsdev.hostListen(if (agent_on) 5000 else 1234); // 5000 = agent control port
     }
 
     // Function 0:4.0 - virtio-net behind the in-VMM user-mode network stack
