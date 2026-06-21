@@ -414,6 +414,14 @@ The build-out arc (offline-first chunks):
      an intentional safety choice - device models aren't individually thread-safe, so
      it serializes possibly-malicious concurrent vCPU access; per-device locking is
      the scalability follow-up (see io.zig).
+   - **Runtime budget (DONE) - govern (time axis).** `max_runtime_s` arms a watchdog
+     thread that stops the sandbox after that many seconds of wall clock - a hard cap
+     on cost/runaway for untrusted agents, alongside the firewall (reachability),
+     bandwidth cap (volume) and cpus/ram (sizing). It uses the guest-PSCI-poweroff
+     path: `power.request(.shutdown)` then `hv_vcpus_exit` so the run loop returns
+     `.shutdown` and the process exits cleanly. 0 = unlimited. Proven live:
+     `max_runtime_s=8` -> "runtime budget (8s) reached; stopping sandbox" -> clean
+     `guest shutdown` at ~8 s.
    - **virtio transport-state lock (DONE).** A concurrency review found a real data
      race: `Device.interruptQueue` (called from host RX threads) and the guest's
      MMIO MSI-X/ISR/queue-vector writes (vCPU thread) share isr/msix_enabled/

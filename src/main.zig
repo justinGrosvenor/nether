@@ -1001,12 +1001,49 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] snapshot {s} armed\n", .{if (snap_ctx.save) "save-to-file" else "rewind demo"});
     }
 
+    // Runtime budget (govern): a watchdog stops the sandbox after max_runtime_s of
+    // wall clock - a hard cap on cost/runaway for untrusted agents (the time axis,
+    // alongside the firewall/bandwidth/sizing controls). 0 = unlimited.
+    var wd_ctx: WatchdogCtx = undefined;
+    const max_runtime_s = confGetInt("max_runtime_s", 0);
+    if (max_runtime_s > 0) {
+        wd_ctx = .{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .start_ms = nowMs(), .budget_ms = @intCast(max_runtime_s * 1000) };
+        if (std.Thread.spawn(.{}, macWatchdog, .{&wd_ctx})) |t| t.detach() else |_| {}
+        std.debug.print("[nether] runtime budget armed: {d}s\n", .{max_runtime_s});
+    }
+
     std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ num_cpus, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.runSmp(&bus, &power, &smpc, &snapctl) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+}
+
+/// Runtime-budget watchdog context: a deadline plus what it needs to stop the VM.
+const WatchdogCtx = struct {
+    power: *nether.Power,
+    handles: []const u64,
+    num_cpus: u32,
+    start_ms: i64, // matches nowMs()
+    budget_ms: i64,
+};
+
+/// Stop the sandbox once its wall-clock budget elapses. Uses the same path a guest
+/// PSCI poweroff takes: request a shutdown, then force the vCPUs out of
+/// `hv_vcpu_run` so the run loop observes the action and returns `.shutdown`
+/// (cpu0's return unwinds macBootLinux and the process exits). Re-fires the exit a
+/// few times in case a vCPU is between runs or parked in WFI inside HVF.
+fn macWatchdog(ctx: *WatchdogCtx) void {
+    const hvf = @import("hvf.zig");
+    while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
+    std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
+    ctx.power.request(.shutdown);
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        _ = hvf.hv_vcpus_exit(ctx.handles.ptr, ctx.num_cpus);
+        _ = usleep(20_000);
+    }
 }
 
 /// Per-secondary-core thread context. The vCPU is created inside the thread (HVF
