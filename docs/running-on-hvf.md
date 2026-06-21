@@ -125,12 +125,21 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
   That round-trip (guest connects to host CID 2:1234, sends, host echoes back)
   exercises the full vsock datapath and is the host<->guest control channel.
 - **Agent runtime** (opt-in via a `nether-agent` marker; the host listens on the
-  agent port 5000): a guest agent (`tools/agent.c`, build like the vsock client and
-  drop `agent` in the initramfs) connects to the host, which sends it a command;
-  the agent runs it through `/bin/sh` and streams the output back over vsock. After
-  loading the vsock modules: `/agent` -> the host prints `[agent] <output>`. This
-  is the in-sandbox exec primitive (run code in an isolated guest, collect the
-  result over the control channel - no network/ssh/shared FS).
+  agent port 5000): the sandbox becomes a REPL. `/init` auto-loads the vsock
+  modules and starts the persistent guest agent (`tools/agent.c`), which connects
+  to the host; then host stdin lines are sent as commands, run in the guest through
+  `/bin/sh`, and their output is streamed back to host stdout. Build the agent like
+  the vsock client and drop `agent` in the initramfs. Example:
+  ```
+  $ printf 'whoami\nuname -srm\nnproc\n' | ./zig-out/bin/nether   # (after boot)
+  [agent] guest agent connected; type commands (they run in the sandbox)
+  root
+  Linux 6.12.93-0-virt aarch64
+  4
+  ```
+  This is the in-sandbox exec primitive (run code in an isolated guest, collect
+  results over the control channel - no network/ssh/shared FS). The PL011 console
+  is output-only in this mode since host stdin drives the agent.
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

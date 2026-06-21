@@ -323,16 +323,19 @@ The build-out arc (offline-first chunks):
      (`VSOCK_ECHO: HELLO_FROM_GUEST_VSOCK`) - the full vsock datapath (3 queues,
      connection state machine, credit flow control, MSI-X) over virtio-pci. Boot,
      SMP, and virtio-blk re-verified on the refreshed kernel.
-   - **Agent runtime (DONE) - exec-over-vsock.** The keystone that makes the
-     sandbox an agent runtime: a guest agent (`tools/agent.c`, static aarch64)
-     connects to the host's agent control port (5000); the host sends it a command
-     (`agentEvent` in main.zig, opt-in via a `nether-agent` marker) and the agent
-     runs it through `/bin/sh` and streams the output back over the same vsock
-     connection. Proven live: the host drives the guest to run `uname -srm; id` and
-     prints the returned `Linux 6.12.93-0-virt aarch64 / uid=0(root) / AGENT_EXEC_OK`
-     - in-sandbox code execution with the result collected over the control channel,
-     no network/ssh/shared FS. This is the host<->guest mechanism the agent platform
-     is built on.
+   - **Agent runtime (DONE) - exec-over-vsock REPL.** The keystone that makes the
+     sandbox an agent runtime: a persistent guest agent (`tools/agent.c`, static
+     aarch64) auto-started by `/init`, which connects to the host's agent control
+     port (5000) and serves a stream of newline-terminated commands - running each
+     through `/bin/sh` and streaming stdout+stderr back over vsock. The host
+     (`agentEvent` + `agentStdinPump`, opt-in via a `nether-agent` marker) turns the
+     sandbox into a REPL: host stdin lines become in-guest commands and their output
+     comes back to host stdout (the PL011 console is output-only in this mode).
+     Proven live: piping `whoami / uname -srm / nproc` runs them in the guest and
+     prints `root / Linux 6.12.93-0-virt aarch64 / 4`. In-sandbox code execution
+     over the control channel, no network/ssh/shared FS - the host<->guest mechanism
+     the agent platform is built on. `VsockDev.hostSend` is the locked host-thread
+     path; the agent connection is the proven guest->host direction.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come

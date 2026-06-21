@@ -306,25 +306,41 @@ fn slirpPollLoop(s: *nether.Slirp) void {
     while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
 }
 
-/// Host-side agent control: on a guest agent connection, send it a command; print
-/// the command output the agent streams back over vsock. This is the host end of
-/// the in-sandbox exec primitive (the guest side is tools/agent.c).
-const AGENT_CMD = "uname -srm; id; echo AGENT_EXEC_OK\n";
+/// Host-side agent control. The sandbox becomes a REPL: host stdin lines are sent
+/// as commands to the in-guest agent (tools/agent.c) over vsock, and the command
+/// output the agent streams back is written to host stdout. The guest agent
+/// connects on boot; we record its connection id so the stdin pump can drive it.
+const AgentCtx = struct {
+    conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+};
 fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
-    const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
+    const a: *AgentCtx = @ptrCast(@alignCast(ctx));
     switch (ev) {
         .accept => |id| {
-            std.debug.print("[agent] guest connected (conn {d}); sending command\n", .{id});
-            _ = vs.send(id, AGENT_CMD);
+            a.conn_id.store(@intCast(id), .release);
+            std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
-        .recv => |r| {
-            _ = std.c.write(1, "[agent] ", 8);
-            _ = std.c.write(1, r.bytes.ptr, r.bytes.len);
-        },
-        .shutdown, .reset => |id| std.debug.print("[agent] conn {d} closed\n", .{id}),
+        .recv => |r| _ = std.c.write(1, r.bytes.ptr, r.bytes.len), // command output
+        .shutdown, .reset => a.conn_id.store(-1, .release),
         else => {},
     }
 }
+
+/// I/O thread (agent mode): forward host stdin to the guest agent over vsock.
+fn agentStdinPump(ctx: *AgentStdinCtx) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = libc.read(0, &buf, buf.len);
+        if (n <= 0) return;
+        var id = ctx.agent.conn_id.load(.acquire);
+        while (id < 0) { // wait until the guest agent has connected
+            _ = usleep(50_000);
+            id = ctx.agent.conn_id.load(.acquire);
+        }
+        _ = ctx.vsdev.hostSend(@intCast(id), buf[0..@intCast(n)]);
+    }
+}
+const AgentStdinCtx = struct { vsdev: *nether.VsockDev, agent: *AgentCtx };
 
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
@@ -684,13 +700,14 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vsdev: nether.VsockDev = undefined;
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
+    var agent_ctx = AgentCtx{};
     const agent_on = macMarkerPresent("nether-agent");
     const vsock_on = macMarkerPresent("nether-vsock") or agent_on;
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
         vs.on_event = if (agent_on) agentEvent else vsockEcho;
-        vs.on_event_ctx = vs;
+        vs.on_event_ctx = if (agent_on) @as(*anyopaque, &agent_ctx) else @as(*anyopaque, vs);
         vs_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
@@ -755,11 +772,15 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
-    // Interactive console: raw-mode host tty (keystrokes pass straight through;
-    // the guest echoes) plus a thread that feeds host stdin into the PL011 RX.
-    const saved_termios = armEnableRawMode();
+    // Host stdin: in agent mode it drives the guest agent (a REPL: stdin lines ->
+    // sandbox exec -> stdout), and the PL011 console is output-only. Otherwise it
+    // feeds the PL011 RX for an interactive guest shell.
+    var agent_stdin = AgentStdinCtx{ .vsdev = &vsdev, .agent = &agent_ctx };
+    const saved_termios = if (agent_on) null else armEnableRawMode();
     defer if (saved_termios) |s| armRestoreTermios(s);
-    if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| {
+    if (agent_on) {
+        if (std.Thread.spawn(.{}, agentStdinPump, .{&agent_stdin})) |t| t.detach() else |_| {}
+    } else if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| {
         t.detach();
     } else |err| {
         std.debug.print("[nether] stdin thread failed: {s}; console is output-only\n", .{@errorName(err)});

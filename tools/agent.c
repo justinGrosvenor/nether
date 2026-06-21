@@ -1,15 +1,15 @@
 /* Nether guest agent: the in-sandbox command executor an agent platform drives.
  *
- * Connects to the host (CID 2) on the agent control port, reads one command, runs
- * it through /bin/sh, and streams the output back over the same vsock connection.
- * This is the keystone that turns the sandbox into an agent runtime: the host can
- * execute code inside an isolated guest and collect the result over the control
- * channel, with no network, ssh, or shared filesystem.
+ * Connects to the host (CID 2) on the agent control port and then serves a stream
+ * of newline-terminated commands: for each, it runs the command through /bin/sh
+ * and streams stdout+stderr back over the same vsock connection. This is the
+ * keystone that turns the sandbox into an agent runtime - the host executes code
+ * inside an isolated guest and collects results over the control channel, with no
+ * network, ssh, or shared filesystem. It exits quietly if the host is not there
+ * (so it is harmless to auto-start from /init on every boot).
  *
  * Build static for the guest with Zig's bundled clang:
  *   zig cc -target aarch64-linux-musl -static -O2 tools/agent.c -o agent
- * Then drop `agent` into the initramfs and run it after the vsock modules load
- * (recipe in docs/running-on-hvf.md).
  */
 #include <sys/socket.h>
 #include <unistd.h>
@@ -30,40 +30,55 @@ struct sockaddr_vm {
     unsigned char svm_zero[4];
 };
 
+static void run(int s, const char *cmd) {
+    char shell[4160];
+    snprintf(shell, sizeof shell, "%s 2>&1", cmd);
+    FILE *p = popen(shell, "r");
+    if (!p) { const char *m = "agent: popen failed\n"; write(s, m, strlen(m)); return; }
+    char buf[4096];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof buf, p)) > 0) {
+        size_t off = 0;
+        while (off < r) {
+            ssize_t w = write(s, buf + off, r - off);
+            if (w <= 0) { off = r; break; }
+            off += (size_t)w;
+        }
+    }
+    pclose(p);
+}
+
 int main(void) {
     int s = socket(AF_VSOCK, SOCK_STREAM, 0);
-    if (s < 0) { perror("socket"); return 1; }
-
+    if (s < 0) return 1;
     struct sockaddr_vm a;
     memset(&a, 0, sizeof a);
     a.svm_family = AF_VSOCK;
     a.svm_port = AGENT_PORT;
     a.svm_cid = VMADDR_CID_HOST;
-    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("connect"); return 2; }
+    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) return 0; // no host -> exit quietly
 
-    /* The host sends one command line on connect. */
-    char cmd[4096];
-    long n = read(s, cmd, sizeof cmd - 1);
-    if (n <= 0) { close(s); return 3; }
-    cmd[n] = 0;
-
-    /* Run it and stream stdout+stderr back over the connection. */
-    char shell[4160];
-    snprintf(shell, sizeof shell, "%s 2>&1", cmd);
-    FILE *p = popen(shell, "r");
-    if (!p) { const char *m = "agent: popen failed\n"; write(s, m, strlen(m)); close(s); return 4; }
-
-    char buf[4096];
-    size_t r;
-    while ((r = fread(buf, 1, sizeof buf, p)) > 0) {
-        ssize_t off = 0;
-        while ((size_t)off < r) {
-            ssize_t w = write(s, buf + off, r - off);
-            if (w <= 0) break;
-            off += w;
+    /* Serve a stream of newline-terminated commands until the host closes. */
+    char buf[8192];
+    size_t len = 0;
+    for (;;) {
+        long n = read(s, buf + len, sizeof buf - len - 1);
+        if (n <= 0) break;
+        len += (size_t)n;
+        size_t start = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (buf[i] == '\n') {
+                buf[i] = 0;
+                if (buf[start]) run(s, buf + start);
+                start = i + 1;
+            }
         }
+        if (start > 0) {
+            memmove(buf, buf + start, len - start);
+            len -= start;
+        }
+        if (len >= sizeof buf - 1) len = 0; // overlong line: reset
     }
-    pclose(p);
     close(s);
     return 0;
 }
