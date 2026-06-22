@@ -158,6 +158,14 @@ the datapaths by hand.
   Each replies `OK <n> bytes -> <path>` or `ERR ...`. Proven byte-identical for
   1 B..8 MiB binary files (16 MiB cap). The guest agent handles `__PUT__`/`__GET__`
   on the same vsock connection as commands, so transfers interleave with exec.
+- **Lifecycle** (over the control socket): `__stats__` returns the metering report;
+  `__shutdown__` cleanly stops the sandbox on demand (acks `OK shutting down`, then
+  the VM takes the PSCI-poweroff path and the process exits - not an abrupt kill).
+  With `max_runtime_s` (a watchdog auto-stop) the platform has both ends of sandbox
+  lifecycle.
+  ```sh
+  printf '__shutdown__\n' | nc -U /tmp/sb.sock   # -> OK shutting down; VM exits
+  ```
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

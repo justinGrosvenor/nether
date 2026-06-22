@@ -429,6 +429,9 @@ const ControlCtx = struct {
     path: [*:0]const u8,
     pipe_r: i32,
     allocator: std.mem.Allocator,
+    power: *nether.Power, // for the __shutdown__ lifecycle command
+    handles: []const u64, // vCPU handles to force out on shutdown
+    num_cpus: u32,
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 };
 
@@ -544,6 +547,15 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         const n = ctx.meter.report(&rep);
         _ = libc.write(c, rep[0..n].ptr, n);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        return;
+    }
+    // Lifecycle: on-demand clean teardown (the platform stops a sandbox without
+    // killing the process abruptly). Host-intercepted, like __stats__; reply first
+    // so the operator sees the ack, then stop (cpu0 returns .shutdown and exits).
+    if (std.mem.eql(u8, line, "__shutdown__\n") or std.mem.eql(u8, line, "__shutdown__")) {
+        reply(c, "OK shutting down\n");
+        std.debug.print("\n[nether] __shutdown__ requested; stopping sandbox\n", .{});
+        stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
         return;
     }
     var id = ctx.agent.conn_id.load(.acquire);
@@ -1133,7 +1145,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
@@ -1205,16 +1217,25 @@ const WatchdogCtx = struct {
 /// `hv_vcpu_run` so the run loop observes the action and returns `.shutdown`
 /// (cpu0's return unwinds macBootLinux and the process exits). Re-fires the exit a
 /// few times in case a vCPU is between runs or parked in WFI inside HVF.
-fn macWatchdog(ctx: *WatchdogCtx) void {
+/// Clean sandbox stop: request a PSCI-style poweroff, then force the vCPUs out of
+/// `hv_vcpu_run` (re-fired for any between runs or parked in WFI) so the run loop
+/// observes the action and returns `.shutdown` - cpu0's return unwinds macBootLinux
+/// and the process exits. Shared by the runtime watchdog and the `__shutdown__`
+/// control command.
+fn stopSandbox(power: *nether.Power, handles: []const u64, num_cpus: u32) void {
     const hvf = @import("hvf.zig");
-    while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
-    std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
-    ctx.power.request(.shutdown);
+    power.request(.shutdown);
     var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {
-        _ = hvf.hv_vcpus_exit(ctx.handles.ptr, ctx.num_cpus);
+        _ = hvf.hv_vcpus_exit(handles.ptr, num_cpus);
         _ = usleep(20_000);
     }
+}
+
+fn macWatchdog(ctx: *WatchdogCtx) void {
+    while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
+    std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
+    stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
 }
 
 /// Per-secondary-core thread context. The vCPU is created inside the thread (HVF

@@ -430,6 +430,14 @@ The build-out arc (offline-first chunks):
      an intentional safety choice - device models aren't individually thread-safe, so
      it serializes possibly-malicious concurrent vCPU access; per-device locking is
      the scalability follow-up (see io.zig).
+   - **`__shutdown__` lifecycle command (DONE).** An on-demand control-socket command
+     (host-intercepted like `__stats__`) for the platform to tear a sandbox down
+     cleanly without killing the process: it acks `OK shutting down`, then `stopSandbox`
+     takes the guest-PSCI-poweroff path (`power.request(.shutdown)` + `hv_vcpus_exit`),
+     so cpu0's run loop returns `.shutdown` and the process exits. Shares `stopSandbox`
+     with the runtime-budget watchdog. Proven live: `__shutdown__` -> ack -> clean
+     `guest shutdown`, process exits immediately. With the runtime budget this gives
+     the platform both ends of sandbox lifecycle (auto-stop + on-demand stop).
    - **Runtime budget (DONE) - govern (time axis).** `max_runtime_s` arms a watchdog
      thread that stops the sandbox after that many seconds of wall clock - a hard cap
      on cost/runaway for untrusted agents, alongside the firewall (reachability),
