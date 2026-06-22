@@ -1947,6 +1947,11 @@ const PciBarWindow = struct {
             .len = nether.memmap_arm.pci_mmio64_size,
             .read_fn = read,
             .write_fn = write,
+            // Routing is over the immutable device list and each virtio Device
+            // self-serializes via its dev_lock, so run off the bus lock: concurrent
+            // vCPUs hit different devices in parallel, and a notify's host I/O stays
+            // off the global lock.
+            .self_locked = true,
         };
     }
     fn match(self: *PciBarWindow, addr: u64) ?struct { dev: *nether.virtio.Device, off: u64 } {

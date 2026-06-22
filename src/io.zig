@@ -10,12 +10,16 @@ pub const max_pio = 16;
 pub const max_mmio = 16;
 
 /// A device claiming a port range [base, base+len). `ptr` is its own state.
+/// `self_locked` devices serialize their own concurrent access (their handler
+/// takes a per-device lock), so the bus releases its lock before calling them -
+/// see `Bus.lock`.
 pub const PioDevice = struct {
     ptr: *anyopaque,
     base: u16,
     len: u16,
     out_fn: *const fn (ptr: *anyopaque, port: u16, size: u8, value: u32) void,
     in_fn: *const fn (ptr: *anyopaque, port: u16, size: u8) u32,
+    self_locked: bool = false,
 
     fn contains(self: PioDevice, port: u16) bool {
         return port >= self.base and port - self.base < self.len;
@@ -30,6 +34,7 @@ pub const MmioDevice = struct {
     len: u64,
     read_fn: *const fn (ptr: *anyopaque, offset: u64, data: []u8) void,
     write_fn: *const fn (ptr: *anyopaque, offset: u64, data: []const u8) void,
+    self_locked: bool = false,
 
     fn contains(self: MmioDevice, addr: u64) bool {
         return addr >= self.base and addr - self.base < self.len;
@@ -41,19 +46,18 @@ pub const Bus = struct {
     pio_count: usize = 0,
     mmio: [max_mmio]MmioDevice = undefined,
     mmio_count: usize = 0,
-    /// Serializes device dispatch so concurrent vCPU threads (SMP) cannot race on
-    /// device state. It is held across the whole handler, not just the lookup,
-    /// BECAUSE the device models are not individually thread-safe: a malicious guest
-    /// could otherwise hammer one device from several vCPUs at once and corrupt its
-    /// state. The known cost is that a handler which performs host I/O (a virtio
-    /// notify that drives net TX does a `send`) holds this lock across that syscall,
-    /// briefly serializing unrelated device access on other vCPUs. That is a
-    /// scalability limit, not a safety bug. The fix when it matters is per-device
-    /// locking (then this drops to a lookup-only lock), tracked as a govern/SMP
-    /// follow-up. Host I/O threads that drive a device directly do NOT take this
-    /// lock: the interrupt/transport state they share with the vCPU side (ISR,
-    /// MSI-X table, queue vectors) is guarded by the device's own `irq_lock`
-    /// (see virtio.zig), and backends hold their own locks for backend state.
+    /// Guards the device registry lookup and serializes dispatch to devices that
+    /// are NOT internally thread-safe (the simple ones: PL011, ECAM, the firmware
+    /// PIO devices). The registry is immutable after init, so this is only ever
+    /// contended for the brief lookup + those small handlers.
+    ///
+    /// `self_locked` devices (the virtio functions, reached via the PCI BAR window)
+    /// take their OWN per-device lock, so the bus RELEASES this lock before calling
+    /// them - that is what lets concurrent vCPUs run in different virtio devices at
+    /// once, and keeps a virtio notify's host I/O (net TX `send`, a queue drain)
+    /// off the global bus lock. Host I/O threads that drive a device directly take
+    /// the device's own locks (virtio `dev_lock`/`irq_lock`, backend locks), never
+    /// this one.
     lock: Lock = .{},
 
     pub fn addPio(self: *Bus, dev: PioDevice) error{BusFull}!void {
@@ -70,45 +74,58 @@ pub const Bus = struct {
 
     pub fn pioOut(self: *Bus, port: u16, size: u8, value: u32) void {
         self.lock.lock();
-        defer self.lock.unlock();
         for (self.pio[0..self.pio_count]) |d| {
             if (d.contains(port)) {
+                if (d.self_locked) self.lock.unlock();
                 d.out_fn(d.ptr, port, size, value);
+                if (!d.self_locked) self.lock.unlock();
                 return;
             }
         }
+        self.lock.unlock();
     }
 
     pub fn pioIn(self: *Bus, port: u16, size: u8) u32 {
         self.lock.lock();
-        defer self.lock.unlock();
         for (self.pio[0..self.pio_count]) |d| {
-            if (d.contains(port)) return d.in_fn(d.ptr, port, size);
+            if (d.contains(port)) {
+                if (d.self_locked) {
+                    self.lock.unlock();
+                    return d.in_fn(d.ptr, port, size);
+                }
+                defer self.lock.unlock();
+                return d.in_fn(d.ptr, port, size);
+            }
         }
+        self.lock.unlock();
         return 0xFFFFFFFF;
     }
 
     pub fn mmioWrite(self: *Bus, addr: u64, data: []const u8) void {
         self.lock.lock();
-        defer self.lock.unlock();
         for (self.mmio[0..self.mmio_count]) |d| {
             if (d.contains(addr)) {
+                if (d.self_locked) self.lock.unlock();
                 d.write_fn(d.ptr, addr - d.base, data);
+                if (!d.self_locked) self.lock.unlock();
                 return;
             }
         }
+        self.lock.unlock();
     }
 
     pub fn mmioRead(self: *Bus, addr: u64, data: []u8) void {
         self.lock.lock();
-        defer self.lock.unlock();
         for (self.mmio[0..self.mmio_count]) |d| {
             if (d.contains(addr)) {
+                if (d.self_locked) self.lock.unlock();
                 d.read_fn(d.ptr, addr - d.base, data);
+                if (!d.self_locked) self.lock.unlock();
                 return;
             }
         }
         @memset(data, 0xFF);
+        self.lock.unlock();
     }
 };
 

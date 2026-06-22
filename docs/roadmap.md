@@ -446,6 +446,22 @@ The build-out arc (offline-first chunks):
      `.shutdown` and the process exits cleanly. 0 = unlimited. Proven live:
      `max_runtime_s=8` -> "runtime budget (8s) reached; stopping sandbox" -> clean
      `guest shutdown` at ~8 s.
+   - **Per-device locking; bus lock off the virtio hot path (DONE).** Both reviews
+     flagged the global bus lock held across whole device handlers - a virtio notify
+     that does net TX (`send`) or a queue drain serialized ALL vCPU MMIO, an SMP
+     scalability wall. The registry is immutable after init, so the bus lock now only
+     guards the lookup + the simple, non-self-locked devices (PL011, ECAM, firmware
+     PIO). Devices that self-serialize set `self_locked`: the bus releases its lock
+     before calling them. The PCI BAR window (all virtio BAR traffic) is self_locked,
+     and each virtio `Device` got a `dev_lock` taken at the top of barRead/barWrite -
+     so concurrent vCPUs run in DIFFERENT virtio devices in parallel, while the same
+     device serializes, and a notify's host I/O no longer holds a global lock.
+     `dev_lock` (vCPU<->vCPU) is distinct from and always outside `irq_lock`
+     (host<->vCPU interrupt state) - the notify path holds dev_lock then calls
+     interruptQueue (irq_lock), so one lock would self-deadlock; backends release
+     their own lock before interruptQueue, so no order is ever reversed. Proven live:
+     4-vCPU boot, MSI-X interrupts across cores, a 1 MiB vsock file round-trip
+     byte-identical, no deadlock; 165 tests pass.
    - **virtio transport-state lock (DONE).** A concurrency review found a real data
      race: `Device.interruptQueue` (called from host RX threads) and the guest's
      MMIO MSI-X/ISR/queue-vector writes (vCPU thread) share isr/msix_enabled/

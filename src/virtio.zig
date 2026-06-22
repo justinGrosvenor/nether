@@ -74,10 +74,18 @@ pub const Device = struct {
     /// Guards the interrupt/transport state (isr, msix_enabled, queue_vector,
     /// msix_table) shared between `interruptQueue` - called from host I/O threads
     /// (virtio-net/vsock RX) - and the guest's MMIO config/MSI-X/ISR writes on the
-    /// vCPU thread. The bus lock only covers the vCPU side, so without this the two
-    /// race (torn MSI-X entries, lost ISR bits, missed interrupts). Held only across
-    /// these field accesses, never across a queue drain or a syscall.
+    /// vCPU thread. Held only across these field accesses, never across a queue
+    /// drain or a syscall. MUST stay distinct from `dev_lock`: the notify path holds
+    /// `dev_lock` and then calls `interruptQueue`, so sharing one lock would
+    /// self-deadlock. Lock order is always dev_lock -> irq_lock.
     irq_lock: Lock = .{},
+    /// Serializes vCPU<->vCPU access to this device's MMIO (queues, config, status).
+    /// The bus no longer holds its lock across virtio handlers (the PCI BAR window
+    /// is self_locked), so concurrent vCPUs to the SAME device serialize here while
+    /// different devices run in parallel. Taken at the top of barRead/barWrite. Host
+    /// I/O threads don't take it (they reach interrupt state via irq_lock and queue
+    /// state via the backend's own lock).
+    dev_lock: Lock = .{},
 
     // Legacy IRQ callback (unused once MSI-X is on) and the MSI sink.
     irq_ptr: ?*anyopaque = null,
@@ -319,6 +327,8 @@ pub const Device = struct {
     }
 
     pub fn barRead(self: *Device, off: u64, size: u8) u32 {
+        self.dev_lock.lock();
+        defer self.dev_lock.unlock();
         if (off < isr_off) return self.commonRead(@intCast(off));
         if (off < notify_off) {
             self.irq_lock.lock();
@@ -336,6 +346,8 @@ pub const Device = struct {
 
     pub fn barWrite(self: *Device, off: u64, size: u8, value: u32) void {
         _ = size;
+        self.dev_lock.lock();
+        defer self.dev_lock.unlock();
         if (off < isr_off) {
             self.commonWrite(@intCast(off), value);
         } else if (off >= notify_off and off < device_off) {
