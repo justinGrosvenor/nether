@@ -8,6 +8,41 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const nether = @import("root.zig");
 
+// Host-OS primitives live in hostutil.zig; alias the ones the boot path still uses
+// so the orchestration bodies below read unchanged.
+const hostutil = @import("hostutil.zig");
+const libc = hostutil.libc;
+const usleep = hostutil.usleep;
+const nowMs = hostutil.nowMs;
+const writeAll = hostutil.writeAll;
+const readExact = hostutil.readExact;
+const readFileMac = hostutil.readFileMac;
+const cpath = hostutil.cpath;
+const SockaddrUn = hostutil.SockaddrUn;
+const AF_UNIX = hostutil.AF_UNIX;
+const SOCK_STREAM = hostutil.SOCK_STREAM;
+
+// Per-sandbox config (nether.conf) lives in conf.zig.
+const conf = @import("conf.zig");
+const confGet = conf.confGet;
+const confGetInt = conf.confGetInt;
+const confBool = conf.confBool;
+const modeOn = conf.modeOn;
+const macMarkerPresent = conf.markerPresent;
+
+// Control plane (control socket, agent plumbing, metering, lifecycle) lives in
+// control.zig.
+const control = @import("control.zig");
+const Metering = control.Metering;
+const AgentCtx = control.AgentCtx;
+const ControlCtx = control.ControlCtx;
+const AgentStdinCtx = control.AgentStdinCtx;
+const agentEvent = control.agentEvent;
+const controlListener = control.controlListener;
+const controlRelay = control.controlRelay;
+const agentStdinPump = control.agentStdinPump;
+const stopSandbox = control.stopSandbox;
+
 const GUEST_RAM_SIZE = 256 * nether.memmap.mib; // room for a kernel + initramfs
 const CODE_LOAD_ADDR = 0x1000;
 
@@ -305,358 +340,6 @@ fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
 fn slirpPollLoop(s: *nether.Slirp) void {
     while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
 }
-
-/// Host-side agent control. The sandbox becomes a REPL: host stdin lines are sent
-/// as commands to the in-guest agent (tools/agent.c) over vsock, and the command
-/// output the agent streams back is written to host stdout. The guest agent
-/// connects on boot; we record its connection id so the stdin pump can drive it.
-/// A diverted capture of the agent's reply, used by the host-mediated file
-/// transfer (`__put__`/`__get__`). While `AgentCtx.capture` points at one of these,
-/// agent reply bytes accumulate here instead of being relayed; the control thread
-/// waits on `done`, then reads the result. Single op at a time (the control
-/// protocol is serial), so no queue is needed.
-const Capture = struct {
-    is_get: bool, // GET parses "OK <len>\n" + body; PUT parses one "OK\n"/"ERR\n" line
-    buf: []u8, // accumulation (header+body for GET; tiny for PUT)
-    len: usize = 0,
-    body_off: usize = 0, // GET: where the file body starts (after the "OK <len>\n" header)
-    expect: usize = 0, // GET: total bytes expected (body_off + file len); 0 until parsed
-    err: bool = false,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn feed(self: *Capture, bytes: []const u8) void {
-        const n = @min(bytes.len, self.buf.len - self.len);
-        @memcpy(self.buf[self.len..][0..n], bytes[0..n]);
-        self.len += n;
-        if (!self.is_get) { // PUT: a single status line
-            if (std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') != null) {
-                self.err = !std.mem.startsWith(u8, self.buf[0..self.len], "OK");
-                self.done.store(true, .release);
-            }
-            return;
-        }
-        if (self.expect == 0) { // GET: still parsing the "OK <len>\n" / "ERR\n" header
-            const nl = std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') orelse return;
-            const hdr = self.buf[0..nl];
-            if (!std.mem.startsWith(u8, hdr, "OK ")) {
-                self.err = true;
-                self.done.store(true, .release);
-                return;
-            }
-            const flen = std.fmt.parseInt(usize, hdr[3..], 10) catch {
-                self.err = true;
-                self.done.store(true, .release);
-                return;
-            };
-            self.body_off = nl + 1;
-            if (flen > self.buf.len - self.body_off) { // larger than our cap
-                self.err = true;
-                self.done.store(true, .release);
-                return;
-            }
-            self.expect = self.body_off + flen;
-        }
-        if (self.expect != 0 and self.len >= self.expect) self.done.store(true, .release);
-    }
-};
-
-const AgentCtx = struct {
-    conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
-    /// Control-socket mode: agent replies are written raw to this pipe for the
-    /// relay thread to forward to the connected control client. -1 = REPL mode
-    /// (parse and print to stdout instead).
-    pipe_w: i32 = -1,
-    /// When set, agent reply bytes are diverted into this capture (file transfer)
-    /// instead of relayed/printed. Set/cleared by the control thread.
-    capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
-    parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
-    exit_buf: [16]u8 = undefined,
-    exit_len: usize = 0,
-
-    /// Parse the agent's framed reply stream: raw output up to 0x1e, then the
-    /// command's exit code, printed as a `[exit N]` line.
-    fn onRecv(a: *AgentCtx, bytes: []const u8) void {
-        var i: usize = 0;
-        while (i < bytes.len) {
-            if (a.parsing_exit) {
-                if (bytes[i] == '\n') {
-                    std.debug.print("[exit {s}]\n", .{a.exit_buf[0..a.exit_len]});
-                    a.parsing_exit = false;
-                    a.exit_len = 0;
-                } else if (a.exit_len < a.exit_buf.len) {
-                    a.exit_buf[a.exit_len] = bytes[i];
-                    a.exit_len += 1;
-                }
-                i += 1;
-            } else {
-                const start = i;
-                while (i < bytes.len and bytes[i] != 0x1e) i += 1;
-                if (i > start) _ = std.c.write(1, bytes[start..].ptr, i - start);
-                if (i < bytes.len) { // hit the 0x1e separator
-                    a.parsing_exit = true;
-                    i += 1;
-                }
-            }
-        }
-    }
-};
-fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
-    const a: *AgentCtx = @ptrCast(@alignCast(ctx));
-    switch (ev) {
-        .accept => |id| {
-            a.conn_id.store(@intCast(id), .release);
-            std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
-        },
-        .recv => |r| if (a.capture.load(.acquire)) |cap| {
-            cap.feed(r.bytes); // file transfer in progress: divert the reply
-        } else if (a.pipe_w >= 0) {
-            _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
-        } else a.onRecv(r.bytes),
-        .shutdown, .reset => a.conn_id.store(-1, .release),
-        else => {},
-    }
-}
-
-/// Control plane: a Unix-domain socket the platform connects to in order to drive
-/// the in-guest agent without owning this process's stdio. One control client at
-/// a time: its command lines are forwarded to the agent over vsock, and the
-/// agent's framed replies are relayed back. The framing (output + 0x1e<exit>\n) is
-/// the agent's, so the client parses results just as a stdio driver would.
-const ControlCtx = struct {
-    vsdev: *nether.VsockDev,
-    agent: *AgentCtx,
-    meter: *Metering,
-    path: [*:0]const u8,
-    pipe_r: i32,
-    allocator: std.mem.Allocator,
-    power: *nether.Power, // for the __shutdown__ lifecycle command
-    handles: []const u64, // vCPU handles to force out on shutdown
-    num_cpus: u32,
-    client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
-};
-
-/// Max bytes a single `__put__`/`__get__` moves. Bounds host memory and frames the
-/// guest-side payload; large enough for typical task payloads/artifacts.
-const MAX_XFER: usize = 16 * 1024 * 1024;
-
-/// Send `data` to the guest agent, retrying as its staging ring drains (hostSend
-/// accepts only what fits). Returns false if the connection dies mid-send.
-fn hostSendAll(vsdev: *nether.VsockDev, id: u16, data: []const u8) bool {
-    var off: usize = 0;
-    var stalls: u32 = 0;
-    while (off < data.len) {
-        const sent = vsdev.hostSend(id, data[off..]);
-        if (sent == 0) {
-            stalls += 1;
-            if (stalls > 100_000) return false; // ~ guest not draining
-            _ = usleep(100);
-        } else {
-            off += sent;
-            stalls = 0;
-        }
-    }
-    return true;
-}
-
-/// Wait (bounded) for a diverted capture to complete.
-fn waitCapture(cap: *Capture) bool {
-    var spins: u32 = 0;
-    while (!cap.done.load(.acquire)) {
-        spins += 1;
-        if (spins > 600_000) return false; // ~60s ceiling
-        _ = usleep(100);
-    }
-    return true;
-}
-
-/// Copy a path slice into `buf` as a NUL-terminated C string for libc calls.
-fn cpath(buf: []u8, p: []const u8) ?[*:0]const u8 {
-    if (p.len + 1 > buf.len) return null;
-    @memcpy(buf[0..p.len], p);
-    buf[p.len] = 0;
-    return @ptrCast(buf.ptr);
-}
-
-/// Host-mediated file push: read the host file and stream it to the guest agent as
-/// a __PUT__ request. `args` = "<hostpath> <guestpath>".
-fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
-    const sp = std.mem.indexOfScalar(u8, args, ' ') orelse return reply(c, "ERR bad __put__ (need <hostpath> <guestpath>)\n");
-    const hostpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
-    const guestpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
-    var pb: [1024]u8 = undefined;
-    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
-    const data = readFileMac(ctx.allocator, hp) catch return reply(c, "ERR cannot read host file\n");
-    defer ctx.allocator.free(data);
-    if (data.len > MAX_XFER) return reply(c, "ERR file too large\n");
-
-    var rbuf: [8]u8 = undefined;
-    var cap = Capture{ .is_get = false, .buf = &rbuf };
-    ctx.agent.capture.store(&cap, .release);
-    defer ctx.agent.capture.store(null, .release);
-
-    var hdr: [4096]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "__PUT__ {s} {d}\n", .{ guestpath, data.len }) catch return reply(c, "ERR guest path too long\n");
-    if (!hostSendAll(ctx.vsdev, id, h) or !hostSendAll(ctx.vsdev, id, data)) return reply(c, "ERR send failed\n");
-    if (!waitCapture(&cap) or cap.err) return reply(c, "ERR guest write failed\n");
-    var ok: [128]u8 = undefined;
-    reply(c, std.fmt.bufPrint(&ok, "OK put {d} bytes -> {s}\n", .{ data.len, guestpath }) catch "OK\n");
-}
-
-/// Host-mediated file pull: request a file from the guest agent and write it to the
-/// host. `args` = "<guestpath> <hostpath>".
-fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
-    const sp = std.mem.indexOfScalar(u8, args, ' ') orelse return reply(c, "ERR bad __get__ (need <guestpath> <hostpath>)\n");
-    const guestpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
-    const hostpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
-
-    const cbuf = ctx.allocator.alloc(u8, MAX_XFER + 64) catch return reply(c, "ERR out of memory\n");
-    defer ctx.allocator.free(cbuf);
-    var cap = Capture{ .is_get = true, .buf = cbuf };
-    ctx.agent.capture.store(&cap, .release);
-    defer ctx.agent.capture.store(null, .release);
-
-    var hdr: [4096]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "__GET__ {s}\n", .{guestpath}) catch return reply(c, "ERR guest path too long\n");
-    if (!hostSendAll(ctx.vsdev, id, h)) return reply(c, "ERR send failed\n");
-    if (!waitCapture(&cap) or cap.err) return reply(c, "ERR guest read failed (missing?)\n");
-    const body = cap.buf[cap.body_off..cap.expect];
-
-    var pb: [1024]u8 = undefined;
-    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
-    const O_WRONLY = 0x0001;
-    const O_CREAT = 0x0200;
-    const O_TRUNC = 0x0400;
-    const fd = libc.open(hp, O_WRONLY | O_CREAT | O_TRUNC, @as(c_int, 0o644));
-    if (fd < 0) return reply(c, "ERR cannot write host file\n");
-    defer _ = libc.close(fd);
-    if (!writeAll(fd, body)) return reply(c, "ERR write failed\n");
-    var ok: [128]u8 = undefined;
-    reply(c, std.fmt.bufPrint(&ok, "OK got {d} bytes -> {s}\n", .{ body.len, hostpath }) catch "OK\n");
-}
-
-fn reply(c: c_int, msg: []const u8) void {
-    _ = libc.write(c, msg.ptr, msg.len);
-}
-
-/// Send one command line to the guest agent (waiting for it to connect), counting
-/// it for metering. The `__stats__` line is intercepted here and answered by the
-/// host without touching the guest.
-fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
-    if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
-        var rep: [512]u8 = undefined;
-        const n = ctx.meter.report(&rep);
-        _ = libc.write(c, rep[0..n].ptr, n);
-        _ = ctx.meter.bytes_out.fetchAdd(n, .release);
-        return;
-    }
-    // Lifecycle: on-demand clean teardown (the platform stops a sandbox without
-    // killing the process abruptly). Host-intercepted, like __stats__; reply first
-    // so the operator sees the ack, then stop (cpu0 returns .shutdown and exits).
-    if (std.mem.eql(u8, line, "__shutdown__\n") or std.mem.eql(u8, line, "__shutdown__")) {
-        reply(c, "OK shutting down\n");
-        std.debug.print("\n[nether] __shutdown__ requested; stopping sandbox\n", .{});
-        stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
-        return;
-    }
-    var id = ctx.agent.conn_id.load(.acquire);
-    while (id < 0) {
-        _ = usleep(50_000);
-        id = ctx.agent.conn_id.load(.acquire);
-    }
-    // File transfer (host-mediated): the bytes move over vsock with length framing,
-    // never through this line-oriented socket, so payloads can be binary/large.
-    if (std.mem.startsWith(u8, line, "__put__ ")) {
-        controlPut(ctx, c, @intCast(id), line["__put__ ".len..]);
-        _ = ctx.meter.commands.fetchAdd(1, .release);
-        return;
-    }
-    if (std.mem.startsWith(u8, line, "__get__ ")) {
-        controlGet(ctx, c, @intCast(id), line["__get__ ".len..]);
-        _ = ctx.meter.commands.fetchAdd(1, .release);
-        return;
-    }
-    _ = ctx.vsdev.hostSend(@intCast(id), line);
-    _ = ctx.meter.commands.fetchAdd(1, .release);
-    _ = ctx.meter.bytes_in.fetchAdd(line.len, .release);
-}
-
-fn controlListener(ctx: *ControlCtx) void {
-    const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        std.debug.print("[control] socket() failed\n", .{});
-        return;
-    }
-    _ = libc.unlink(ctx.path);
-    var addr = SockaddrUn{};
-    const p = std.mem.span(ctx.path);
-    @memcpy(addr.path[0..p.len], p);
-    addr.len = @intCast(2 + p.len + 1);
-    if (libc.bind(fd, &addr, addr.len) < 0 or libc.listen(fd, 4) < 0) {
-        std.debug.print("[control] bind/listen failed on {s}\n", .{ctx.path});
-        return;
-    }
-    std.debug.print("[control] listening on {s}\n", .{ctx.path});
-    while (true) {
-        const c = libc.accept(fd, null, null);
-        if (c < 0) continue;
-        ctx.client.store(c, .release);
-        // Line-buffer the client stream so `__stats__` can be intercepted and each
-        // command metered; everything else is forwarded verbatim to the agent.
-        var buf: [4096]u8 = undefined;
-        var len: usize = 0;
-        while (true) {
-            const r = libc.read(c, buf[len..].ptr, buf.len - len);
-            if (r <= 0) break;
-            len += @intCast(r);
-            var start: usize = 0;
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                if (buf[i] == '\n') {
-                    controlCommand(ctx, c, buf[start .. i + 1]);
-                    start = i + 1;
-                }
-            }
-            if (start > 0) {
-                std.mem.copyForwards(u8, buf[0 .. len - start], buf[start..len]);
-                len -= start;
-            }
-            if (len == buf.len) len = 0; // overlong line: drop
-        }
-        ctx.client.store(-1, .release);
-        _ = libc.close(c);
-    }
-}
-
-/// Relay the guest agent's reply stream (from the recv pipe) to the current
-/// control client.
-fn controlRelay(ctx: *ControlCtx) void {
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = libc.read(ctx.pipe_r, &buf, buf.len);
-        if (n <= 0) return;
-        const c = ctx.client.load(.acquire);
-        if (c >= 0) {
-            _ = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
-            _ = ctx.meter.bytes_out.fetchAdd(@intCast(n), .release);
-        }
-    }
-}
-
-/// I/O thread (agent mode): forward host stdin to the guest agent over vsock.
-fn agentStdinPump(ctx: *AgentStdinCtx) void {
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = libc.read(0, &buf, buf.len);
-        if (n <= 0) return;
-        var id = ctx.agent.conn_id.load(.acquire);
-        while (id < 0) { // wait until the guest agent has connected
-            _ = usleep(50_000);
-            id = ctx.agent.conn_id.load(.acquire);
-        }
-        _ = ctx.vsdev.hostSend(@intCast(id), buf[0..@intCast(n)]);
-    }
-}
-const AgentStdinCtx = struct { vsdev: *nether.VsockDev, agent: *AgentCtx };
 
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
@@ -1217,21 +900,6 @@ const WatchdogCtx = struct {
 /// `hv_vcpu_run` so the run loop observes the action and returns `.shutdown`
 /// (cpu0's return unwinds macBootLinux and the process exits). Re-fires the exit a
 /// few times in case a vCPU is between runs or parked in WFI inside HVF.
-/// Clean sandbox stop: request a PSCI-style poweroff, then force the vCPUs out of
-/// `hv_vcpu_run` (re-fired for any between runs or parked in WFI) so the run loop
-/// observes the action and returns `.shutdown` - cpu0's return unwinds macBootLinux
-/// and the process exits. Shared by the runtime watchdog and the `__shutdown__`
-/// control command.
-fn stopSandbox(power: *nether.Power, handles: []const u64, num_cpus: u32) void {
-    const hvf = @import("hvf.zig");
-    power.request(.shutdown);
-    var tries: u32 = 0;
-    while (tries < 50) : (tries += 1) {
-        _ = hvf.hv_vcpus_exit(handles.ptr, num_cpus);
-        _ = usleep(20_000);
-    }
-}
-
 fn macWatchdog(ctx: *WatchdogCtx) void {
     while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
     std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
@@ -1460,16 +1128,6 @@ const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
 const SNAP_VERSION: u32 = 2;
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
 
-fn writeAll(fd: c_int, buf: []const u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const w = libc.write(fd, buf.ptr + off, buf.len - off);
-        if (w <= 0) return false;
-        off += @intCast(w);
-    }
-    return true;
-}
-
 fn writeSnapshotFile(
     path: [*:0]const u8,
     ram: []const u8,
@@ -1512,16 +1170,6 @@ fn writeSnapshotFile(
     var pad = [_]u8{0} ** HOST_PAGE;
     if (ram_off > meta and !writeAll(fd, pad[0 .. ram_off - meta])) return false;
     if (!writeAll(fd, ram)) return false;
-    return true;
-}
-
-fn readExact(fd: c_int, buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const r = libc.read(fd, buf.ptr + off, buf.len - off);
-        if (r <= 0) return false;
-        off += @intCast(r);
-    }
     return true;
 }
 
@@ -1682,14 +1330,6 @@ fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     std.debug.print("\n[nether] forked guest {s}.\n", .{@tagName(reason)});
 }
 
-/// Opt-in marker check (macOS libc), mirroring the x86 markerPresent.
-fn macMarkerPresent(path: [*:0]const u8) bool {
-    const fd = libc.open(path, 0, @as(c_int, 0));
-    if (fd < 0) return false;
-    _ = libc.close(fd);
-    return true;
-}
-
 /// First light under Apple HVF: a tiny aarch64 blob writes a message to the PL011
 /// (MMIO, dispatched through the same Bus the x86 path uses) and powers off via
 /// PSCI. Proves hv_vm_create/map, hv_vcpu_run, and the data-abort/HVC decode.
@@ -1720,153 +1360,6 @@ fn macBlobDemo(allocator: std.mem.Allocator) !void {
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
-}
-
-/// libc file IO (macOS): std.posix/std.c don't expose these publicly in this Zig,
-/// and the new std.Io.Dir reader needs an Io instance; these symbols are linked.
-const libc = struct {
-    extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
-    extern "c" fn close(fd: c_int) c_int;
-    extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
-    extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
-    extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
-    // Unix-domain control socket + a pipe to relay the guest agent's replies.
-    extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
-    extern "c" fn bind(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
-    extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
-    extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
-    extern "c" fn unlink(path: [*:0]const u8) c_int;
-    extern "c" fn pipe(fds: *[2]c_int) c_int;
-};
-extern "c" fn usleep(usec: c_uint) c_int;
-
-const AF_UNIX: c_int = 1;
-const SOCK_STREAM: c_int = 1;
-const SockaddrUn = extern struct {
-    len: u8 = 0,
-    family: u8 = AF_UNIX,
-    path: [104]u8 = [_]u8{0} ** 104,
-};
-
-/// Read a `key=value` from `nether.conf` in the cwd into `out` (NUL-terminated for
-/// socket binds), returning the value or null if the file/key is absent. The
-/// platform writes one config per sandbox (e.g. a distinct `control_socket` path)
-/// so many sandboxes run on one host. Minimal: `key = value` lines, `#` comments.
-fn confGet(key: []const u8, out: []u8) ?[]const u8 {
-    const fd = libc.open("nether.conf", 0, @as(c_int, 0));
-    if (fd < 0) return null;
-    defer _ = libc.close(fd);
-    var buf: [4096]u8 = undefined;
-    const n = libc.read(fd, &buf, buf.len);
-    if (n <= 0) return null;
-    var it = std.mem.splitScalar(u8, buf[0..@intCast(n)], '\n');
-    while (it.next()) |line| {
-        const l = std.mem.trim(u8, line, " \t\r");
-        if (l.len == 0 or l[0] == '#') continue;
-        const eq = std.mem.indexOfScalar(u8, l, '=') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, l[0..eq], " \t"), key)) continue;
-        const v = std.mem.trim(u8, l[eq + 1 ..], " \t");
-        if (v.len + 1 > out.len) return null;
-        @memcpy(out[0..v.len], v);
-        out[v.len] = 0; // NUL terminator for [*:0] consumers
-        return out[0..v.len];
-    }
-    return null;
-}
-
-/// nether.conf integer value for `key`, or `default` if absent/unparseable.
-fn confGetInt(key: []const u8, default: u64) u64 {
-    var b: [32]u8 = undefined;
-    if (confGet(key, &b)) |v| return std.fmt.parseInt(u64, v, 10) catch default;
-    return default;
-}
-
-/// nether.conf boolean (`1`/`true`/`yes`) for `key`, false if absent.
-fn confBool(key: []const u8) bool {
-    var b: [16]u8 = undefined;
-    if (confGet(key, &b)) |v| {
-        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes");
-    }
-    return false;
-}
-
-/// A mode is on if its config key is set or its (legacy) marker file is present.
-fn modeOn(comptime conf_key: []const u8, comptime marker: [*:0]const u8) bool {
-    return confBool(conf_key) or macMarkerPresent(marker);
-}
-
-// macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
-const timeval = extern struct { sec: i64, usec: i32 };
-extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
-fn nowMs() i64 {
-    var tv: timeval = .{ .sec = 0, .usec = 0 };
-    _ = gettimeofday(&tv, null);
-    return tv.sec * 1000 + @divTrunc(tv.usec, 1000);
-}
-
-/// Per-sandbox resource usage, exposed to the platform (which settles per use)
-/// via the `__stats__` control command. Counters are shared across the control
-/// threads; the platform reads them to meter compute, RAM, and I/O.
-const Metering = struct {
-    start_ms: i64 = 0,
-    ram_mb: u64 = 0,
-    cpus: u32 = 0,
-    commands: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    bytes_in: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // client -> sandbox
-    bytes_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // sandbox -> client
-    net: ?*nether.Slirp = null, // network NAT, for egress/ingress byte counts
-
-    /// Render a stats report (text + the agent's 0x1e<exit>\n framing) into `buf`.
-    fn report(self: *Metering, buf: []u8) usize {
-        const net_tx = if (self.net) |s| s.tx_bytes.load(.monotonic) else 0;
-        const net_rx = if (self.net) |s| s.rx_bytes.load(.monotonic) else 0;
-        const net_blocked = if (self.net) |s| s.blocked_count.load(.monotonic) else 0;
-        return (std.fmt.bufPrint(buf,
-            \\nether sandbox stats
-            \\uptime_ms={d}
-            \\ram_mb={d}
-            \\cpus={d}
-            \\commands={d}
-            \\bytes_in={d}
-            \\bytes_out={d}
-            \\net_tx_bytes={d}
-            \\net_rx_bytes={d}
-            \\net_blocked={d}
-            \\{c}0
-            \\
-        , .{
-            nowMs() - self.start_ms,
-            self.ram_mb,
-            self.cpus,
-            self.commands.load(.acquire),
-            self.bytes_in.load(.acquire),
-            self.bytes_out.load(.acquire),
-            net_tx,
-            net_rx,
-            net_blocked,
-            @as(u8, 0x1e),
-        }) catch return 0).len;
-    }
-};
-
-/// Read a whole file (macOS host side). Caller owns the slice.
-fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
-    const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
-    if (fd < 0) return error.OpenFailed;
-    defer _ = libc.close(fd);
-    const size_i = libc.lseek(fd, 0, 2); // SEEK_END
-    if (size_i <= 0) return error.OpenFailed;
-    _ = libc.lseek(fd, 0, 0); // SEEK_SET
-    const size: usize = @intCast(size_i);
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    var off: usize = 0;
-    while (off < size) {
-        const n = libc.read(fd, buf.ptr + off, size - off);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-    return buf;
 }
 
 /// PL011 TX sink: write one guest byte to host stdout (libc is linked on macOS).
