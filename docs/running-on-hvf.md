@@ -166,6 +166,14 @@ the datapaths by hand.
   ```sh
   printf '__shutdown__\n' | nc -U /tmp/sb.sock   # -> OK shutting down; VM exits
   ```
+- **Render** (over the control socket): `__screen__` returns a snapshot of the
+  sandbox's terminal - the agent's command output rendered through a server-side VT
+  screen (real CR/cursor/colors/clear, not log concatenation), so the platform can
+  display the agent's visible work without the guest cooperating. Size it with
+  `screen_rows` / `screen_cols` in nether.conf (default 24x80).
+  ```sh
+  printf '__screen__\n' | nc -U /tmp/sb.sock     # -> the rendered terminal text
+  ```
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

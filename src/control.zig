@@ -136,6 +136,9 @@ pub const AgentCtx = struct {
     /// When set, agent reply bytes are diverted into this capture (file transfer)
     /// instead of relayed/printed. Set/cleared by the control thread.
     capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
+    /// The render pillar: when set, command output is teed into a VT screen so the
+    /// platform can fetch a rendered snapshot via `__screen__`.
+    render: ?*nether.Render = null,
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
@@ -177,9 +180,12 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
         },
         .recv => |r| if (a.capture.load(.acquire)) |cap| {
             cap.feed(r.bytes); // file transfer in progress: divert the reply
-        } else if (a.pipe_w >= 0) {
-            _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
-        } else a.onRecv(r.bytes),
+        } else {
+            if (a.render) |rd| rd.feed(r.bytes); // tee command output into the render screen
+            if (a.pipe_w >= 0) {
+                _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
+            } else a.onRecv(r.bytes);
+        },
         .shutdown, .reset => a.conn_id.store(-1, .release),
         else => {},
     }
@@ -307,6 +313,17 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         const n = ctx.meter.report(&rep);
         _ = libc.write(c, rep[0..n].ptr, n);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        return;
+    }
+    // Render: return a snapshot of the sandbox's terminal (what the agent's session
+    // currently shows), host-intercepted like __stats__.
+    if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {
+        if (ctx.agent.render) |rd| {
+            var buf: [64 * 1024]u8 = undefined;
+            const n = rd.snapshot(&buf);
+            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        } else reply(c, "ERR render not enabled\n");
         return;
     }
     // Lifecycle: on-demand clean teardown (the platform stops a sandbox without

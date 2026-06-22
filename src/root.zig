@@ -38,6 +38,10 @@ pub const vt = struct {
     pub const Screen = @import("vt/Screen.zig");
 };
 
+/// The render pillar: a server-side terminal model of the agent's session, fed by
+/// its output and snapshot via the `__screen__` control command.
+pub const Render = @import("render.zig").Render;
+
 pub const webconsole = @import("webconsole.zig");
 pub const WebConsole = webconsole.Server;
 
@@ -81,6 +85,7 @@ test {
     _ = @import("vt/parse_table.zig");
     _ = @import("vt/osc.zig");
     _ = @import("vt/Screen.zig");
+    _ = @import("render.zig");
     _ = @import("webconsole.zig");
     _ = @import("virtio_vsock.zig");
     _ = @import("virtio_net.zig");

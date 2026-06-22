@@ -738,6 +738,17 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const agent_repl = modeOn("agent", "nether-agent") and !control_on;
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
     const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
+
+    // Render pillar: in control mode, tee the agent's terminal output into a VT
+    // screen so the platform can fetch a rendered snapshot via `__screen__`.
+    var render: nether.Render = undefined;
+    if (control_on) {
+        const rows: u16 = @intCast(std.math.clamp(confGetInt("screen_rows", 24), 1, 200));
+        const cols: u16 = @intCast(std.math.clamp(confGetInt("screen_cols", 80), 1, 400));
+        render = try nether.Render.init(allocator, rows, cols);
+        agent_ctx.render = &render;
+    }
+    defer if (control_on) render.deinit();
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };

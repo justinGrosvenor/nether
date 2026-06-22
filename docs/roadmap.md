@@ -430,6 +430,18 @@ The build-out arc (offline-first chunks):
      an intentional safety choice - device models aren't individually thread-safe, so
      it serializes possibly-malicious concurrent vCPU access; per-device locking is
      the scalability follow-up (see io.zig).
+   - **Render pillar (DONE).** The platform must be able to show an untrusted
+     agent's work. `render.zig` maintains a server-side VT `Screen` (the same parser/
+     grid the serial console uses) fed by the agent's command output, so the
+     platform can fetch a rendered snapshot of what the sandbox's terminal shows -
+     to display, stream, or store as the visible artifact - without the guest
+     cooperating. The agent reply stream is teed in with its `0x1e<exit>\n` framing
+     stripped and pipe LF mapped to CR+LF (ONLCR), so it renders like a real tty.
+     Exposed as the `__screen__` control command; size via `screen_rows`/`screen_cols`
+     (default 24x80). Unit-tested (framing strip incl. split-chunk) and proven live:
+     after running commands, `__screen__` returns the clean terminal, and a
+     `printf 'PROGRESS-XXXXXX\rDONE'` renders as `DONERESS-XXXXXX` (real CR overwrite,
+     not log concatenation).
    - **`__shutdown__` lifecycle command (DONE).** An on-demand control-socket command
      (host-intercepted like `__stats__`) for the platform to tear a sandbox down
      cleanly without killing the process: it acks `OK shutting down`, then `stopSandbox`
