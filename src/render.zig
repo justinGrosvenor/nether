@@ -16,6 +16,11 @@ pub const Render = struct {
     screen: Screen,
     lock: Lock = .{}, // the agent RX thread feeds; a control thread snapshots
     in_trailer: bool = false, // mid 0x1e<exit>\n framing trailer (skipped)
+    // Streaming diff state: a hash of each live row as last emitted, so `diff` can
+    // send only the rows that changed. `primed` is false until the first diff (which
+    // emits the whole current screen). Sized past the 200-row config clamp.
+    row_hash: [256]u64 = [_]u64{0} ** 256,
+    primed: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) !Render {
         return .{ .screen = try Screen.init(alloc, rows, cols) };
@@ -58,6 +63,49 @@ pub const Render = struct {
         }
     }
 
+    /// Force the next `diff` to re-emit the whole screen (call when a fresh control
+    /// client connects so it gets a full picture before deltas).
+    pub fn resetDiff(self: *Render) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.primed = false;
+    }
+
+    /// Streaming delta: emit only the LIVE rows (the fixed rows x cols grid, not
+    /// scrollback) that changed since the last call, so the platform can follow the
+    /// screen cheaply. Wire format:
+    ///   SCREEN <rows>x<cols>\n
+    ///   <row-index> <text>\n      (one per changed row; text may be empty = cleared)
+    ///   \n                        (blank line terminates)
+    /// The first call after init/resetDiff emits every non-empty row (the full
+    /// screen). Returns the bytes written into `out`.
+    pub fn diff(self: *Render, out: []u8) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        const rows = self.screen.rows;
+        const sb = self.screen.scrollbackLen();
+        n += (std.fmt.bufPrint(out[n..], "SCREEN {d}x{d}\n", .{ rows, self.screen.cols }) catch return n).len;
+        var rbuf: [4096]u8 = undefined;
+        var j: u16 = 0;
+        while (j < rows) : (j += 1) {
+            const line = std.mem.trimEnd(u8, self.screen.viewRow(sb + j, &rbuf), " ");
+            const h = std.hash.Wyhash.hash(0, line);
+            const changed = if (self.primed) h != self.row_hash[j] else line.len > 0;
+            self.row_hash[j] = h;
+            if (changed) {
+                const w = std.fmt.bufPrint(out[n..], "{d} {s}\n", .{ j, line }) catch break;
+                n += w.len;
+            }
+        }
+        self.primed = true;
+        if (n < out.len) { // terminating blank line
+            out[n] = '\n';
+            n += 1;
+        }
+        return n;
+    }
+
     /// Render the non-empty rows of the current view (scrollback + live screen) into
     /// `out` as newline-joined lines with trailing spaces trimmed. Returns the bytes
     /// written. This is what the `__screen__` control command returns.
@@ -94,6 +142,24 @@ test "feed strips 0x1e<exit> trailers and renders output" {
     try std.testing.expect(std.mem.indexOf(u8, out, "world") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null); // no RS
     try std.testing.expect(std.mem.indexOf(u8, out, "world1") == null); // trailer stripped
+}
+
+test "diff emits the full screen first, then only changed rows" {
+    var r = try Render.init(std.testing.allocator, 4, 20);
+    defer r.deinit();
+    r.feed("line-a\n"); // row 0
+    r.feed("line-b\n"); // row 1
+    var buf: [512]u8 = undefined;
+    const d1 = buf[0..r.diff(&buf)]; // first diff = full screen
+    try std.testing.expect(std.mem.indexOf(u8, d1, "0 line-a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d1, "1 line-b") != null);
+    const d2 = buf[0..r.diff(&buf)]; // nothing changed -> no row lines
+    try std.testing.expect(std.mem.indexOf(u8, d2, "line-a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d2, "line-b") == null);
+    r.feed("line-c\n"); // row 2 changes
+    const d3 = buf[0..r.diff(&buf)];
+    try std.testing.expect(std.mem.indexOf(u8, d3, "2 line-c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d3, "line-a") == null); // unchanged row not re-sent
 }
 
 test "feed handles a trailer split across two chunks" {

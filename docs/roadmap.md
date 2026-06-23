@@ -442,6 +442,15 @@ The build-out arc (offline-first chunks):
      after running commands, `__screen__` returns the clean terminal, and a
      `printf 'PROGRESS-XXXXXX\rDONE'` renders as `DONERESS-XXXXXX` (real CR overwrite,
      not log concatenation).
+   - **Screen streaming / diff (DONE).** So the platform can *follow* the agent's
+     screen cheaply instead of re-pulling the whole grid, `__screendiff__` returns
+     only the LIVE rows (the fixed rows x cols grid, not scrollback) that changed
+     since the last call - the first call (or after a fresh client connects) emits
+     the whole screen. Per-row Wyhash tracks what was last sent; wire format is
+     `SCREEN <rows>x<cols>` then `<row-index> <text>` lines (text may be empty =
+     cleared) terminated by a blank line. Unit-tested and proven live: diff#1 sends
+     the full screen, an unchanged diff#2 sends no rows, and after a new command
+     diff#3 sends only the one changed row.
    - **`__shutdown__` lifecycle command (DONE).** An on-demand control-socket command
      (host-intercepted like `__stats__`) for the platform to tear a sandbox down
      cleanly without killing the process: it acks `OK shutting down`, then `stopSandbox`

@@ -315,12 +315,24 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
-    // Render: return a snapshot of the sandbox's terminal (what the agent's session
-    // currently shows), host-intercepted like __stats__.
+    // Render: full snapshot of the sandbox terminal (scrollback + live), host-
+    // intercepted like __stats__.
     if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {
         if (ctx.agent.render) |rd| {
             var buf: [64 * 1024]u8 = undefined;
             const n = rd.snapshot(&buf);
+            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        } else reply(c, "ERR render not enabled\n");
+        return;
+    }
+    // Render streaming: only the live rows that changed since the last __screendiff__
+    // (the first call emits the whole screen). Lets the platform follow the screen
+    // cheaply by polling.
+    if (std.mem.eql(u8, line, "__screendiff__\n") or std.mem.eql(u8, line, "__screendiff__")) {
+        if (ctx.agent.render) |rd| {
+            var buf: [64 * 1024]u8 = undefined;
+            const n = rd.diff(&buf);
             _ = libc.write(c, buf[0..n].ptr, n);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
@@ -377,6 +389,7 @@ pub fn controlListener(ctx: *ControlCtx) void {
         const c = libc.accept(fd, null, null);
         if (c < 0) continue;
         ctx.client.store(c, .release);
+        if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh client gets a full screen first
         // Line-buffer the client stream so `__stats__` can be intercepted and each
         // command metered; everything else is forwarded verbatim to the agent.
         var buf: [4096]u8 = undefined;

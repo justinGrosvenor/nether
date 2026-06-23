@@ -174,6 +174,13 @@ the datapaths by hand.
   ```sh
   printf '__screen__\n' | nc -U /tmp/sb.sock     # -> the rendered terminal text
   ```
+  To *follow* the screen cheaply, `__screendiff__` returns only the live rows that
+  changed since the last call (the first call, or a fresh client, gets the whole
+  screen): `SCREEN <rows>x<cols>` then `<row-index> <text>` lines (empty text =
+  cleared row), terminated by a blank line. Poll it on one connection to stream.
+  ```sh
+  printf '__screendiff__\n' | nc -U /tmp/sb.sock # -> changed rows since last diff
+  ```
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules
