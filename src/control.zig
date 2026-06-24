@@ -354,6 +354,23 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         } else reply(c, "ERR gpu not enabled\n");
         return;
     }
+    // Framebuffer streaming: only the tiles changed since the last call (full frame
+    // on the first call / after a client reconnects). Same binary-on-the-socket
+    // model as __frame__.
+    if (std.mem.eql(u8, line, "__framediff__\n") or std.mem.eql(u8, line, "__framediff__")) {
+        if (ctx.gpu) |g| {
+            const sz = g.shadowSize();
+            if (sz == 0) {
+                reply(c, "ERR no frame\n");
+            } else if (ctx.allocator.alloc(u8, sz * 2)) |buf| { // shadow + out, both <= a full frame
+                defer ctx.allocator.free(buf);
+                const n = g.frameDiff(buf[0..sz], buf[sz..]);
+                _ = libc.write(c, buf[sz..][0..n].ptr, n);
+                _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+            } else |_| reply(c, "ERR out of memory\n");
+        } else reply(c, "ERR gpu not enabled\n");
+        return;
+    }
     // Lifecycle: on-demand clean teardown (the platform stops a sandbox without
     // killing the process abruptly). Host-intercepted, like __stats__; reply first
     // so the operator sees the ack, then stop (cpu0 returns .shutdown and exits).
@@ -406,6 +423,7 @@ pub fn controlListener(ctx: *ControlCtx) void {
         if (c < 0) continue;
         ctx.client.store(c, .release);
         if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh client gets a full screen first
+        if (ctx.gpu) |g| g.resetFrameDiff(); // ...and a full framebuffer first
         // Line-buffer the client stream so `__stats__` can be intercepted and each
         // command metered; everything else is forwarded verbatim to the agent.
         var buf: [4096]u8 = undefined;

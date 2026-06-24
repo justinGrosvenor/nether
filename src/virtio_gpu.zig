@@ -46,6 +46,8 @@ const MAX_SCANOUTS = 16;
 const MAX_RES = 64; // resource-id table
 const MAX_ENTRIES = 4096; // backing pages for the framebuffer (16 MiB at 4 KiB)
 const BYTES_PER_PIXEL = 4;
+const TILE = 64; // diff granularity (64x64 pixel tiles)
+const MAX_TILES = (4096 / TILE) * (4096 / TILE); // tiles in a 4096^2 framebuffer
 
 const Resource = struct { used: bool = false, width: u32 = 0, height: u32 = 0, format: u32 = 0 };
 const Entry = struct { addr: u64, len: u32 };
@@ -71,6 +73,11 @@ pub const Gpu = struct {
 
     cmd_scratch: [4096]u8 = undefined, // gathered command bytes
     resp_scratch: [HDR_LEN + MAX_SCANOUTS * 24]u8 = undefined, // largest response (display info)
+
+    // Per-tile content hashes for the streaming diff (__framediff__): the framebuffer
+    // is divided into TILE x TILE blocks and only changed tiles are sent each call.
+    tile_hash: [MAX_TILES]u64 = [_]u64{0} ** MAX_TILES,
+    diff_primed: bool = false, // false -> first diff emits every (non-blank) tile
 
     pub fn backend(self: *Gpu) virtio.Backend {
         return .{
@@ -313,6 +320,138 @@ pub const Gpu = struct {
         }
         return n;
     }
+
+    /// Copy the framebuffer backing into a contiguous host buffer in raster order
+    /// (the backing entries are offset-contiguous, so a sequential copy reconstructs
+    /// the frame). Unmapped entries are zero-filled to keep raster alignment. Returns
+    /// bytes assembled (== min(backing total, shadow.len)).
+    fn assembleFb(self: *Gpu, shadow: []u8) usize {
+        const mem = self.dev.memory();
+        var off: usize = 0;
+        var i: usize = 0;
+        while (i < self.backing_n and off < shadow.len) : (i += 1) {
+            const take = @min(@as(usize, self.backing[i].len), shadow.len - off);
+            if (mem.slice(self.backing[i].addr, take)) |src| {
+                @memcpy(shadow[off..][0..take], src);
+            } else @memset(shadow[off..][0..take], 0);
+            off += take;
+        }
+        return off;
+    }
+
+    /// Bytes a `frameDiff` needs for its working shadow (w*h*4), 0 if no frame.
+    /// `out` for `frameDiff` should be at least this size too (a full frame fits).
+    pub fn shadowSize(self: *Gpu) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const res = self.scanout_res;
+        if (res == 0 or res >= MAX_RES or !self.resources[res].used) return 0;
+        if (self.backing_res != res or self.backing_n == 0) return 0;
+        const w = self.resources[res].width;
+        const h = self.resources[res].height;
+        if (w == 0 or h == 0) return 0;
+        return @as(usize, w) * h * 4;
+    }
+
+    /// Re-prime the diff so the next `frameDiff` emits the full frame again (call on
+    /// a new streaming client, mirroring render.resetDiff()).
+    pub fn resetFrameDiff(self: *Gpu) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.diff_primed = false;
+    }
+
+    /// Wyhash the content of one TILE-aligned block from the assembled `shadow`
+    /// (per-row contiguous slices), clamped to the framebuffer edges.
+    fn hashTile(shadow: []const u8, w: u32, h: u32, tx: u32, ty: u32) u64 {
+        const x0 = @as(usize, tx) * TILE;
+        const y0 = @as(usize, ty) * TILE;
+        const tw: usize = @min(@as(usize, TILE), @as(usize, w) - x0);
+        const th: usize = @min(@as(usize, TILE), @as(usize, h) - y0);
+        var hsh = std.hash.Wyhash.init(0);
+        var row: usize = 0;
+        while (row < th) : (row += 1) {
+            const off = ((y0 + row) * w + x0) * BYTES_PER_PIXEL;
+            hsh.update(shadow[off..][0 .. tw * BYTES_PER_PIXEL]);
+        }
+        return hsh.final();
+    }
+
+    /// Streaming diff: emit only the framebuffer tiles whose content changed since
+    /// the last call. `shadow` (>= shadowSize) is working space for the assembled
+    /// frame; the diff is written to `out`. Format:
+    ///   "FRAMEDIFF <w> <h> <tile> <nchanged>\n"   (text header)
+    ///   then nchanged records, each: tx:u16 ty:u16 (LE) + tile_w*tile_h*3 RGB bytes,
+    ///   where tile_w/tile_h are derivable from w,h,tile,tx,ty (edge tiles clamp).
+    /// The first call after priming (or resetFrameDiff) emits every tile (full frame).
+    /// Returns bytes written, or 0 if no presentable frame / buffers too small.
+    pub fn frameDiff(self: *Gpu, shadow: []u8, out: []u8) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.attached) return 0;
+        const res = self.scanout_res;
+        if (res == 0 or res >= MAX_RES or !self.resources[res].used) return 0;
+        if (self.backing_res != res or self.backing_n == 0) return 0;
+        const w = self.resources[res].width;
+        const h = self.resources[res].height;
+        if (w == 0 or h == 0) return 0;
+        const need4 = @as(usize, w) * h * BYTES_PER_PIXEL;
+        if (shadow.len < need4) return 0;
+
+        const assembled = self.assembleFb(shadow[0..need4]);
+        if (assembled < need4) @memset(shadow[assembled..need4], 0);
+
+        const tiles_x = (w + TILE - 1) / TILE;
+        const tiles_y = (h + TILE - 1) / TILE;
+        const ntiles = @as(usize, tiles_x) * tiles_y;
+        if (ntiles > MAX_TILES) return 0;
+
+        // Pass 1: hash every tile, collect the changed ones, update stored hashes.
+        var changed: [MAX_TILES]u16 = undefined;
+        var nch: usize = 0;
+        var ty: u32 = 0;
+        while (ty < tiles_y) : (ty += 1) {
+            var tx: u32 = 0;
+            while (tx < tiles_x) : (tx += 1) {
+                const idx = @as(usize, ty) * tiles_x + tx;
+                const hh = hashTile(shadow, w, h, tx, ty);
+                if (!self.diff_primed or hh != self.tile_hash[idx]) {
+                    changed[nch] = @intCast(idx);
+                    nch += 1;
+                }
+                self.tile_hash[idx] = hh;
+            }
+        }
+        self.diff_primed = true;
+
+        // Header, then one binary record per changed tile.
+        var n: usize = (std.fmt.bufPrint(out[0..], "FRAMEDIFF {d} {d} {d} {d}\n", .{ w, h, TILE, nch }) catch return 0).len;
+        for (changed[0..nch]) |idx| {
+            const tx: u32 = @intCast(idx % tiles_x);
+            const ty2: u32 = @intCast(idx / tiles_x);
+            const x0 = @as(usize, tx) * TILE;
+            const y0 = @as(usize, ty2) * TILE;
+            const tw: usize = @min(@as(usize, TILE), @as(usize, w) - x0);
+            const th: usize = @min(@as(usize, TILE), @as(usize, h) - y0);
+            if (n + 4 + tw * th * 3 > out.len) break; // out undersized: stop (caller sizes to a full frame)
+            std.mem.writeInt(u16, out[n..][0..2], @intCast(tx), .little);
+            std.mem.writeInt(u16, out[n + 2 ..][0..2], @intCast(ty2), .little);
+            n += 4;
+            var row: usize = 0;
+            while (row < th) : (row += 1) {
+                var col: usize = 0;
+                while (col < tw) : (col += 1) {
+                    const off = ((y0 + row) * w + x0 + col) * BYTES_PER_PIXEL;
+                    const px = std.mem.readInt(u32, shadow[off..][0..4], .little);
+                    out[n] = @truncate(px >> 16); // R
+                    out[n + 1] = @truncate(px >> 8); // G
+                    out[n + 2] = @truncate(px); // B
+                    n += 3;
+                }
+            }
+        }
+        return n;
+    }
 };
 
 fn cast(ptr: *anyopaque) *Gpu {
@@ -450,6 +589,55 @@ test "gpu brings up a scanout and the host captures the drawn frame" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0xFF, 0 }, body[3..6]); // green
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0xFF }, body[6..9]); // blue
     try testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0xFF, 0xFF }, body[9..12]); // white
+}
+
+test "gpu frameDiff emits the full frame, then only changed tiles" {
+    const alloc = testing.allocator;
+    const W: u32 = 128; // 2 tiles wide (TILE=64)
+    const H: u32 = 64; // 1 tile tall
+    const fb_bytes = @as(usize, W) * H * 4;
+    const FB = 0x1000;
+    const ram = try alloc.alloc(u8, fb_bytes + FB);
+    defer alloc.free(ram);
+    @memset(ram, 0);
+
+    var gpu = Gpu{ .width = W, .height = H };
+    var dev = virtio.Device.init(gpu.backend(), .{ .bytes = ram, .base = 0 });
+    gpu.attach(&dev);
+    gpu.resources[1] = .{ .used = true, .width = W, .height = H, .format = 2 };
+    gpu.scanout_res = 1;
+    gpu.backing_res = 1;
+    gpu.backing_n = 1;
+    gpu.backing[0] = .{ .addr = FB, .len = @intCast(fb_bytes) };
+
+    const shadow = try alloc.alloc(u8, fb_bytes);
+    defer alloc.free(shadow);
+    const out = try alloc.alloc(u8, fb_bytes + 0x1000);
+    defer alloc.free(out);
+
+    // First diff: full frame -> both tiles.
+    var n = gpu.frameDiff(shadow, out);
+    try testing.expect(std.mem.startsWith(u8, out[0..n], "FRAMEDIFF 128 64 64 2\n"));
+
+    // Idempotent: no pixels changed -> zero tiles.
+    n = gpu.frameDiff(shadow, out);
+    try testing.expect(std.mem.startsWith(u8, out[0..n], "FRAMEDIFF 128 64 64 0\n"));
+
+    // Touch one pixel in the right tile (x=100) -> exactly tile (1,0).
+    std.mem.writeInt(u32, ram[FB + (0 * W + 100) * 4 ..][0..4], 0x00FF0000, .little); // red
+    n = gpu.frameDiff(shadow, out);
+    try testing.expect(std.mem.startsWith(u8, out[0..n], "FRAMEDIFF 128 64 64 1\n"));
+    const rec = std.mem.indexOfScalar(u8, out[0..n], '\n').? + 1; // first record after header
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, out[rec..][0..2], .little)); // tx
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[rec + 2 ..][0..2], .little)); // ty
+    // The changed pixel sits at col 36 of the tile, row 0 -> red in its RGB slot.
+    const px0 = rec + 4 + 36 * 3;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0, 0 }, out[px0 .. px0 + 3]);
+
+    // resetFrameDiff -> next call re-emits the full frame.
+    gpu.resetFrameDiff();
+    n = gpu.frameDiff(shadow, out);
+    try testing.expect(std.mem.startsWith(u8, out[0..n], "FRAMEDIFF 128 64 64 2\n"));
 }
 
 test "gpu rejects an unknown command with ERR_UNSPEC" {

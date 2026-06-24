@@ -456,6 +456,21 @@ The build-out arc (offline-first chunks):
      `/dev/dri/card0`, "number of scanouts: 1"), and writing white to `/dev/fb0` then
      `__frame__` returns a 1024x768 PPM that is white (the drawn frame). The visual
      equivalent of the terminal render pillar, for GUI/visual agents.
+   - **Framebuffer diff / streaming (DONE) - cheap visual following.** `__framediff__`
+     sends only the framebuffer tiles (64x64) whose content changed since the last
+     call, the visual analog of `__screendiff__`. The fb is assembled into a host
+     shadow, each tile Wyhash'd against the previous frame, and changed tiles emitted
+     as `FRAMEDIFF <w> <h> <tile> <n>\n` + n binary records (`tx:u16 ty:u16` + the
+     tile's RGB pixels; edge tiles clamp). A fresh client (or `resetFrameDiff`) gets
+     the full frame first. Unit-tested deterministically (full -> 0 -> exactly one
+     changed tile at the right coords with the right pixel -> reset -> full). Live:
+     the guest driver binds and a fresh client gets the correct full-frame diff (192
+     tiles for 1024x768) with the right wire format. CAVEAT: reliable incremental
+     capture needs the guest to actually flush its framebuffer to the resource
+     backing - a real DRM/mmap client issues TRANSFER_TO_HOST_2D + RESOURCE_FLUSH,
+     but driving the fb with `dd`/`write()` does not consistently trigger the guest
+     fbdev's (mmap-fault-based) deferred-IO blit, so live tile counts under that crude
+     path are not a measure of the diff itself.
    - **Screen streaming / diff (DONE).** So the platform can *follow* the agent's
      screen cheaply instead of re-pulling the whole grid, `__screendiff__` returns
      only the LIVE rows (the fixed rows x cols grid, not scrollback) that changed

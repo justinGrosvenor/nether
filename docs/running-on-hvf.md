@@ -192,6 +192,13 @@ the datapaths by hand.
   tr '\000' '\377' </dev/zero >/dev/fb0            # fill white
   printf '__frame__\n' | nc -U /tmp/sb.sock > frame.ppm   # capture (host side)
   ```
+  `__framediff__` streams only the 64x64 tiles that changed since the last call
+  (full frame on the first call / after a client reconnects), for cheap visual
+  following: `FRAMEDIFF <w> <h> <tile> <n>\n` then n binary records (`tx:u16 ty:u16`
+  + that tile's RGB pixels). NOTE: incremental capture relies on the guest flushing
+  the framebuffer to its resource backing - a real DRM/mmap GUI client does this via
+  TRANSFER_TO_HOST_2D + RESOURCE_FLUSH; driving `/dev/fb0` with `dd`/`write()` does
+  not reliably trigger the guest fbdev's deferred-IO blit.
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules
