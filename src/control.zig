@@ -206,6 +206,7 @@ pub const ControlCtx = struct {
     power: *nether.Power, // for the __shutdown__ lifecycle command
     handles: []const u64, // vCPU handles to force out on shutdown
     num_cpus: u32,
+    gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 };
 
@@ -336,6 +337,21 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
             _ = libc.write(c, buf[0..n].ptr, n);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
+        return;
+    }
+    // Render (framebuffer): capture the virtio-gpu scanout as a binary PPM.
+    if (std.mem.eql(u8, line, "__frame__\n") or std.mem.eql(u8, line, "__frame__")) {
+        if (ctx.gpu) |g| {
+            const sz = g.frameSize();
+            if (sz == 0) {
+                reply(c, "ERR no frame\n");
+            } else if (ctx.allocator.alloc(u8, sz)) |buf| {
+                defer ctx.allocator.free(buf);
+                const n = g.frame(buf);
+                _ = libc.write(c, buf[0..n].ptr, n);
+                _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+            } else |_| reply(c, "ERR out of memory\n");
+        } else reply(c, "ERR gpu not enabled\n");
         return;
     }
     // Lifecycle: on-demand clean teardown (the platform stops a sandbox without

@@ -442,6 +442,20 @@ The build-out arc (offline-first chunks):
      after running commands, `__screen__` returns the clean terminal, and a
      `printf 'PROGRESS-XXXXXX\rDONE'` renders as `DONERESS-XXXXXX` (real CR overwrite,
      not log concatenation).
+   - **virtio-gpu framebuffer (DONE) - the visual render path.** A minimal virtio-gpu
+     2D device (`virtio_gpu.zig`, device id 16) over the existing virtio-pci
+     transport: GET_DISPLAY_INFO, RESOURCE_CREATE_2D, RESOURCE_ATTACH_BACKING,
+     SET_SCANOUT, TRANSFER_TO_HOST_2D (no-op - we read the backing live),
+     RESOURCE_FLUSH, RESOURCE_UNREF; cursor queue drained+acked; unknown cmds ->
+     ERR_UNSPEC; all guest fields bounds-checked. The framebuffer is the scanout
+     resource's attached backing (scattered guest pages), read directly via GuestMem
+     and emitted as a PPM by the `__frame__` control command (XRGB8888 -> RGB). Opt-in
+     `gpu=1`, size `gpu_width`/`gpu_height` (PCI 0:5.0). Unit-tested at the protocol
+     level (full bring-up sequence -> capture verifies red/green/blue/white pixels).
+     Proven LIVE: a stock Linux `virtio_gpu` DRM driver binds it (`/dev/fb0`,
+     `/dev/dri/card0`, "number of scanouts: 1"), and writing white to `/dev/fb0` then
+     `__frame__` returns a 1024x768 PPM that is white (the drawn frame). The visual
+     equivalent of the terminal render pillar, for GUI/visual agents.
    - **Screen streaming / diff (DONE).** So the platform can *follow* the agent's
      screen cheaply instead of re-pulling the whole grid, `__screendiff__` returns
      only the LIVE rows (the fixed rows x cols grid, not scrollback) that changed

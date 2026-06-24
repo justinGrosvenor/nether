@@ -818,8 +818,29 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
     }
 
+    // virtio-gpu (render pillar): a framebuffer the guest can draw into and the host
+    // can capture via __frame__. Opt-in (gpu=1); size via gpu_width/gpu_height.
+    var gpu_be: nether.VirtioGpu = undefined;
+    var gpu_dev: nether.virtio.Device = undefined;
+    var gpu_intx: IntxLine = undefined;
+    const gpu_on = modeOn("gpu", "nether-gpu");
+    if (gpu_on) {
+        gpu_be = .{
+            .width = @intCast(std.math.clamp(confGetInt("gpu_width", 1024), 64, 4096)),
+            .height = @intCast(std.math.clamp(confGetInt("gpu_height", 768), 64, 4096)),
+        };
+        gpu_dev = nether.virtio.Device.init(gpu_be.backend(), gmem);
+        gpu_intx = .{ .intid = armPciIntxIntid(5) };
+        gpu_dev.intx_ptr = &gpu_intx;
+        gpu_dev.intx_fn = IntxLine.set;
+        gpu_dev.msi_ptr = &gpu_dev;
+        gpu_dev.msi_fn = armSendMsi;
+        try pci_host.addFunction(gpu_dev.function(5, 0));
+        gpu_be.attach(&gpu_dev);
+    }
+
     // One dispatcher over the 64-bit window routes to each function's live BAR.
-    var dev_buf: [4]*nether.virtio.Device = undefined;
+    var dev_buf: [5]*nether.virtio.Device = undefined;
     var ndev: usize = 0;
     dev_buf[ndev] = &con_dev;
     ndev += 1;
@@ -833,9 +854,14 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         dev_buf[ndev] = &net_dev;
         ndev += 1;
     }
+    if (gpu_on) {
+        dev_buf[ndev] = &gpu_dev;
+        ndev += 1;
+    }
     var bar_win = PciBarWindow{ .devs = dev_buf[0..ndev] };
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice()); // ECAM config space
+    if (gpu_on) std.debug.print("[nether] virtio-gpu: {d}x{d} framebuffer (PCI 0:5.0); capture via __frame__\n", .{ gpu_be.width, gpu_be.height });
     if (vsock_on) std.debug.print("[nether] virtio-vsock: guest CID 3, host echo on port 1234 (PCI 0:3.0)\n", .{});
     if (net_on) std.debug.print("[nether] virtio-net: user-mode net 10.0.2.15/24 gw 10.0.2.2 (PCI 0:4.0); egress firewall {s} (allow={d} block={d}); rate {d} kbps\n", .{ if (slirp_stack.fw_enabled) "on" else "OFF", slirp_stack.allow_n, slirp_stack.block_n, slirp_stack.rate_bps * 8 / 1000 });
 
@@ -849,7 +875,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});

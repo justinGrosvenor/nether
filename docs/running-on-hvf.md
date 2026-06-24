@@ -181,6 +181,17 @@ the datapaths by hand.
   ```sh
   printf '__screendiff__\n' | nc -U /tmp/sb.sock # -> changed rows since last diff
   ```
+- **Framebuffer** (virtio-gpu, opt-in `gpu=1`, PCI `0:5.0`): a minimal virtio-gpu 2D
+  device a stock guest `virtio_gpu` DRM driver binds (gives `/dev/fb0` +
+  `/dev/dri/card0`), for GUI/visual agents. `__frame__` over the control socket
+  captures the current scanout as a binary PPM (P6). Size via `gpu_width`/
+  `gpu_height` (default 1024x768). Example:
+  ```sh
+  # in the guest (control/agent): bring up the framebuffer, draw, then on the host:
+  modprobe virtio_gpu                              # -> /dev/fb0
+  tr '\000' '\377' </dev/zero >/dev/fb0            # fill white
+  printf '__frame__\n' | nc -U /tmp/sb.sock > frame.ppm   # capture (host side)
+  ```
 - **virtio-net** (`0:4.0`, opt-in via a `nether-net` marker) behind the in-VMM
   user-mode network stack (`slirp.zig`) - no host tap/bridge/root. Address plan
   10.0.2.0/24 (guest .15, gateway .2, DNS .3). Add the net modules

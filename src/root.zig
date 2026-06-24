@@ -56,6 +56,7 @@ pub const net = @import("virtio_net.zig");
 pub const VirtioNet = net.Net;
 pub const console = @import("virtio_console.zig");
 pub const VirtioConsole = console.Console;
+pub const VirtioGpu = @import("virtio_gpu.zig").Gpu;
 pub const smp = @import("smp.zig");
 pub const slirp = @import("slirp.zig");
 pub const Slirp = slirp.Slirp;
@@ -90,6 +91,7 @@ test {
     _ = @import("virtio_vsock.zig");
     _ = @import("virtio_net.zig");
     _ = @import("virtio_console.zig");
+    _ = @import("virtio_gpu.zig");
     _ = @import("smp.zig");
     _ = @import("slirp.zig");
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
