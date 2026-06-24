@@ -316,6 +316,17 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
+    // Observe: the egress audit log - every destination the sandbox tried to reach
+    // (new TCP connections / UDP flows) with the firewall's verdict. Host-intercepted.
+    if (std.mem.eql(u8, line, "__netlog__\n") or std.mem.eql(u8, line, "__netlog__")) {
+        if (ctx.meter.net) |s| {
+            var buf: [16384]u8 = undefined;
+            const n = s.netLog(&buf);
+            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        } else reply(c, "ERR net not enabled\n");
+        return;
+    }
     // Render: full snapshot of the sandbox terminal (scrollback + live), host-
     // intercepted like __stats__.
     if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {

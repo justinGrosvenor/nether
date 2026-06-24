@@ -113,6 +113,20 @@ const UdpFlow = struct {
 const MAX_RULES = 16;
 const Cidr = struct { addr: u32 = 0, mask: u32 = 0 };
 
+// Egress audit log (the "observe" pillar): a ring of the destinations the sandbox
+// tried to reach - one record per new TCP connection / UDP flow, with the firewall's
+// verdict - so the platform can answer "what did this agent connect to?" and audit
+// blocked attempts. Read via the __netlog__ control command.
+const FLOW_LOG_CAP = 256;
+const FlowProto = enum(u8) { tcp, udp };
+const FlowEvent = struct {
+    ms: u64 = 0,
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
+    port: u16 = 0,
+    proto: FlowProto = .tcp,
+    allowed: bool = false,
+};
+
 fn ipToU32(ip: *const [4]u8) u32 {
     return (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) | (@as(u32, ip[2]) << 8) | ip[3];
 }
@@ -206,6 +220,48 @@ pub const Slirp = struct {
     rate_tokens: i64 = 0,
     rate_burst: i64 = 0,
     rate_last_ms: u64 = 0, // 0 = lazy-init the bucket on first refill
+
+    // Egress audit log. Its own leaf lock (never nested under `lock`) so it is safe to
+    // record from both the firewall-blocked paths (outside `lock`) and the
+    // connection-open paths (inside `lock`) without a lock-order hazard.
+    log_lock: Lock = .{},
+    flow_log: [FLOW_LOG_CAP]FlowEvent = [_]FlowEvent{.{}} ** FLOW_LOG_CAP,
+    flow_head: usize = 0, // next write slot (ring)
+    flow_total: u64 = 0, // lifetime events (> CAP means the ring wrapped)
+
+    /// Record one egress destination + the firewall verdict into the audit ring.
+    fn recordFlow(self: *Slirp, proto: FlowProto, ip: *const [4]u8, port: u16, allowed: bool) void {
+        self.log_lock.lock();
+        defer self.log_lock.unlock();
+        self.flow_log[self.flow_head] = .{ .ms = nowMs(), .ip = ip.*, .port = port, .proto = proto, .allowed = allowed };
+        self.flow_head = (self.flow_head + 1) % FLOW_LOG_CAP;
+        self.flow_total += 1;
+    }
+
+    /// Serialize the egress audit log (oldest -> newest) into `out`:
+    ///   "NETLOG <total>\n"  then one line per retained event:
+    ///   "<ms> <TCP|UDP> <a.b.c.d>:<port> <ALLOW|BLOCK>\n"
+    /// `total` is lifetime count; if it exceeds the retained line count the ring
+    /// wrapped (oldest events were dropped). Returns bytes written (truncates to fit).
+    pub fn netLog(self: *Slirp, out: []u8) usize {
+        self.log_lock.lock();
+        defer self.log_lock.unlock();
+        var n: usize = (std.fmt.bufPrint(out, "NETLOG {d}\n", .{self.flow_total}) catch return 0).len;
+        const retained: usize = if (self.flow_total < FLOW_LOG_CAP) @intCast(self.flow_total) else FLOW_LOG_CAP;
+        const start = if (self.flow_total < FLOW_LOG_CAP) 0 else self.flow_head; // oldest slot
+        var i: usize = 0;
+        while (i < retained) : (i += 1) {
+            const e = self.flow_log[(start + i) % FLOW_LOG_CAP];
+            const line = std.fmt.bufPrint(out[n..], "{d} {s} {d}.{d}.{d}.{d}:{d} {s}\n", .{
+                e.ms,
+                if (e.proto == .tcp) "TCP" else "UDP",
+                e.ip[0], e.ip[1], e.ip[2], e.ip[3], e.port,
+                if (e.allowed) "ALLOW" else "BLOCK",
+            }) catch break; // out full: stop cleanly
+            n += line.len;
+        }
+        return n;
+    }
 
     /// Entry point: a raw Ethernet frame the guest transmitted.
     pub fn onGuestFrame(self: *Slirp, frame: []const u8) void {
@@ -381,6 +437,7 @@ pub const Slirp = struct {
         // checked, so DNS via the virtual resolver is judged by the upstream's IP).
         if (!self.egressAllowed(&real_ip)) {
             _ = self.blocked_count.fetchAdd(1, .monotonic);
+            self.recordFlow(.udp, &real_ip, dport, false);
             return;
         }
 
@@ -398,6 +455,7 @@ pub const Slirp = struct {
                 return;
             }
             flow.fd = fd;
+            self.recordFlow(.udp, &real_ip, dport, true); // one record per new UDP flow
         }
         _ = sock.send(flow.fd, payload.ptr, payload.len, 0);
         _ = self.tx_bytes.fetchAdd(payload.len, .monotonic);
@@ -575,10 +633,12 @@ pub const Slirp = struct {
                 // Govern: refuse the connection with a RST so the guest fails fast
                 // (connection refused) instead of waiting out a SYN timeout.
                 _ = self.blocked_count.fetchAdd(1, .monotonic);
+                self.recordFlow(.tcp, &dst_ip, dport, false);
                 var tmp = TcpConn{ .dst_ip = dst_ip, .dst_port = dport, .guest_port = sport, .rcv_nxt = seq +% 1 };
                 self.tcpSend(&tmp, 0, TH_RST | TH_ACK, &.{}, null);
                 return;
             }
+            self.recordFlow(.tcp, &dst_ip, dport, true);
             _ = self.tcpOpen(sport, &dst_ip, dport, seq, win, tcp[20..doff]);
             return; // SYN-ACK is sent from the poll loop once the host connect completes
         }
@@ -1050,6 +1110,34 @@ test "egress firewall disabled allows everything" {
     var s: Slirp = .{ .fw_enabled = false };
     try testing.expect(s.egressAllowed(&.{ 169, 254, 169, 254 }));
     try testing.expect(s.egressAllowed(&.{ 127, 0, 0, 1 }));
+}
+
+test "egress audit log records verdicts and reports them oldest-first" {
+    var s: Slirp = .{};
+    s.recordFlow(.tcp, &.{ 93, 184, 216, 34 }, 443, true); // an allowed TCP connection
+    s.recordFlow(.udp, &.{ 8, 8, 8, 8 }, 53, true); // an allowed UDP (DNS) flow
+    s.recordFlow(.tcp, &.{ 169, 254, 169, 254 }, 80, false); // a blocked metadata probe
+
+    var buf: [4096]u8 = undefined;
+    const out = buf[0..s.netLog(&buf)];
+    try testing.expect(std.mem.startsWith(u8, out, "NETLOG 3\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "TCP 93.184.216.34:443 ALLOW\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "UDP 8.8.8.8:53 ALLOW\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "TCP 169.254.169.254:80 BLOCK\n") != null);
+    // Order is oldest -> newest (the metadata probe is last).
+    try testing.expect(std.mem.indexOf(u8, out, "93.184.216.34").? < std.mem.indexOf(u8, out, "169.254.169.254").?);
+}
+
+test "egress audit log ring wraps and reports lifetime total" {
+    var s: Slirp = .{};
+    var i: u16 = 0;
+    while (i < FLOW_LOG_CAP + 5) : (i += 1) s.recordFlow(.tcp, &.{ 1, 2, 3, 4 }, i, true);
+    var buf: [16384]u8 = undefined;
+    const out = buf[0..s.netLog(&buf)];
+    try testing.expect(std.mem.startsWith(u8, out, "NETLOG 261\n")); // lifetime count survives the wrap
+    // Only the last CAP events are retained; the earliest ports were dropped.
+    try testing.expect(std.mem.indexOf(u8, out, ":0 ALLOW\n") == null);
+    try testing.expect(std.mem.indexOf(u8, out, ":260 ALLOW\n") != null);
 }
 
 test "parseCidr handles prefixes and rejects garbage" {

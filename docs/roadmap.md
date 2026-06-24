@@ -391,6 +391,17 @@ The build-out arc (offline-first chunks):
      denied attempts metered as `net_blocked`. Unit-tested (deny/allow/block/parse)
      and proven live: guest fetches http://example.com (allowed), is refused on
      http://192.168.1.2 with a RST, `__stats__` shows `net_blocked=1`.
+   - **Egress audit log (DONE) - the observe pillar.** "What did this agent connect
+     to?" slirp keeps a ring (last 256) of every destination the sandbox tried to
+     reach - one record per new TCP connection / UDP flow - with the firewall's
+     verdict, read via the `__netlog__` control command: `NETLOG <lifetime-total>`
+     then `<ms> <TCP|UDP> <ip>:<port> <ALLOW|BLOCK>` oldest-first (total > retained =
+     the ring wrapped). Recorded from the connection-open and firewall-blocked paths
+     under a dedicated leaf lock (safe from both the locked and unlocked callers).
+     Unit-tested (verdict lines, oldest-first order, ring wrap + lifetime total) and
+     proven live: a guest session shows `TCP 1.1.1.1:80/443 ALLOW` (an HTTPS upgrade
+     followed), `UDP 8.8.8.8:53 ALLOW` (a DNS lookup), the resolved host's
+     `TCP ...:80 ALLOW`, and `TCP 169.254.169.254:80 BLOCK` (a denied metadata probe).
    - **Bandwidth cap (DONE) - govern.** `net_rate_kbps` token-bucket-limits the
      download (internet->guest) rate, so an untrusted sandbox can't saturate the
      host uplink or run up unbounded bandwidth cost (the metered dimension). When the

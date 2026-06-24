@@ -237,6 +237,18 @@ the datapaths by hand.
     wget http://192.168.1.2/      # -> "Connection refused" (RST from the firewall)
     ```
     Denied attempts are counted as `net_blocked` in the `__stats__` report.
+  - **Egress audit log** (observe): `__netlog__` lists every destination the sandbox
+    tried to reach (last 256), one line per new TCP connection / UDP flow, with the
+    firewall verdict - so you can audit what an autonomous agent connected to.
+    ```sh
+    printf '__netlog__\n' | nc -U /tmp/sb.sock
+    # NETLOG 5
+    # 1782317399243 TCP 1.1.1.1:443 ALLOW
+    # 1782317406241 UDP 8.8.8.8:53 ALLOW          (a DNS lookup, forwarded upstream)
+    # 1782317413249 TCP 169.254.169.254:80 BLOCK  (a denied metadata probe)
+    ```
+    Format: `NETLOG <lifetime-total>` then `<ms> <TCP|UDP> <ip>:<port> <ALLOW|BLOCK>`
+    oldest-first; `total` greater than the listed count means the ring wrapped.
   - **Bandwidth cap** (govern): `net_rate_kbps` token-bucket-limits the download
     (internet->guest) rate so an untrusted sandbox can't saturate the host uplink.
     When the bucket empties the poll loop stops reading host sockets and TCP
