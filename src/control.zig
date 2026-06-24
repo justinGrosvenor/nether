@@ -7,6 +7,7 @@
 const std = @import("std");
 const nether = @import("root.zig");
 const hostutil = @import("hostutil.zig");
+const Lock = @import("lock.zig").Lock;
 
 const libc = hostutil.libc;
 const usleep = hostutil.usleep;
@@ -127,6 +128,19 @@ const Capture = struct {
     }
 };
 
+// Command audit log (the "observe" pillar, host side): a ring of the shell commands
+// the platform ran in the sandbox and their exit codes - the run-history companion to
+// slirp's egress log. The command text is captured when forwarded; the exit code is
+// scanned out of the agent's 0x1e<code>\n reply trailer. Read via __cmdlog__.
+const CMD_LOG_CAP = 128;
+const CMD_TEXT_MAX = 120;
+const CmdEvent = struct {
+    ms: i64 = 0,
+    exit: i32 = -1,
+    text: [CMD_TEXT_MAX]u8 = undefined,
+    text_len: usize = 0,
+};
+
 pub const AgentCtx = struct {
     conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     /// Control-socket mode: agent replies are written raw to this pipe for the
@@ -142,6 +156,85 @@ pub const AgentCtx = struct {
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
+
+    // Command audit log. cmd_lock is a leaf lock guarding the ring + the pending slot;
+    // controlCommand (control thread) sets `pending`, the vsock callback records on the
+    // exit trailer - different threads, so the lock is required. Single pending slot:
+    // the relay is request/response (the client reads a command's [exit N] before
+    // sending the next), so commands don't overlap.
+    cmd_lock: Lock = .{},
+    cmd_log: [CMD_LOG_CAP]CmdEvent = [_]CmdEvent{.{}} ** CMD_LOG_CAP,
+    cmd_head: usize = 0, // next write slot (ring)
+    cmd_total: u64 = 0, // lifetime commands (> retained = ring wrapped)
+    pend_text: [CMD_TEXT_MAX]u8 = undefined,
+    pend_len: usize = 0, // 0 = no command awaiting an exit code
+    pend_ms: i64 = 0,
+    audit_in_exit: bool = false, // mid-scan of the trailer's exit digits
+    audit_exit: [16]u8 = undefined,
+    audit_exit_len: usize = 0,
+
+    /// A command was forwarded to the agent: stash it as the pending command awaiting
+    /// an exit code. Called on the control thread.
+    fn auditForward(a: *AgentCtx, line: []const u8) void {
+        // Trim a trailing newline / blanks for a clean record.
+        var end = line.len;
+        while (end > 0 and (line[end - 1] == '\n' or line[end - 1] == '\r' or line[end - 1] == ' ')) end -= 1;
+        const n = @min(end, CMD_TEXT_MAX);
+        a.cmd_lock.lock();
+        defer a.cmd_lock.unlock();
+        @memcpy(a.pend_text[0..n], line[0..n]);
+        a.pend_len = n;
+        a.pend_ms = nowMs();
+    }
+
+    /// Scan agent reply bytes for the 0x1e<exit>\n trailer; on completion, commit the
+    /// pending command + its exit code to the ring. Runs on the vsock thread alongside
+    /// the raw relay (it only observes, never consumes, the bytes).
+    fn auditRecv(a: *AgentCtx, bytes: []const u8) void {
+        for (bytes) |b| {
+            if (a.audit_in_exit) {
+                if (b == '\n') {
+                    a.commitPending(std.fmt.parseInt(i32, a.audit_exit[0..a.audit_exit_len], 10) catch -1);
+                    a.audit_in_exit = false;
+                    a.audit_exit_len = 0;
+                } else if (a.audit_exit_len < a.audit_exit.len and b != '\r') {
+                    a.audit_exit[a.audit_exit_len] = b;
+                    a.audit_exit_len += 1;
+                }
+            } else if (b == 0x1e) {
+                a.audit_in_exit = true;
+            }
+        }
+    }
+
+    fn commitPending(a: *AgentCtx, exit: i32) void {
+        a.cmd_lock.lock();
+        defer a.cmd_lock.unlock();
+        if (a.pend_len == 0) return; // a trailer with no command we tracked (e.g. REPL)
+        var e = CmdEvent{ .ms = a.pend_ms, .exit = exit, .text_len = a.pend_len };
+        @memcpy(e.text[0..a.pend_len], a.pend_text[0..a.pend_len]);
+        a.cmd_log[a.cmd_head] = e;
+        a.cmd_head = (a.cmd_head + 1) % CMD_LOG_CAP;
+        a.cmd_total += 1;
+        a.pend_len = 0;
+    }
+
+    /// Serialize the command audit log oldest-first into `out`:
+    ///   "CMDLOG <lifetime-total>\n" then "<ms> exit=<code> <command>\n" per event.
+    fn cmdLog(a: *AgentCtx, out: []u8) usize {
+        a.cmd_lock.lock();
+        defer a.cmd_lock.unlock();
+        var n: usize = (std.fmt.bufPrint(out, "CMDLOG {d}\n", .{a.cmd_total}) catch return 0).len;
+        const retained: usize = if (a.cmd_total < CMD_LOG_CAP) @intCast(a.cmd_total) else CMD_LOG_CAP;
+        const start = if (a.cmd_total < CMD_LOG_CAP) 0 else a.cmd_head;
+        var i: usize = 0;
+        while (i < retained) : (i += 1) {
+            const e = a.cmd_log[(start + i) % CMD_LOG_CAP];
+            const line = std.fmt.bufPrint(out[n..], "{d} exit={d} {s}\n", .{ e.ms, e.exit, e.text[0..e.text_len] }) catch break;
+            n += line.len;
+        }
+        return n;
+    }
 
     /// Parse the agent's framed reply stream: raw output up to 0x1e, then the
     /// command's exit code, printed as a `[exit N]` line.
@@ -182,6 +275,7 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             cap.feed(r.bytes); // file transfer in progress: divert the reply
         } else {
             if (a.render) |rd| rd.feed(r.bytes); // tee command output into the render screen
+            a.auditRecv(r.bytes); // observe exit codes for the command audit log
             if (a.pipe_w >= 0) {
                 _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
             } else a.onRecv(r.bytes);
@@ -327,6 +421,15 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         } else reply(c, "ERR net not enabled\n");
         return;
     }
+    // Observe: the command audit log - every shell command the platform ran in the
+    // sandbox and its exit code. Host-intercepted.
+    if (std.mem.eql(u8, line, "__cmdlog__\n") or std.mem.eql(u8, line, "__cmdlog__")) {
+        var buf: [16384]u8 = undefined;
+        const n = ctx.agent.cmdLog(&buf);
+        _ = libc.write(c, buf[0..n].ptr, n);
+        _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        return;
+    }
     // Render: full snapshot of the sandbox terminal (scrollback + live), host-
     // intercepted like __stats__.
     if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {
@@ -408,6 +511,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         _ = ctx.meter.commands.fetchAdd(1, .release);
         return;
     }
+    ctx.agent.auditForward(line); // record the command, awaiting its exit code
     _ = ctx.vsdev.hostSend(@intCast(id), line);
     _ = ctx.meter.commands.fetchAdd(1, .release);
     _ = ctx.meter.bytes_in.fetchAdd(line.len, .release);
@@ -492,4 +596,51 @@ pub fn agentStdinPump(ctx: *AgentStdinCtx) void {
         }
         _ = ctx.vsdev.hostSend(@intCast(id), buf[0..@intCast(n)]);
     }
+}
+
+// --- tests -----------------------------------------------------------------
+const testing = std.testing;
+
+test "command audit log records commands with exit codes oldest-first" {
+    var a = AgentCtx{};
+    a.auditForward("echo hi\n");
+    a.auditRecv("hi\n\x1e0\n"); // command output, then the trailer (exit 0)
+    a.auditForward("false\n");
+    a.auditRecv("\x1e1\n"); // no output, exit 1
+    a.auditForward("grep x f\n");
+    a.auditRecv("\x1e2\n");
+
+    var buf: [4096]u8 = undefined;
+    const out = buf[0..a.cmdLog(&buf)];
+    try testing.expect(std.mem.startsWith(u8, out, "CMDLOG 3\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "exit=0 echo hi\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit=1 false\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit=2 grep x f\n") != null);
+    // oldest-first ordering
+    try testing.expect(std.mem.indexOf(u8, out, "echo hi").? < std.mem.indexOf(u8, out, "false").?);
+}
+
+test "command audit log handles a trailer split across reads" {
+    var a = AgentCtx{};
+    a.auditForward("cmd\n");
+    a.auditRecv("partial output\x1e1"); // separator + first digit, newline not yet arrived
+    a.auditRecv("2\n"); // continues: exit code is "12"
+    var buf: [256]u8 = undefined;
+    const out = buf[0..a.cmdLog(&buf)];
+    try testing.expect(std.mem.indexOf(u8, out, "exit=12 cmd\n") != null);
+}
+
+test "command audit log ring wraps and keeps the lifetime total" {
+    var a = AgentCtx{};
+    var i: u32 = 0;
+    while (i < CMD_LOG_CAP + 3) : (i += 1) {
+        var nb: [32]u8 = undefined;
+        a.auditForward(std.fmt.bufPrint(&nb, "cmd{d}\n", .{i}) catch unreachable);
+        a.auditRecv("\x1e0\n");
+    }
+    var buf: [16384]u8 = undefined;
+    const out = buf[0..a.cmdLog(&buf)];
+    try testing.expect(std.mem.startsWith(u8, out, "CMDLOG 131\n")); // lifetime survives the wrap
+    try testing.expect(std.mem.indexOf(u8, out, " cmd0\n") == null); // earliest dropped
+    try testing.expect(std.mem.indexOf(u8, out, " cmd130\n") != null); // newest retained
 }

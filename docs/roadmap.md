@@ -402,6 +402,17 @@ The build-out arc (offline-first chunks):
      proven live: a guest session shows `TCP 1.1.1.1:80/443 ALLOW` (an HTTPS upgrade
      followed), `UDP 8.8.8.8:53 ALLOW` (a DNS lookup), the resolved host's
      `TCP ...:80 ALLOW`, and `TCP 169.254.169.254:80 BLOCK` (a denied metadata probe).
+   - **Command audit log (DONE) - the observe pillar.** The run-history companion to
+     the egress log: "what did this agent run, and did it succeed?" The host keeps a
+     ring (last 128) of every shell command the platform relayed into the sandbox plus
+     its exit code, read via the `__cmdlog__` control command: `CMDLOG <lifetime-total>`
+     then `<ms> exit=<code> <command>` oldest-first. The command text is captured on
+     forward (`auditForward`); the exit code is scanned out of the agent's 0x1e<code>\n
+     reply trailer (`auditRecv`, a small state machine that survives chunk splits)
+     without disturbing the raw relay. Its own leaf lock (`cmd_lock`) since the control
+     thread sets the pending command and the vsock thread commits it. Unit-tested
+     (verdicts/order, split trailer, ring wrap) and proven live: `echo hello`->exit 0,
+     `false`->1, `ls /no/such`->1, `true`->0, `sh -c "exit 42"`->42, all logged.
    - **Bandwidth cap (DONE) - govern.** `net_rate_kbps` token-bucket-limits the
      download (internet->guest) rate, so an untrusted sandbox can't saturate the
      host uplink or run up unbounded bandwidth cost (the metered dimension). When the

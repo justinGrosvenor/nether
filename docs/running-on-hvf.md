@@ -249,6 +249,17 @@ the datapaths by hand.
     ```
     Format: `NETLOG <lifetime-total>` then `<ms> <TCP|UDP> <ip>:<port> <ALLOW|BLOCK>`
     oldest-first; `total` greater than the listed count means the ring wrapped.
+  - **Command audit log** (observe): `__cmdlog__` lists the last 128 shell commands the
+    platform ran in the sandbox and their exit codes - "what did this agent run, and
+    did it succeed?" Pairs with `__netlog__` for a full record of agent activity.
+    ```sh
+    printf '__cmdlog__\n' | nc -U /tmp/sb.sock
+    # CMDLOG 3
+    # 1782318926235 exit=0 echo hello
+    # 1782318928239 exit=1 ls /no/such/path
+    # 1782318930258 exit=42 sh -c "exit 42"
+    ```
+    Format: `CMDLOG <lifetime-total>` then `<ms> exit=<code> <command>` oldest-first.
   - **Bandwidth cap** (govern): `net_rate_kbps` token-bucket-limits the download
     (internet->guest) rate so an untrusted sandbox can't saturate the host uplink.
     When the bucket empties the poll loop stops reading host sockets and TCP
