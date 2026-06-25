@@ -15,6 +15,14 @@ const nowMs = @import("hostutil.zig").nowMs;
 const CAP = 512; // retained events (older ones age out of the ring)
 const TEXT_MAX = 160;
 
+/// Upper bound on the bytes `since` can write for a full ring, so callers can size a
+/// buffer that never truncates. Truncation would drop the NEWEST events while the
+/// header still advertises the full current-seq, so an incremental client would
+/// advance its cursor past events it never received and lose them. Per line:
+/// seq(u64,20) + ' ' + ms(i64,20) + ' ' + KIND(4) + ' ' + text(TEXT_MAX) + '\n', plus
+/// the "EVENTS <u64>\n" header (28).
+pub const SERIALIZE_MAX = 28 + CAP * (20 + 1 + 20 + 1 + 4 + 1 + TEXT_MAX + 1);
+
 pub const Kind = enum(u8) {
     cmd, // a shell command + its exit code
     net, // an egress connection/flow + the firewall verdict
@@ -57,7 +65,9 @@ pub const Journal = struct {
 
     /// Serialize events with `seq > after` (oldest-first) into `out`:
     ///   "EVENTS <current-seq>\n"  then  "<seq> <ms> <KIND> <text>\n" per event.
-    /// The header's current-seq is the cursor the client passes as `after` next time.
+    /// The header's current-seq is the cursor the client passes as `after` next time;
+    /// callers must give an `out` of at least `SERIALIZE_MAX` bytes so the body can
+    /// never truncate below that seq (else the newest events would be silently lost).
     /// If `after` lags more than CAP behind, the gap (events that aged out) is implied
     /// by the seq jump; the client can detect it from non-contiguous seq numbers.
     pub fn since(self: *Journal, out: []u8, after: u64) usize {

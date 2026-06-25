@@ -455,7 +455,10 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
                 }
                 break :blk 0;
             };
-            var buf: [65536]u8 = undefined;
+            // Sized from the journal's own bound so a full-ring dump never truncates
+            // (a truncated body would drop the newest events while the header still
+            // advertises the full seq, silently losing them for an incremental client).
+            var buf: [nether.audit.SERIALIZE_MAX]u8 = undefined;
             const n = j.since(&buf, after);
             _ = libc.write(c, buf[0..n].ptr, n);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
