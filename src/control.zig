@@ -315,6 +315,14 @@ pub const ControlCtx = struct {
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    // File-transfer jail, pinned once at listener start (not per call) so the jail
+    // can't move if the process cwd ever changes. Empty until set => fail closed.
+    xfer_root_buf: [1024]u8 = undefined,
+    xfer_root_len: usize = 0,
+
+    fn xferRoot(self: *const ControlCtx) []const u8 {
+        return self.xfer_root_buf[0..self.xfer_root_len];
+    }
 };
 
 /// Max bytes a single `__put__`/`__get__` moves. Bounds host memory and frames the
@@ -360,16 +368,15 @@ fn within(root: []const u8, path: []const u8) bool {
     return path.len == root.len or path[root.len] == '/';
 }
 
-/// Confine a host transfer path to the jail (the directory nether was launched
-/// from): canonicalize it and confirm it stays within `realpath(".")`. For a path
-/// being created (`creating`), the file may not exist yet, so resolve its parent
-/// directory and re-attach a validated basename. Returns a NUL-terminated absolute
-/// path inside the jail in `out`, or null if it escapes or is malformed.
-fn jailedPath(out: *[1024]u8, req: []const u8, creating: bool) ?[*:0]const u8 {
+/// Confine a host transfer path to `root` (the jail, pinned at listener start):
+/// canonicalize it and confirm it stays within `root`. For a path being created
+/// (`creating`), the file may not exist yet, so resolve its parent directory and
+/// re-attach a validated basename. Returns a NUL-terminated absolute path inside
+/// the jail in `out`, or null if it escapes or is malformed. An empty `root` (the
+/// jail was never established) fails closed.
+fn jailedPath(out: *[1024]u8, root: []const u8, req: []const u8, creating: bool) ?[*:0]const u8 {
+    if (root.len == 0) return null;
     if (req.len == 0 or req.len + 1 > out.len) return null;
-    var rootb: [1024]u8 = undefined;
-    const root_c = libc.realpath(".", &rootb) orelse return null;
-    const root = std.mem.span(root_c);
 
     var rb: [1024]u8 = undefined;
     if (!creating) {
@@ -410,7 +417,7 @@ fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const hostpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
     const guestpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
     var pb: [1024]u8 = undefined;
-    const hp = jailedPath(&pb, hostpath, false) orelse return reply(c, "ERR host path outside transfer dir\n");
+    const hp = jailedPath(&pb, ctx.xferRoot(), hostpath, false) orelse return reply(c, "ERR host path outside transfer dir\n");
     const data = readFileMac(ctx.allocator, hp) catch return reply(c, "ERR cannot read host file\n");
     defer ctx.allocator.free(data);
     if (data.len > MAX_XFER) return reply(c, "ERR file too large\n");
@@ -448,7 +455,7 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const body = cap.buf[cap.body_off..cap.expect];
 
     var pb: [1024]u8 = undefined;
-    const hp = jailedPath(&pb, hostpath, true) orelse return reply(c, "ERR host path outside transfer dir\n");
+    const hp = jailedPath(&pb, ctx.xferRoot(), hostpath, true) orelse return reply(c, "ERR host path outside transfer dir\n");
     const O_WRONLY = 0x0001;
     const O_CREAT = 0x0200;
     const O_TRUNC = 0x0400;
@@ -627,6 +634,10 @@ pub fn controlListener(ctx: *ControlCtx) void {
     // unlink+bind'd, so there is no pre-existing file to inherit looser perms from.
     if (libc.fchmod(fd, 0o600) != 0) std.debug.print("[control] warning: fchmod 0600 on socket failed\n", .{});
     const owner_uid = libc.getuid();
+    // Pin the file-transfer jail once, here, to the launch directory. Done at
+    // listener start (not per __put__/__get__) so the jail can't follow a later
+    // cwd change. If realpath fails, the root stays empty and transfers fail closed.
+    if (libc.realpath(".", &ctx.xfer_root_buf)) |r| ctx.xfer_root_len = std.mem.span(r).len;
     std.debug.print("[control] listening on {s}\n", .{ctx.path});
     while (true) {
         const c = libc.accept(fd, null, null);
@@ -647,10 +658,23 @@ pub fn controlListener(ctx: *ControlCtx) void {
         // command metered; everything else is forwarded verbatim to the agent.
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
+        var skipping = false; // discarding the tail of an overlong line until its '\n'
         while (true) {
             const r = libc.read(c, buf[len..].ptr, buf.len - len);
             if (r <= 0) break;
             len += @intCast(r);
+            // Resync after an overlong line: drop everything up to and including the
+            // next newline, then resume normal parsing on whatever follows.
+            if (skipping) {
+                if (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |nl| {
+                    std.mem.copyForwards(u8, buf[0 .. len - (nl + 1)], buf[nl + 1 .. len]);
+                    len -= nl + 1;
+                    skipping = false;
+                } else {
+                    len = 0; // still no newline; keep discarding
+                    continue;
+                }
+            }
             var start: usize = 0;
             var i: usize = 0;
             while (i < len) : (i += 1) {
@@ -663,7 +687,14 @@ pub fn controlListener(ctx: *ControlCtx) void {
                 std.mem.copyForwards(u8, buf[0 .. len - start], buf[start..len]);
                 len -= start;
             }
-            if (len == buf.len) len = 0; // overlong line: drop
+            // A full buffer with no newline is an overlong command: reject it
+            // explicitly (rather than silently dropping) and skip its remainder so
+            // the tail is never misparsed as a fresh command.
+            if (len == buf.len) {
+                reply(c, "ERR line too long (max 4096 bytes)\n");
+                len = 0;
+                skipping = true;
+            }
         }
         ctx.client.store(-1, .release);
         _ = libc.close(c);
