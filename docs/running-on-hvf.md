@@ -260,6 +260,22 @@ the datapaths by hand.
     # 1782318930258 exit=42 sh -c "exit 42"
     ```
     Format: `CMDLOG <lifetime-total>` then `<ms> exit=<code> <command>` oldest-first.
+  - **Unified event timeline** (observe): `__events__` is the single chronological feed
+    of commands, network flows, and lifecycle (boot/connect/shutdown), polled with a
+    cursor - `__events__` for the retained ring, `__events__ <seq>` for only events
+    after that sequence number. This is what a platform tails to follow a sandbox.
+    ```sh
+    printf '__events__\n' | nc -U /tmp/sb.sock
+    # EVENTS 5
+    # 1 .. LIFE boot
+    # 2 .. LIFE agent connected
+    # 3 .. CMD exit=0 echo hi
+    # 4 .. NET TCP 1.1.1.1:443 ALLOW
+    # 5 .. NET TCP 169.254.169.254:80 BLOCK
+    printf '__events__ 5\n' | nc -U /tmp/sb.sock   # -> only events after seq 5
+    ```
+    Format: `EVENTS <current-seq>` then `<seq> <ms> <CMD|NET|LIFE> <text>` oldest-first;
+    pass the header's `<current-seq>` back as the cursor to poll incrementally.
   - **Bandwidth cap** (govern): `net_rate_kbps` token-bucket-limits the download
     (internet->guest) rate so an untrusted sandbox can't saturate the host uplink.
     When the bucket empties the poll loop stops reading host sockets and TCP

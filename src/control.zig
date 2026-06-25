@@ -156,6 +156,8 @@ pub const AgentCtx = struct {
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
+    /// Unified event journal: commands are mirrored here as CMD events.
+    journal: ?*nether.Journal = null,
 
     // Command audit log. cmd_lock is a leaf lock guarding the ring + the pending slot;
     // controlCommand (control thread) sets `pending`, the vsock callback records on the
@@ -209,14 +211,23 @@ pub const AgentCtx = struct {
 
     fn commitPending(a: *AgentCtx, exit: i32) void {
         a.cmd_lock.lock();
-        defer a.cmd_lock.unlock();
-        if (a.pend_len == 0) return; // a trailer with no command we tracked (e.g. REPL)
+        if (a.pend_len == 0) { // a trailer with no command we tracked (e.g. REPL)
+            a.cmd_lock.unlock();
+            return;
+        }
         var e = CmdEvent{ .ms = a.pend_ms, .exit = exit, .text_len = a.pend_len };
         @memcpy(e.text[0..a.pend_len], a.pend_text[0..a.pend_len]);
         a.cmd_log[a.cmd_head] = e;
         a.cmd_head = (a.cmd_head + 1) % CMD_LOG_CAP;
         a.cmd_total += 1;
         a.pend_len = 0;
+        a.cmd_lock.unlock();
+
+        if (a.journal) |j| {
+            var b: [CMD_TEXT_MAX + 24]u8 = undefined;
+            const s = std.fmt.bufPrint(&b, "exit={d} {s}", .{ exit, e.text[0..e.text_len] }) catch return;
+            j.emit(.cmd, s);
+        }
     }
 
     /// Serialize the command audit log oldest-first into `out`:
@@ -269,6 +280,7 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
     switch (ev) {
         .accept => |id| {
             a.conn_id.store(@intCast(id), .release);
+            if (a.journal) |j| j.emit(.life, "agent connected");
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
         .recv => |r| if (a.capture.load(.acquire)) |cap| {
@@ -301,6 +313,7 @@ pub const ControlCtx = struct {
     handles: []const u64, // vCPU handles to force out on shutdown
     num_cpus: u32,
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
+    journal: ?*nether.Journal = null, // unified event timeline, for __events__
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 };
 
@@ -430,6 +443,25 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
+    // Observe: the unified event timeline (commands + network + lifecycle), polled
+    // with a cursor. "__events__" dumps the retained ring; "__events__ <seq>" returns
+    // only events after that sequence number (the previous EVENTS header's value).
+    if (std.mem.eql(u8, line, "__events__\n") or std.mem.eql(u8, line, "__events__") or std.mem.startsWith(u8, line, "__events__ ")) {
+        if (ctx.journal) |j| {
+            const after: u64 = blk: {
+                if (std.mem.startsWith(u8, line, "__events__ ")) {
+                    const arg = std.mem.trim(u8, line["__events__ ".len..], " \r\n");
+                    break :blk std.fmt.parseInt(u64, arg, 10) catch 0;
+                }
+                break :blk 0;
+            };
+            var buf: [65536]u8 = undefined;
+            const n = j.since(&buf, after);
+            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        } else reply(c, "ERR journal not enabled\n");
+        return;
+    }
     // Render: full snapshot of the sandbox terminal (scrollback + live), host-
     // intercepted like __stats__.
     if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {
@@ -489,6 +521,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     // killing the process abruptly). Host-intercepted, like __stats__; reply first
     // so the operator sees the ack, then stop (cpu0 returns .shutdown and exits).
     if (std.mem.eql(u8, line, "__shutdown__\n") or std.mem.eql(u8, line, "__shutdown__")) {
+        if (ctx.journal) |j| j.emit(.life, "shutdown requested");
         reply(c, "OK shutting down\n");
         std.debug.print("\n[nether] __shutdown__ requested; stopping sandbox\n", .{});
         stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);

@@ -41,6 +41,7 @@ pub const vt = struct {
 /// The render pillar: a server-side terminal model of the agent's session, fed by
 /// its output and snapshot via the `__screen__` control command.
 pub const Render = @import("render.zig").Render;
+pub const Journal = @import("audit.zig").Journal;
 
 pub const webconsole = @import("webconsole.zig");
 pub const WebConsole = webconsole.Server;
@@ -95,6 +96,7 @@ test {
     _ = @import("smp.zig");
     _ = @import("slirp.zig");
     _ = @import("control.zig");
+    _ = @import("audit.zig");
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
     _ = @import("fuzz.zig");
 }

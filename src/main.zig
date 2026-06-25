@@ -729,6 +729,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
     var agent_ctx = AgentCtx{};
+    // Unified event journal (observe): one sequenced timeline of commands, network
+    // flows, and lifecycle events, polled via __events__. Shared by the agent (CMD),
+    // slirp (NET), and lifecycle emitters.
+    var journal = nether.Journal{};
+    agent_ctx.journal = &journal;
+    journal.emit(.life, "boot");
     // Control socket path from nether.conf (per-sandbox), else the default. A
     // configured path also enables control mode (no marker needed).
     var sock_path_buf: [256]u8 = undefined;
@@ -814,6 +820,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         net_be.on_tx = netToSlirp;
         net_be.on_tx_ctx = &slirp_stack;
         meter.net = &slirp_stack; // expose NAT egress/ingress bytes via __stats__
+        slirp_stack.journal = &journal; // mirror egress flows into the event timeline
         // Host thread: poll NAT sockets and inject replies back into the guest.
         if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
     }
@@ -875,7 +882,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});

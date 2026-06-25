@@ -229,13 +229,26 @@ pub const Slirp = struct {
     flow_head: usize = 0, // next write slot (ring)
     flow_total: u64 = 0, // lifetime events (> CAP means the ring wrapped)
 
+    // Unified event journal (the cross-cutting timeline); net flows are mirrored here
+    // as NET events alongside their detailed entry in flow_log above.
+    journal: ?*@import("audit.zig").Journal = null,
+
     /// Record one egress destination + the firewall verdict into the audit ring.
     fn recordFlow(self: *Slirp, proto: FlowProto, ip: *const [4]u8, port: u16, allowed: bool) void {
         self.log_lock.lock();
-        defer self.log_lock.unlock();
         self.flow_log[self.flow_head] = .{ .ms = nowMs(), .ip = ip.*, .port = port, .proto = proto, .allowed = allowed };
         self.flow_head = (self.flow_head + 1) % FLOW_LOG_CAP;
         self.flow_total += 1;
+        self.log_lock.unlock();
+        if (self.journal) |j| {
+            var b: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&b, "{s} {d}.{d}.{d}.{d}:{d} {s}", .{
+                if (proto == .tcp) "TCP" else "UDP",
+                ip[0], ip[1], ip[2], ip[3], port,
+                if (allowed) "ALLOW" else "BLOCK",
+            }) catch return;
+            j.emit(.net, s);
+        }
     }
 
     /// Serialize the egress audit log (oldest -> newest) into `out`:

@@ -413,6 +413,20 @@ The build-out arc (offline-first chunks):
      thread sets the pending command and the vsock thread commits it. Unit-tested
      (verdicts/order, split trailer, ring wrap) and proven live: `echo hello`->exit 0,
      `false`->1, `ls /no/such`->1, `true`->0, `sh -c "exit 42"`->42, all logged.
+   - **Unified event journal (DONE) - the observe capstone.** One sequenced,
+     chronological feed (`audit.zig`, `nether.Journal`) interleaving commands, network
+     flows, and lifecycle transitions (boot / agent-connected / shutdown - the only
+     place lifecycle is recorded), that the platform polls with a monotonic cursor:
+     `__events__` dumps the retained ring (512), `__events__ <seq>` returns only events
+     after that sequence (the previous `EVENTS <seq>` header value). Format
+     `EVENTS <current-seq>` then `<seq> <ms> <CMD|NET|LIFE> <text>` oldest-first. Each
+     record point (slirp.recordFlow, control.commitPending, the lifecycle emitters)
+     mirrors into the journal under its own leaf lock; `__netlog__`/`__cmdlog__` remain
+     the per-domain detail views. Unit-tested (monotonic seq, cursor replay, ring
+     age-out + lifetime seq) and proven live: a session shows the boot/connect, an
+     `echo`, an `1.1.1.1:80`+`:443` fetch, an `exit=7`, a `169.254.169.254:80 BLOCK`,
+     all in one ordered timeline, and `__events__ <seq>` then returns only the next
+     command - true incremental following.
    - **Bandwidth cap (DONE) - govern.** `net_rate_kbps` token-bucket-limits the
      download (internet->guest) rate, so an untrusted sandbox can't saturate the
      host uplink or run up unbounded bandwidth cost (the metered dimension). When the
