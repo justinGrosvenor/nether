@@ -36,6 +36,12 @@ pub fn loadPvh(image: []const u8, ctx: anytype) !u64 {
     const phentsize = rd16(image, 54);
     const phnum = rd16(image, 56);
 
+    // The image is host-supplied but still untrusted enough to validate: a
+    // malformed vmlinux must not read out of bounds. A 64-bit phdr is 56 bytes;
+    // require that and that the whole header table fits, so every rd*(image, ph+..)
+    // below stays in range. phnum/phentsize are u16 so their product cannot wrap.
+    if (phentsize < 56 or phoff > image.len or phnum * @as(usize, phentsize) > image.len - phoff) return error.BadElf;
+
     var entry: ?u64 = null;
     var i: usize = 0;
     while (i < phnum) : (i += 1) {
@@ -45,13 +51,17 @@ pub fn loadPvh(image: []const u8, ctx: anytype) !u64 {
         const p_paddr = rd64(image, ph + 24);
         const p_filesz: usize = @intCast(rd64(image, ph + 32));
         const p_memsz = rd64(image, ph + 40);
+        // Overflow-safe segment bound: never compute p_offset + p_filesz (a
+        // malformed offset can wrap past the end); compare against the room left.
+        if (p_offset > image.len or p_filesz > image.len - p_offset) return error.BadElf;
+        const seg = image[p_offset .. p_offset + p_filesz];
         switch (p_type) {
             PT_LOAD => {
-                try ctx.write(p_paddr, image[p_offset .. p_offset + p_filesz]);
+                try ctx.write(p_paddr, seg);
                 if (p_memsz > p_filesz) try ctx.zero(p_paddr + p_filesz, @intCast(p_memsz - p_filesz));
             },
             PT_NOTE => {
-                if (findPvhNote(image[p_offset .. p_offset + p_filesz])) |e| entry = e;
+                if (findPvhNote(seg)) |e| entry = e;
             },
             else => {},
         }

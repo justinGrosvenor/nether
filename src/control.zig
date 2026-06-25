@@ -351,6 +351,58 @@ fn waitCapture(cap: *Capture) bool {
     return true;
 }
 
+/// True if `path` is `root` itself or lies beneath it. Both must be absolute and
+/// canonical (no symlinks/`..`), as returned by realpath. The separator check stops
+/// a sibling-prefix escape ("/jail" must not match "/jail-evil").
+fn within(root: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (root.len > 0 and root[root.len - 1] == '/') return true; // root is "/"
+    return path.len == root.len or path[root.len] == '/';
+}
+
+/// Confine a host transfer path to the jail (the directory nether was launched
+/// from): canonicalize it and confirm it stays within `realpath(".")`. For a path
+/// being created (`creating`), the file may not exist yet, so resolve its parent
+/// directory and re-attach a validated basename. Returns a NUL-terminated absolute
+/// path inside the jail in `out`, or null if it escapes or is malformed.
+fn jailedPath(out: *[1024]u8, req: []const u8, creating: bool) ?[*:0]const u8 {
+    if (req.len == 0 or req.len + 1 > out.len) return null;
+    var rootb: [1024]u8 = undefined;
+    const root_c = libc.realpath(".", &rootb) orelse return null;
+    const root = std.mem.span(root_c);
+
+    var rb: [1024]u8 = undefined;
+    if (!creating) {
+        var tb: [1024]u8 = undefined;
+        const reqz = cpath(&tb, req) orelse return null;
+        const real_c = libc.realpath(reqz, &rb) orelse return null;
+        const real = std.mem.span(real_c);
+        if (!within(root, real) or real.len + 1 > out.len) return null;
+        @memcpy(out[0..real.len], real);
+        out[real.len] = 0;
+        return @ptrCast(out);
+    }
+    // Create: split into dir + basename, resolve the dir, reject a basename that
+    // could traverse (it must be a plain name with no separator).
+    const slash = std.mem.lastIndexOfScalar(u8, req, '/');
+    const dir = if (slash) |s| (if (s == 0) "/" else req[0..s]) else ".";
+    const base = if (slash) |s| req[s + 1 ..] else req;
+    if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
+    var tb: [1024]u8 = undefined;
+    const dirz = cpath(&tb, dir) orelse return null;
+    const rdir_c = libc.realpath(dirz, &rb) orelse return null;
+    const rdir = std.mem.span(rdir_c);
+    if (!within(root, rdir)) return null;
+    // rdir + '/' + base + NUL
+    const sep: usize = if (rdir.len > 0 and rdir[rdir.len - 1] == '/') 0 else 1;
+    if (rdir.len + sep + base.len + 1 > out.len) return null;
+    @memcpy(out[0..rdir.len], rdir);
+    if (sep == 1) out[rdir.len] = '/';
+    @memcpy(out[rdir.len + sep ..][0..base.len], base);
+    out[rdir.len + sep + base.len] = 0;
+    return @ptrCast(out);
+}
+
 /// Host-mediated file push: read the host file and stream it to the guest agent as
 /// a __PUT__ request. `args` = "<hostpath> <guestpath>".
 fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
@@ -358,7 +410,7 @@ fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const hostpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
     const guestpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
     var pb: [1024]u8 = undefined;
-    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
+    const hp = jailedPath(&pb, hostpath, false) orelse return reply(c, "ERR host path outside transfer dir\n");
     const data = readFileMac(ctx.allocator, hp) catch return reply(c, "ERR cannot read host file\n");
     defer ctx.allocator.free(data);
     if (data.len > MAX_XFER) return reply(c, "ERR file too large\n");
@@ -396,7 +448,7 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const body = cap.buf[cap.body_off..cap.expect];
 
     var pb: [1024]u8 = undefined;
-    const hp = cpath(&pb, hostpath) orelse return reply(c, "ERR host path too long\n");
+    const hp = jailedPath(&pb, hostpath, true) orelse return reply(c, "ERR host path outside transfer dir\n");
     const O_WRONLY = 0x0001;
     const O_CREAT = 0x0200;
     const O_TRUNC = 0x0400;
@@ -652,6 +704,19 @@ pub fn agentStdinPump(ctx: *AgentStdinCtx) void {
 
 // --- tests -----------------------------------------------------------------
 const testing = std.testing;
+
+test "transfer jail containment check rejects escapes and sibling-prefixes" {
+    // Inside the jail.
+    try testing.expect(within("/jail", "/jail")); // the root itself
+    try testing.expect(within("/jail", "/jail/file"));
+    try testing.expect(within("/jail", "/jail/sub/deep.txt"));
+    try testing.expect(within("/", "/anything")); // root "/" contains all
+    // Escapes.
+    try testing.expect(!within("/jail", "/etc/passwd"));
+    try testing.expect(!within("/jail", "/jail-evil/x")); // sibling-prefix, not a child
+    try testing.expect(!within("/jail", "/jailx")); // prefix without separator
+    try testing.expect(!within("/jail/sub", "/jail/other"));
+}
 
 test "command audit log records commands with exit codes oldest-first" {
     var a = AgentCtx{};

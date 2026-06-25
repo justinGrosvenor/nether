@@ -216,7 +216,10 @@ pub const Server = struct {
         const one: u32 = 1;
         _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
 
-        const addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, self.port), .addr = 0 };
+        // Bind loopback only: POST /input injects keystrokes into the guest serial
+        // console, so the console must never be reachable off-host. 127.0.0.1 in
+        // network byte order (0 would be INADDR_ANY = every interface).
+        const addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, self.port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
         if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return;
         if (linux.errno(linux.listen(fd, 16)) != .SUCCESS) return;
 

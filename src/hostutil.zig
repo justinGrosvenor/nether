@@ -24,6 +24,9 @@ pub const libc = struct {
     pub extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
     pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
     pub extern "c" fn getuid() u32;
+    // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
+    // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
+    pub extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 };
 pub extern "c" fn usleep(usec: c_uint) c_int;
 
@@ -84,6 +87,9 @@ pub fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
         if (n <= 0) break;
         off += @intCast(n);
     }
+    // A short read (error or EOF mid-file) must not silently yield a partial file:
+    // callers (e.g. __put__) would transfer truncated data as if complete.
+    if (off != size) return error.ShortRead;
     return buf;
 }
 
