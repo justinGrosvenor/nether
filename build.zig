@@ -16,13 +16,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    // The HVF backend (macOS hosts) links Apple's Hypervisor.framework and needs
-    // libSystem. The binary must then be codesigned with the hypervisor
-    // entitlement before it can run; ad-hoc signing works for local dev:
+    // Link libc on every target: the user-mode network stack (slirp) and the
+    // control/file-transfer plumbing use the C socket/file APIs, and both host
+    // paths (KVM and HVF) now route guest egress through slirp's firewall.
+    exe.root_module.link_libc = true;
+    // The HVF backend (macOS hosts) additionally links Apple's Hypervisor.framework.
+    // The binary must then be codesigned with the hypervisor entitlement before it
+    // can run; ad-hoc signing works for local dev:
     //   codesign --sign - --entitlements nether.entitlements --force <binary>
     if (target.result.os.tag == .macos) {
         exe.root_module.linkFramework("Hypervisor", .{});
-        exe.root_module.link_libc = true;
     }
     b.installArtifact(exe);
 

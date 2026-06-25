@@ -216,9 +216,23 @@ fn linuxMain() !void {
     var net_be: nether.VirtioNet = undefined;
     var net_dev: nether.virtio.Device = undefined;
     var tap_io: TapIo = undefined;
+    var slirp_stack: nether.Slirp = undefined;
     var net_running = false;
+    var net_slirp = false;
     if (netEnabled()) {
-        if (openTap("tap0")) |tap_fd| {
+        // Default backend: the in-VMM user-mode stack (slirp) with the egress
+        // firewall, same as the HVF path, so the guest gets filtered outbound NAT
+        // and no host root/tap is needed. `net_tap` opts into the raw tap0 bridge
+        // instead (real L2, NO egress firewall) for trusted setups.
+        const want_tap = modeOn("net_tap", "nether-net-tap");
+        var tap_fd: ?i32 = null;
+        if (want_tap) {
+            tap_fd = openTap("tap0");
+            if (tap_fd == null) std.debug.print("[nether] virtio-net: cannot open tap0 (need /dev/net/tun and a configured tap)\n", .{});
+        }
+        // Build the PCI device only once we have a backend to attach (slirp is
+        // always available; tap only if it opened, matching the old behavior).
+        if (!want_tap or tap_fd != null) {
             net_be = .{};
             net_dev = nether.virtio.Device.init(net_be.backend(), .{ .bytes = low, .base = layout.ram_low.base });
             net_dev.assignBar(nether.memmap.pci_mmio32_base + 0x20000);
@@ -227,13 +241,23 @@ fn linuxMain() !void {
             try pci_host.addFunction(net_dev.function(3, 0));
             try bus.addMmio(net_dev.mmio());
             net_be.attach(&net_dev);
-            tap_io = .{ .fd = tap_fd, .net = &net_be };
-            net_be.on_tx = TapIo.tx;
-            net_be.on_tx_ctx = &tap_io;
-            net_running = true;
-            std.debug.print("[nether] virtio-net: tap0, MAC 52:54:00:12:34:56, BAR 0x{x}\n", .{net_dev.barBase()});
-        } else {
-            std.debug.print("[nether] virtio-net: cannot open tap0 (need /dev/net/tun and a configured tap)\n", .{});
+            if (tap_fd) |fd| {
+                tap_io = .{ .fd = fd, .net = &net_be };
+                net_be.on_tx = TapIo.tx;
+                net_be.on_tx_ctx = &tap_io;
+                net_running = true;
+                std.debug.print("[nether] virtio-net: tap0 (raw L2, no egress firewall), MAC 52:54:00:12:34:56, BAR 0x{x}\n", .{net_dev.barBase()});
+            } else {
+                slirp_stack = .{};
+                applyNetFirewall(&slirp_stack);
+                slirp_stack.out_fn = slirpToNet;
+                slirp_stack.out_ctx = &net_be;
+                net_be.on_tx = netToSlirp;
+                net_be.on_tx_ctx = &slirp_stack;
+                net_running = true;
+                net_slirp = true;
+                std.debug.print("[nether] virtio-net: user-mode slirp + egress firewall (default-deny; net_open/net_allow to adjust), BAR 0x{x}\n", .{net_dev.barBase()});
+            }
         }
     }
 
@@ -301,11 +325,19 @@ fn linuxMain() !void {
     // each inbound frame to the guest's RX ring (frames are dropped until the
     // guest posts buffers, which is harmless). Same lifetime model as the stdin
     // and web threads: the process owns it.
-    if (net_running) {
+    if (net_running and !net_slirp) {
         if (std.Thread.spawn(.{}, TapIo.rxPump, .{&tap_io})) |t| {
             t.detach();
         } else |err| {
             std.debug.print("[nether] net rx thread failed: {s}; net is send-only\n", .{@errorName(err)});
+        }
+    } else if (net_slirp) {
+        // slirp poll thread: drives the NAT sockets and injects replies into the
+        // guest's RX ring (same host-side loop the HVF path runs).
+        if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| {
+            t.detach();
+        } else |err| {
+            std.debug.print("[nether] slirp poll thread failed: {s}; net is send-only\n", .{@errorName(err)});
         }
     }
 
@@ -365,6 +397,33 @@ fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
 }
 fn slirpPollLoop(s: *nether.Slirp) void {
     while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
+}
+
+/// Apply the egress-firewall config (govern) to a slirp stack from nether.conf,
+/// shared by both host paths: default-deny private/loopback/link-local/metadata,
+/// `net_open` to disable, `net_allow`/`net_block` CIDR exceptions, and a
+/// `net_rate_kbps` download cap. Default-deny is the default, so a stack left
+/// unconfigured is already firewalled.
+fn applyNetFirewall(s: *nether.Slirp) void {
+    if (confBool("net_open")) s.fw_enabled = false;
+    var fw_allow: [1024]u8 = undefined;
+    if (confGet("net_allow", &fw_allow)) |v| {
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |c| {
+            const t = std.mem.trim(u8, c, " \t");
+            if (t.len > 0 and !s.addAllow(t)) std.debug.print("[nether] net_allow: bad/full rule '{s}'\n", .{t});
+        }
+    }
+    var fw_block: [1024]u8 = undefined;
+    if (confGet("net_block", &fw_block)) |v| {
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |c| {
+            const t = std.mem.trim(u8, c, " \t");
+            if (t.len > 0 and !s.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
+        }
+    }
+    const rate_kbps = confGetInt("net_rate_kbps", 0);
+    if (rate_kbps > 0) s.setRateKbps(rate_kbps);
 }
 
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
@@ -792,28 +851,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         try pci_host.addFunction(net_dev.function(4, 0));
         net_be.attach(&net_dev);
         slirp_stack = .{};
-        // Egress firewall (govern): default-deny private/loopback/link-local/metadata.
-        // net_open=1 disables it; net_allow / net_block add CIDR exceptions.
-        if (confBool("net_open")) slirp_stack.fw_enabled = false;
-        var fw_allow: [1024]u8 = undefined;
-        if (confGet("net_allow", &fw_allow)) |v| {
-            var it = std.mem.splitScalar(u8, v, ',');
-            while (it.next()) |c| {
-                const t = std.mem.trim(u8, c, " \t");
-                if (t.len > 0 and !slirp_stack.addAllow(t)) std.debug.print("[nether] net_allow: bad/full rule '{s}'\n", .{t});
-            }
-        }
-        var fw_block: [1024]u8 = undefined;
-        if (confGet("net_block", &fw_block)) |v| {
-            var it = std.mem.splitScalar(u8, v, ',');
-            while (it.next()) |c| {
-                const t = std.mem.trim(u8, c, " \t");
-                if (t.len > 0 and !slirp_stack.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
-            }
-        }
-        // Download bandwidth cap (govern): net_rate_kbps kilobits/sec, 0 = unlimited.
-        const rate_kbps = confGetInt("net_rate_kbps", 0);
-        if (rate_kbps > 0) slirp_stack.setRateKbps(rate_kbps);
+        // Egress firewall (govern): default-deny private/loopback/link-local/metadata,
+        // with net_open / net_allow / net_block / net_rate_kbps from nether.conf.
+        applyNetFirewall(&slirp_stack);
         slirp_stack.out_fn = slirpToNet;
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
