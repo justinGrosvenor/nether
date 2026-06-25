@@ -174,7 +174,8 @@ const page =
     \\<style>html,body{margin:0;background:#000}.t{font:14px/1.2 ui-monospace,monospace;
     \\color:#ddd;background:#000;padding:8px;white-space:pre;tab-size:8}</style></head>
     \\<body><pre id="s" class="t">connecting...</pre><script>
-    \\async function tick(){try{const r=await fetch("/grid");
+    \\const Q=location.search;
+    \\async function tick(){try{const r=await fetch("/grid"+Q);
     \\document.getElementById("s").outerHTML=await r.text();}catch(e){}setTimeout(tick,250)}
     \\function key(e){
     \\if(e.ctrlKey&&e.key.length===1){const c=e.key.toUpperCase().charCodeAt(0);
@@ -185,7 +186,7 @@ const page =
     \\case"End":return"\x1b[F";case"Delete":return"\x1b[3~";}
     \\if(e.key.length===1&&!e.ctrlKey&&!e.metaKey)return e.key;return null}
     \\addEventListener("keydown",e=>{const s=key(e);
-    \\if(s!==null){e.preventDefault();fetch("/input",{method:"POST",body:s});}});
+    \\if(s!==null){e.preventDefault();fetch("/input"+Q,{method:"POST",body:s});}});
     \\tick();</script></body></html>
 ;
 
@@ -204,10 +205,21 @@ pub const Server = struct {
     /// already safe to push from another thread.
     on_input: ?*const fn (*anyopaque, []const u8) void = null,
     on_input_ctx: ?*anyopaque = null,
+    /// Per-process access token (hex of 16 random bytes), generated in `run`. Every
+    /// request must carry `?t=<token>`; without it the console (and its keystroke
+    /// injection) is refused, so other local processes that did not see the
+    /// operator's URL cannot drive it even though the port is loopback.
+    token: [32]u8 = undefined,
 
     /// Bind, listen, and serve forever. Returns on a fatal setup error (e.g.
     /// the port is taken), so the caller can run it on a detached thread.
     pub fn run(self: *Server) void {
+        // Mint a fresh access token for this process before listening. Without OS
+        // randomness we refuse to serve rather than fall back to a guessable token.
+        var raw: [16]u8 = undefined;
+        if (linux.getrandom(&raw, raw.len, 0) != raw.len) return;
+        self.token = std.fmt.bytesToHex(raw, .lower);
+
         const fd_u = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
         if (linux.errno(fd_u) != .SUCCESS) return;
         const fd: i32 = @intCast(fd_u);
@@ -222,6 +234,7 @@ pub const Server = struct {
         const addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, self.port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
         if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return;
         if (linux.errno(linux.listen(fd, 16)) != .SUCCESS) return;
+        std.debug.print("[web] console: http://127.0.0.1:{d}/?t={s}\n", .{ self.port, self.token });
 
         while (true) {
             const conn_u = linux.accept(fd, null, null);
@@ -236,7 +249,18 @@ pub const Server = struct {
         var req: [4096]u8 = undefined;
         const n = linux.read(conn, &req, req.len);
         if (linux.errno(n) != .SUCCESS or n == 0) return;
-        const path = parsePath(req[0..n]);
+        const target = parsePath(req[0..n]);
+        const qpos = std.mem.indexOfScalar(u8, target, '?');
+        const path = if (qpos) |q| target[0..q] else target;
+        const query = if (qpos) |q| target[q + 1 ..] else "";
+
+        // Token gate: every route (page, /grid, /input) requires ?t=<token>. The
+        // page's JS carries it forward via location.search, so a client that never
+        // saw the operator's URL cannot reach keystroke injection or the screen.
+        if (!self.authed(query)) {
+            writeAll(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
 
         if (std.mem.eql(u8, path, "/input")) {
             self.deliverInput(conn, &req, n);
@@ -269,7 +293,23 @@ pub const Server = struct {
         const body_len = @min(have, want);
         if (body_len > 0) cb(ctx, req[body_start .. body_start + body_len]);
     }
+
+    /// True if the request query carries the matching `t=<token>`.
+    fn authed(self: *const Server, query: []const u8) bool {
+        const tok = tokenParam(query);
+        return tok.len == self.token.len and std.mem.eql(u8, &self.token, tok);
+    }
 };
+
+/// Extract the `t` query parameter value (empty if absent). `query` is the part
+/// after '?', e.g. "t=abc123" or "x=1&t=abc123".
+fn tokenParam(query: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |kv| {
+        if (std.mem.startsWith(u8, kv, "t=")) return kv[2..];
+    }
+    return "";
+}
 
 /// Parse the Content-Length header value (0 if absent/unparseable).
 fn contentLength(req: []const u8) usize {
@@ -398,6 +438,21 @@ test "parsePath extracts the request target" {
     try testing.expectEqualStrings("/grid", parsePath("GET /grid HTTP/1.1\r\n"));
     try testing.expectEqualStrings("/", parsePath("GET / HTTP/1.1\r\n"));
     try testing.expectEqualStrings("/", parsePath("garbage-no-spaces"));
+}
+
+test "tokenParam and the auth gate accept only the exact token" {
+    try testing.expectEqualStrings("abc", tokenParam("t=abc"));
+    try testing.expectEqualStrings("abc", tokenParam("x=1&t=abc"));
+    try testing.expectEqualStrings("", tokenParam("x=1")); // absent
+    try testing.expectEqualStrings("", tokenParam("")); // empty query
+
+    const tok = "0123456789abcdef0123456789abcdef"; // 32 hex chars
+    var s: Server = undefined;
+    @memcpy(&s.token, tok);
+    try testing.expect(s.authed("t=" ++ tok));
+    try testing.expect(!s.authed("t=wrong"));
+    try testing.expect(!s.authed("")); // no token => refused
+    try testing.expect(!s.authed("t=" ++ tok ++ "x")); // longer
 }
 
 test "contentLength parses the header case-insensitively" {

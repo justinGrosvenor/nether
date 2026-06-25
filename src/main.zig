@@ -291,8 +291,7 @@ fn linuxMain() !void {
             .on_input_ctx = &serial,
         };
         if (std.Thread.spawn(.{}, nether.WebConsole.run, .{&web})) |t| {
-            t.detach();
-            std.debug.print("[nether] web console: http://0.0.0.0:9000\n", .{});
+            t.detach(); // the server thread prints the loopback URL with its access token
         } else |err| {
             std.debug.print("[nether] web console failed: {s}\n", .{@errorName(err)});
         }
