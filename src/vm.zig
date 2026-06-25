@@ -60,10 +60,14 @@ pub const Vm = struct {
     /// Return a host slice for the guest physical range, or NotMapped.
     fn guestSlice(self: *Vm, gpa: u64, len: usize) Error![]u8 {
         for (self.regions[0..self.region_count]) |r| {
-            if (gpa >= r.guest_phys and gpa + len <= r.guest_phys + r.host.len) {
-                const off: usize = @intCast(gpa - r.guest_phys);
-                return r.host[off .. off + len];
-            }
+            if (gpa < r.guest_phys) continue;
+            const off = gpa - r.guest_phys;
+            // Overflow-safe bound (matches virtq.GuestMem.slice): a guest can make
+            // `gpa` huge, so never compute `gpa + len` (it can wrap past the end).
+            // Compare against the room left in the region instead.
+            if (off > r.host.len or len > r.host.len - off) continue;
+            const o: usize = @intCast(off);
+            return r.host[o .. o + len];
         }
         return error.NotMapped;
     }

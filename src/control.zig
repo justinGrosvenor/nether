@@ -568,10 +568,26 @@ pub fn controlListener(ctx: *ControlCtx) void {
         std.debug.print("[control] bind/listen failed on {s}\n", .{ctx.path});
         return;
     }
+    // The control socket grants full control of the VM (run commands in the guest,
+    // shut down, pull screen/frame snapshots, transfer host files). The default
+    // path lives in world-traversable /tmp, so restrict it to the owner: tighten the
+    // socket file to 0600 and reject any peer whose uid is not ours. We just
+    // unlink+bind'd, so there is no pre-existing file to inherit looser perms from.
+    if (libc.fchmod(fd, 0o600) != 0) std.debug.print("[control] warning: fchmod 0600 on socket failed\n", .{});
+    const owner_uid = libc.getuid();
     std.debug.print("[control] listening on {s}\n", .{ctx.path});
     while (true) {
         const c = libc.accept(fd, null, null);
         if (c < 0) continue;
+        // Authoritative gate: only the owning uid may drive the control plane,
+        // even if the socket perms were somehow loosened (race, remount, umask).
+        var euid: u32 = 0;
+        var egid: u32 = 0;
+        if (libc.getpeereid(c, &euid, &egid) != 0 or euid != owner_uid) {
+            std.debug.print("[control] rejected connection from uid {d} (owner {d})\n", .{ euid, owner_uid });
+            _ = libc.close(c);
+            continue;
+        }
         ctx.client.store(c, .release);
         if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh client gets a full screen first
         if (ctx.gpu) |g| g.resetFrameDiff(); // ...and a full framebuffer first

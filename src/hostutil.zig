@@ -19,6 +19,11 @@ pub const libc = struct {
     pub extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
     pub extern "c" fn unlink(path: [*:0]const u8) c_int;
     pub extern "c" fn pipe(fds: *[2]c_int) c_int;
+    // Control-socket access control: tighten the bound socket to owner-only and
+    // verify the connecting peer's uid (the socket grants full control of the VM).
+    pub extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
+    pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
+    pub extern "c" fn getuid() u32;
 };
 pub extern "c" fn usleep(usec: c_uint) c_int;
 
