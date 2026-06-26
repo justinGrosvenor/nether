@@ -481,7 +481,7 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
 }
 
 fn reply(c: c_int, msg: []const u8) void {
-    _ = libc.write(c, msg.ptr, msg.len);
+    _ = writeAll(c, msg);
 }
 
 /// Send one command line to the guest agent (waiting for it to connect), counting
@@ -492,7 +492,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
         var rep: [512]u8 = undefined;
         const n = ctx.meter.report(&rep);
-        _ = libc.write(c, rep[0..n].ptr, n);
+        _ = writeAll(c, rep[0..n]);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
@@ -502,7 +502,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         if (ctx.meter.net) |s| {
             var buf: [16384]u8 = undefined;
             const n = s.netLog(&buf);
-            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR net not enabled\n");
         return;
@@ -512,7 +512,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     if (std.mem.eql(u8, line, "__cmdlog__\n") or std.mem.eql(u8, line, "__cmdlog__")) {
         var buf: [16384]u8 = undefined;
         const n = ctx.agent.cmdLog(&buf);
-        _ = libc.write(c, buf[0..n].ptr, n);
+        _ = writeAll(c, buf[0..n]);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
@@ -533,7 +533,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
             // advertises the full seq, silently losing them for an incremental client).
             var buf: [nether.audit.SERIALIZE_MAX]u8 = undefined;
             const n = j.since(&buf, after);
-            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR journal not enabled\n");
         return;
@@ -544,7 +544,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         if (ctx.agent.render) |rd| {
             var buf: [64 * 1024]u8 = undefined;
             const n = rd.snapshot(&buf);
-            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
         return;
@@ -556,7 +556,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
         if (ctx.agent.render) |rd| {
             var buf: [64 * 1024]u8 = undefined;
             const n = rd.diff(&buf);
-            _ = libc.write(c, buf[0..n].ptr, n);
+            _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
         return;
@@ -570,7 +570,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
             } else if (ctx.allocator.alloc(u8, sz)) |buf| {
                 defer ctx.allocator.free(buf);
                 const n = g.frame(buf);
-                _ = libc.write(c, buf[0..n].ptr, n);
+                _ = writeAll(c, buf[0..n]);
                 _ = ctx.meter.bytes_out.fetchAdd(n, .release);
             } else |_| reply(c, "ERR out of memory\n");
         } else reply(c, "ERR gpu not enabled\n");
@@ -587,7 +587,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
             } else if (ctx.allocator.alloc(u8, sz * 2)) |buf| { // shadow + out, both <= a full frame
                 defer ctx.allocator.free(buf);
                 const n = g.frameDiff(buf[0..sz], buf[sz..]);
-                _ = libc.write(c, buf[sz..][0..n].ptr, n);
+                _ = writeAll(c, buf[sz..][0..n]);
                 _ = ctx.meter.bytes_out.fetchAdd(n, .release);
             } else |_| reply(c, "ERR out of memory\n");
         } else reply(c, "ERR gpu not enabled\n");

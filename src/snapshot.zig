@@ -352,6 +352,19 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
     const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
 
+    // The RAM region is mapped copy-on-write by offset (not read), so a file that is
+    // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
+    // the guest on the first access to the missing tail. Verify the file actually
+    // holds the RAM region up front (overflow-safe), then rewind to the metadata.
+    const fsize = libc.lseek(fd, 0, 2); // SEEK_END
+    _ = libc.lseek(fd, 64, 0); // SEEK_SET back to just after the header
+    if (fsize < 0) return error.BadSnapshot;
+    const file_size: u64 = @intCast(fsize);
+    if (ram_off > file_size or ram_size > file_size - ram_off) {
+        std.debug.print("[nether] restore: snapshot truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_size, file_size });
+        return error.BadSnapshot;
+    }
+
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
     // Map RAM copy-on-write from the snapshot file (at the snapshot's own size):

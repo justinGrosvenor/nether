@@ -355,15 +355,11 @@ fn genTable() Table {
 fn single(t: *OptionalTable, c: u8, s0: State, s1: State, a: Action) void {
     const s0_int = @intFromEnum(s0);
 
-    // TODO: enable this but it thinks we're in runtime right now
-    // if (t[c][s0_int]) |existing| {
-    //     @compileLog(c);
-    //     @compileLog(s0);
-    //     @compileLog(s1);
-    //     @compileLog(existing);
-    //     @compileError("transition set multiple times");
-    // }
-
+    // No set-once assertion here: the table is built by setting broad ranges first
+    // and then deliberately overriding specific cells (e.g. a printable range, then
+    // single control codes within it), so a cell being written twice is expected.
+    // (The old TODO blamed "runtime"; the real reason is these intentional overrides
+    // - genTable is a comptime const, so an assertion would run, it just must not.)
     t[c][s0_int] = transition(s1, a);
 }
 
