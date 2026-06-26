@@ -699,7 +699,16 @@ The build-out arc (offline-first chunks):
      time-to-RESTORED from ~1780 ms to ~90 ms (~20x); restore now mmaps + reads only
      the ~1.2 MiB of metadata/GIC/disk, and RAM pages fault in on demand. Verified
      the forked guest still runs correctly with no invalidation.
-   Known rough edge: same-host/same-build snapshot format.
+   Known rough edge: same-host/same-build snapshot format - but now **validated, not
+   assumed**. The restore path checks the 64-byte header before mapping RAM or reading
+   any state: magic, a format version (`SNAP_VERSION`, bumped on intentional changes),
+   and a struct-layout fingerprint (the `@sizeOf` of each raw-serialized struct -
+   cpu/device/uart) that catches silent layout drift even when the version was not
+   bumped, plus bounds on the vCPU count and the RAM/disk/GIC sizes. A stale or corrupt
+   snapshot now fails with a clear, distinct error (`SnapshotVersionMismatch` /
+   `SnapshotLayoutMismatch` / `BadSnapshot`) instead of a layout-mismatched struct read
+   or an out-of-bounds write into the fixed disk buffer. Unit-tested and proven live
+   (a wrong-version, wrong-magic, and oversized-disk snapshot are each rejected cleanly).
 
 The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
 (a live networked boot) is independent of this track. SMP and snapshot on the KVM

@@ -216,8 +216,33 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
 // shares the file's pages and only copies what it writes. Same-host/same-build
 // only (raw struct layout, native endian).
 const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
-const SNAP_VERSION: u32 = 2;
+const SNAP_VERSION: u32 = 3; // bumped: header now carries a struct-layout fingerprint
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
+const GIC_STATE_MAX: u64 = 16 * 1024 * 1024; // sane cap for the GIC blob (~126 KiB in practice)
+
+pub const SnapError = error{ BadSnapshot, SnapshotVersionMismatch, SnapshotLayoutMismatch };
+
+/// Validate the 64-byte snapshot header against THIS build before any trailing
+/// state is read or RAM is mapped. A snapshot file is operator-supplied and may
+/// be stale (written by an older build), corrupt, or truncated; an unvalidated
+/// header would otherwise drive a layout-mismatched struct read or an
+/// out-of-bounds disk write. Rejects: wrong magic; a version mismatch; a struct
+/// layout fingerprint (cpu/device/uart @sizeOf) that differs from this build,
+/// which catches silent layout drift even when the version was not bumped; a zero
+/// or too-large vCPU count; a zero RAM size; and disk/GIC sizes that would overrun
+/// the fixed disk buffer or request an absurd allocation.
+fn validateHeader(hdr: *const [64]u8, max_cpus: u32, disk_cap: u64, gic_cap: u64, cpu_sz: u32, dev_sz: u32, uart_sz: u32) SnapError!void {
+    if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return error.BadSnapshot;
+    if (std.mem.readInt(u32, hdr[4..8], .little) != SNAP_VERSION) return error.SnapshotVersionMismatch;
+    const num_cpus = std.mem.readInt(u32, hdr[8..12], .little);
+    if (num_cpus == 0 or num_cpus > max_cpus) return error.BadSnapshot;
+    if (std.mem.readInt(u64, hdr[24..32], .little) == 0) return error.BadSnapshot; // ram_size
+    if (std.mem.readInt(u64, hdr[40..48], .little) > disk_cap) return error.BadSnapshot; // disk would overrun
+    if (std.mem.readInt(u64, hdr[32..40], .little) > gic_cap) return error.BadSnapshot; // gic absurd
+    if (std.mem.readInt(u32, hdr[12..16], .little) != cpu_sz or
+        std.mem.readInt(u32, hdr[56..60], .little) != dev_sz or
+        std.mem.readInt(u32, hdr[60..64], .little) != uart_sz) return error.SnapshotLayoutMismatch;
+}
 
 fn writeSnapshotFile(
     path: [*:0]const u8,
@@ -245,11 +270,16 @@ fn writeSnapshotFile(
     std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
     std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION, .little);
     std.mem.writeInt(u32, hdr[8..12], @intCast(cpus.len), .little);
+    // Struct-layout fingerprint (validated on restore): the @sizeOf of each
+    // raw-serialized struct, so a layout change is rejected even without a version bump.
+    std.mem.writeInt(u32, hdr[12..16], @sizeOf(@TypeOf(cpus[0])), .little);
     std.mem.writeInt(u64, hdr[16..24], ARM_RAM_BASE, .little);
     std.mem.writeInt(u64, hdr[24..32], ram.len, .little);
     std.mem.writeInt(u64, hdr[32..40], gic.len, .little);
     std.mem.writeInt(u64, hdr[40..48], disk.len, .little);
     std.mem.writeInt(u64, hdr[48..56], ram_off, .little);
+    std.mem.writeInt(u32, hdr[56..60], @sizeOf(@TypeOf(con)), .little);
+    std.mem.writeInt(u32, hdr[60..64], @sizeOf(@TypeOf(uart)), .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -308,13 +338,19 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
 
     var hdr = [_]u8{0} ** 64;
     if (!readExact(fd, &hdr)) return error.BadSnapshot;
-    if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return error.BadSnapshot;
+    validateHeader(&hdr, hvfb.MAX_SNAP_CPUS, armdev.blk_disk_storage.len, GIC_STATE_MAX, @sizeOf(hvfb.CpuState), @sizeOf(nether.virtio.Device.DeviceState), @sizeOf(nether.Pl011.State)) catch |e| {
+        switch (e) {
+            error.SnapshotVersionMismatch => std.debug.print("[nether] restore: snapshot is not format v{d} (written by a different build); re-snapshot with this nether\n", .{SNAP_VERSION}),
+            error.SnapshotLayoutMismatch => std.debug.print("[nether] restore: snapshot struct layout differs from this build; re-snapshot with this nether\n", .{}),
+            error.BadSnapshot => std.debug.print("[nether] restore: snapshot header invalid, corrupt, or truncated\n", .{}),
+        }
+        return e;
+    };
     const num_cpus = std.mem.readInt(u32, hdr[8..12], .little);
     const ram_size = std.mem.readInt(u64, hdr[24..32], .little);
     const gic_size = std.mem.readInt(u64, hdr[32..40], .little);
     const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
     const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
-    if (num_cpus > hvfb.MAX_SNAP_CPUS or ram_size == 0) return error.BadSnapshot;
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
@@ -419,4 +455,55 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         return err;
     };
     std.debug.print("\n[nether] forked guest {s}.\n", .{@tagName(reason)});
+}
+
+// --- tests -----------------------------------------------------------------
+const testing = std.testing;
+
+test "snapshot header validation gates version, layout, and oversized sizes" {
+    const CPU: u32 = 100;
+    const DEV: u32 = 200;
+    const UART: u32 = 50;
+    const DISK_CAP: u64 = 1024 * 1024;
+    const GIC_CAP: u64 = GIC_STATE_MAX;
+
+    // A well-formed header for this "build".
+    var hdr = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
+    std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION, .little);
+    std.mem.writeInt(u32, hdr[8..12], 4, .little); // num_cpus
+    std.mem.writeInt(u32, hdr[12..16], CPU, .little);
+    std.mem.writeInt(u64, hdr[24..32], 512 * 1024 * 1024, .little); // ram_size
+    std.mem.writeInt(u64, hdr[32..40], 126405, .little); // gic_size
+    std.mem.writeInt(u64, hdr[40..48], DISK_CAP, .little); // disk_size == cap (ok)
+    std.mem.writeInt(u32, hdr[56..60], DEV, .little);
+    std.mem.writeInt(u32, hdr[60..64], UART, .little);
+    try validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART); // accepts a good header
+
+    var bad = hdr;
+    std.mem.writeInt(u32, bad[0..4], 0xdead_beef, .little); // wrong magic
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+
+    bad = hdr;
+    std.mem.writeInt(u32, bad[4..8], SNAP_VERSION + 1, .little); // version mismatch
+    try testing.expectError(error.SnapshotVersionMismatch, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+
+    // Layout drift: this build's cpu struct size differs from the file's fingerprint.
+    try testing.expectError(error.SnapshotLayoutMismatch, validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU + 1, DEV, UART));
+
+    bad = hdr;
+    std.mem.writeInt(u64, bad[40..48], DISK_CAP + 1, .little); // disk would overrun the buffer
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+
+    bad = hdr;
+    std.mem.writeInt(u64, bad[32..40], GIC_CAP + 1, .little); // absurd gic size
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+
+    bad = hdr;
+    std.mem.writeInt(u32, bad[8..12], 9, .little); // too many cpus
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+
+    bad = hdr;
+    std.mem.writeInt(u64, bad[24..32], 0, .little); // zero ram
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
 }

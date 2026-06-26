@@ -98,6 +98,7 @@ test {
     _ = @import("slirp.zig");
     _ = @import("control.zig");
     _ = @import("audit.zig");
+    _ = @import("snapshot.zig"); // snapshot file-format validation (mac path)
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
     _ = @import("fuzz.zig");
 }
