@@ -792,6 +792,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // slirp (NET), and lifecycle emitters.
     var journal = nether.Journal{};
     agent_ctx.journal = &journal;
+    agent_ctx.meter = &meter; // agent output counts as activity for the idle watchdog
     journal.emit(.life, "boot");
     // Control socket path from nether.conf (per-sandbox), else the default. A
     // configured path also enables control mode (no marker needed).
@@ -971,6 +972,20 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] runtime budget armed: {d}s\n", .{max_runtime_s});
     }
 
+    // Idle timeout (govern): reclaim a sandbox that has seen no control-plane
+    // activity (a client command or agent output) for idle_timeout_s, so a finished
+    // or abandoned sandbox does not burn the host until its max_runtime_s ceiling.
+    // The clock starts at boot, so a sandbox the platform never attaches to is also
+    // reclaimed. 0 = disabled. (max_runtime_s remains the hard wall-clock cap.)
+    var idle_ctx: IdleWatchdogCtx = undefined;
+    const idle_timeout_s = confGetInt("idle_timeout_s", 0);
+    if (idle_timeout_s > 0) {
+        meter.last_activity_ms.store(nowMs(), .release); // start counting from boot
+        idle_ctx = .{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .activity = &meter.last_activity_ms, .idle_ms = @intCast(idle_timeout_s * 1000) };
+        if (std.Thread.spawn(.{}, macIdleWatchdog, .{&idle_ctx})) |t| t.detach() else |_| {}
+        std.debug.print("[nether] idle timeout armed: {d}s\n", .{idle_timeout_s});
+    }
+
     std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ num_cpus, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.runSmp(&bus, &power, &smpc, &snapctl) catch |err| {
         std.debug.print("\n[nether] vcpu stopped: {s}\n", .{@errorName(err)});
@@ -996,6 +1011,25 @@ const WatchdogCtx = struct {
 fn macWatchdog(ctx: *WatchdogCtx) void {
     while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
     std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
+    stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
+}
+
+/// Idle-timeout watchdog context: a last-activity timestamp plus what it needs to
+/// stop the VM. `activity` is updated by the control plane (client commands and
+/// agent output); the sandbox is stopped once it has been stale for `idle_ms`.
+const IdleWatchdogCtx = struct {
+    power: *nether.Power,
+    handles: []const u64,
+    num_cpus: u32,
+    activity: *std.atomic.Value(i64), // last activity, matches nowMs()
+    idle_ms: i64,
+};
+
+/// Stop the sandbox once no control-plane activity has occurred for `idle_ms`.
+/// Polls the shared last-activity timestamp; same stop path as the runtime budget.
+fn macIdleWatchdog(ctx: *IdleWatchdogCtx) void {
+    while (nowMs() - ctx.activity.load(.acquire) < ctx.idle_ms) _ = usleep(200_000); // ~5 Hz
+    std.debug.print("\n[nether] idle timeout ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.idle_ms, 1000)});
     stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
 }
 

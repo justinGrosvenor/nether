@@ -532,6 +532,19 @@ The build-out arc (offline-first chunks):
      `.shutdown` and the process exits cleanly. 0 = unlimited. Proven live:
      `max_runtime_s=8` -> "runtime budget (8s) reached; stopping sandbox" -> clean
      `guest shutdown` at ~8 s.
+   - **Idle timeout (DONE) - govern (reclamation axis).** `idle_timeout_s` arms a
+     second watchdog that stops the sandbox after that many seconds with no
+     control-plane activity - a client command (any `__...__` or relayed line) or
+     agent output - so a finished or abandoned sandbox is reclaimed promptly instead
+     of burning the host until its hard `max_runtime_s` ceiling. Activity is a shared
+     `Metering.last_activity_ms` touched by `controlCommand` and the agent recv/accept
+     path; the clock starts at boot, so a sandbox the platform never attaches to is
+     also reclaimed. Same PSCI-poweroff stop path as the runtime budget; 0 = disabled.
+     Distinct from `max_runtime_s` (the hard wall-clock cap): idle is for efficient
+     reclamation, runtime is the ceiling. Proven live: with `idle_timeout_s=8` and no
+     client, the sandbox stops ~8 s after the agent connects; with a keepalive command
+     every 3 s it survives well past 8 s and stops ~8 s after the last command - so
+     activity defers reclamation and silence triggers it.
    - **Per-device locking; bus lock off the virtio hot path (DONE).** Both reviews
      flagged the global bus lock held across whole device handlers - a virtio notify
      that does net TX (`send`) or a queue drain serialized ALL vCPU MMIO, an SMP

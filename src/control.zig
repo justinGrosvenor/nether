@@ -30,6 +30,14 @@ pub const Metering = struct {
     bytes_in: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // client -> sandbox
     bytes_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // sandbox -> client
     net: ?*nether.Slirp = null, // network NAT, for egress/ingress byte counts
+    // Last control-plane activity (nowMs): a client command or agent output. The
+    // idle watchdog reclaims a sandbox that has seen none for idle_timeout_s.
+    last_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Mark control-plane activity (resets the idle timer).
+    pub fn touch(self: *Metering) void {
+        self.last_activity_ms.store(nowMs(), .release);
+    }
 
     /// Render a stats report (text + the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *Metering, buf: []u8) usize {
@@ -158,6 +166,8 @@ pub const AgentCtx = struct {
     exit_len: usize = 0,
     /// Unified event journal: commands are mirrored here as CMD events.
     journal: ?*nether.Journal = null,
+    /// Usage meter, so agent output counts as activity for the idle watchdog.
+    meter: ?*Metering = null,
 
     // Command audit log. cmd_lock is a leaf lock guarding the ring + the pending slot;
     // controlCommand (control thread) sets `pending`, the vsock callback records on the
@@ -280,12 +290,15 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
     switch (ev) {
         .accept => |id| {
             a.conn_id.store(@intCast(id), .release);
+            if (a.meter) |m| m.touch();
             if (a.journal) |j| j.emit(.life, "agent connected");
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
         .recv => |r| if (a.capture.load(.acquire)) |cap| {
             cap.feed(r.bytes); // file transfer in progress: divert the reply
         } else {
+            if (a.meter) |m| m.touch(); // agent output: the sandbox is doing work
+
             if (a.render) |rd| rd.feed(r.bytes); // tee command output into the render screen
             a.auditRecv(r.bytes); // observe exit codes for the command audit log
             if (a.pipe_w >= 0) {
@@ -475,6 +488,7 @@ fn reply(c: c_int, msg: []const u8) void {
 /// it for metering. `__stats__` and `__shutdown__` are intercepted here and
 /// answered by the host without touching the guest.
 fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
+    ctx.meter.touch(); // any client command counts as activity (resets the idle timer)
     if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
         var rep: [512]u8 = undefined;
         const n = ctx.meter.report(&rep);
