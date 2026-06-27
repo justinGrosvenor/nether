@@ -339,6 +339,17 @@ fn linuxMain() !void {
         }
     }
 
+    // Runtime budget (govern) on the KVM path: the same shared platform.Watchdogs as
+    // the HVF path, with the KVM force-exit injected as the Stop. Only the hard
+    // wall-clock cap is wired here; the idle timeout needs the control plane (the rest
+    // of the platform port, #2). 0 = unlimited.
+    var kvm_stop = KvmStop{ .power = &power, .vcpu = &vcpu };
+    var watchdogs = platform.Watchdogs{
+        .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
+        .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
+    };
+    watchdogs.arm();
+
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         if (nether.trace.on()) dumpConsole(&console);
@@ -1006,6 +1017,19 @@ const HvfStop = struct {
     fn call(p: *anyopaque) void {
         const self: *HvfStop = @ptrCast(@alignCast(p));
         stopSandbox(self.power, self.handles, self.num_cpus);
+    }
+};
+
+/// The KVM backend's guest stop, adapted to `platform.Stop`: request a PSCI-style
+/// poweroff, then force the vCPU thread out of `KVM_RUN` (`vcpu.requestExit` signals
+/// it; the run loop's EINTR path returns `.shutdown`). The KVM analog of `HvfStop`.
+const KvmStop = struct {
+    power: *nether.Power,
+    vcpu: *nether.Vcpu,
+    fn call(p: *anyopaque) void {
+        const self: *KvmStop = @ptrCast(@alignCast(p));
+        self.power.request(.shutdown);
+        self.vcpu.requestExit();
     }
 };
 

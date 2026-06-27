@@ -94,10 +94,31 @@ pub const Vm = struct {
     }
 };
 
+// Force-exit signal: a watchdog / control thread sends this to the vCPU thread to
+// kick it out of a blocking KVM_RUN (the KVM analog of HVF's hv_vcpus_exit). The
+// handler is a no-op installed WITHOUT SA_RESTART, so the interrupted KVM_RUN ioctl
+// returns EINTR; the run loop then honors a pending power request. Compile-verified;
+// not yet exercised on real KVM (no x86 host) - see docs/linux-platform-port.md.
+const FORCE_EXIT_SIG = std.posix.SIG.USR1;
+var fe_installed = std.atomic.Value(bool).init(false);
+fn forceExitHandler(_: std.posix.SIG) callconv(.c) void {}
+fn installForceExitHandler() void {
+    if (fe_installed.swap(true, .acq_rel)) return;
+    const act = std.posix.Sigaction{ .handler = .{ .handler = forceExitHandler }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(FORCE_EXIT_SIG, &act, null);
+}
+
 pub const Vcpu = struct {
     fd: i32,
     run_page: *kvm.Run,
     run_mem: []u8,
+    run_thread: std.c.pthread_t = undefined, // set at run() start, for requestExit()
+
+    /// Force this vCPU out of a blocking KVM_RUN (called from another thread). Pairs
+    /// with the run loop's EINTR handling; the caller sets the power action first.
+    pub fn requestExit(self: *Vcpu) void {
+        _ = std.c.pthread_kill(self.run_thread, FORCE_EXIT_SIG);
+    }
 
     fn init(kvm_fd: i32, vm_fd: i32, id: u32) Error!Vcpu {
         const fd: i32 = @intCast(try kvm.ioctl(vm_fd, kvm.CREATE_VCPU, id));
@@ -209,8 +230,26 @@ pub const Vcpu = struct {
     /// guest halts or a device requests a power transition via `power`.
     /// Unhandled exits are surfaced as errors.
     pub fn run(self: *Vcpu, bus: *io.Bus, power: *pwr.Power, apic: ?*ioapic.IoApic) !StopReason {
+        self.run_thread = std.c.pthread_self(); // target for requestExit()'s signal
+        installForceExitHandler();
         while (true) {
-            _ = try kvm.ioctl(self.fd, kvm.RUN, 0);
+            const r = linux.ioctl(self.fd, kvm.RUN, 0);
+            switch (linux.errno(r)) {
+                .SUCCESS => {},
+                .INTR => {
+                    // A force-exit signal kicked us out of KVM_RUN. Honor a pending
+                    // power request (shutdown/reset); otherwise re-enter the guest.
+                    if (power.action) |a| return switch (a) {
+                        .reset => .reset,
+                        .shutdown => .shutdown,
+                    };
+                    continue;
+                },
+                else => |e| {
+                    std.debug.print("[nether] KVM_RUN failed: {s}\n", .{@tagName(e)});
+                    return error.IoctlFailed;
+                },
+            }
             switch (self.run_page.exit_reason) {
                 kvm.EXIT_HLT => return .halted,
                 kvm.EXIT_SHUTDOWN => {

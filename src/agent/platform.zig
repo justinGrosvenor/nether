@@ -33,13 +33,14 @@ pub const Stop = struct {
 /// `self` for the VM's lifetime); pass `&watchdogs` and do not move it after arm().
 pub const Watchdogs = struct {
     stop: Stop,
-    activity: *std.atomic.Value(i64), // last control-plane activity (meter.last_activity_ms)
+    activity: ?*std.atomic.Value(i64) = null, // control-plane activity; required only for idle
     start_ms: i64 = 0, // set by arm()
     runtime_ms: i64 = 0, // hard wall-clock cap (0 = unlimited)
-    idle_ms: i64 = 0, // idle reclamation (0 = disabled)
+    idle_ms: i64 = 0, // idle reclamation (0 = disabled; needs `activity`)
 
     /// Start the clock and spawn the enabled watchdog threads. A budget of 0 means
-    /// that watchdog is not armed.
+    /// that watchdog is not armed. The idle watchdog also needs `activity` (the runtime
+    /// budget does not), so a bare VMM can arm just the runtime cap.
     pub fn arm(self: *Watchdogs) void {
         self.start_ms = nowMs();
         if (self.runtime_ms > 0) {
@@ -47,9 +48,11 @@ pub const Watchdogs = struct {
             std.debug.print("[nether] runtime budget armed: {d}s\n", .{@divTrunc(self.runtime_ms, 1000)});
         }
         if (self.idle_ms > 0) {
-            self.activity.store(self.start_ms, .release); // count idle from boot
-            if (std.Thread.spawn(.{}, idleLoop, .{self})) |t| t.detach() else |_| {}
-            std.debug.print("[nether] idle timeout armed: {d}s\n", .{@divTrunc(self.idle_ms, 1000)});
+            if (self.activity) |act| {
+                act.store(self.start_ms, .release); // count idle from boot
+                if (std.Thread.spawn(.{}, idleLoop, .{self})) |t| t.detach() else |_| {}
+                std.debug.print("[nether] idle timeout armed: {d}s\n", .{@divTrunc(self.idle_ms, 1000)});
+            }
         }
     }
 
@@ -60,9 +63,11 @@ pub const Watchdogs = struct {
         self.stop.call();
     }
 
-    /// Stop once no control-plane activity has occurred for `idle_ms`.
+    /// Stop once no control-plane activity has occurred for `idle_ms`. Only spawned
+    /// when `activity` is set, so the unwrap is safe.
     fn idleLoop(self: *Watchdogs) void {
-        while (nowMs() - self.activity.load(.acquire) < self.idle_ms) _ = usleep(200_000); // ~5 Hz
+        const activity = self.activity.?;
+        while (nowMs() - activity.load(.acquire) < self.idle_ms) _ = usleep(200_000); // ~5 Hz
         std.debug.print("\n[nether] idle timeout ({d}s) reached; stopping sandbox\n", .{@divTrunc(self.idle_ms, 1000)});
         self.stop.call();
     }
