@@ -26,6 +26,7 @@ const vsock = @import("virtio/virtio_vsock.zig");
 const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
 const pci = @import("chipset/pci.zig");
+const elf = @import("boot/elf.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -436,4 +437,72 @@ test "virtio BAR MMIO reads survive every offset and width" {
         }
     }
     std.mem.doNotOptimizeAway(dev.isr);
+}
+
+// --- ELF / PVH boot loader -------------------------------------------------
+
+// elf.loadPvh parses a structured binary (ELF header -> program headers -> PT_LOAD
+// segments + the PVH note). The image is operator-supplied, not guest-supplied, but
+// a malformed/corrupt vmlinux must still error cleanly, never read out of bounds or
+// overflow. We drive it with a PERMISSIVE writer (records, does not bounds-check),
+// which removes the production writer's masking so the loader's own arithmetic safety
+// is what's under test - e.g. a huge p_paddr in a PT_LOAD must not overflow the .bss
+// start computation.
+const ElfSink = struct {
+    pub fn write(self: *ElfSink, gpa: u64, bytes: []const u8) !void {
+        _ = self;
+        std.mem.doNotOptimizeAway(gpa);
+        std.mem.doNotOptimizeAway(bytes.len);
+    }
+    pub fn zero(self: *ElfSink, gpa: u64, len: usize) !void {
+        _ = self;
+        std.mem.doNotOptimizeAway(gpa);
+        std.mem.doNotOptimizeAway(len);
+    }
+};
+
+test "ELF/PVH loader survives malformed and hostile images" {
+    var prng = std.Random.DefaultPrng.init(0xE1F_F022);
+    const rand = prng.random();
+    var sink = ElfSink{};
+    var i: usize = 0;
+    while (i < 12000) : (i += 1) {
+        var img = [_]u8{0} ** 512;
+        const len = 1 + rand.uintLessThan(usize, img.len);
+        rand.bytes(img[0..len]);
+
+        // Half the rounds: build a well-formed-enough ELF so parsing reaches the phdr
+        // loop with PT_LOAD/PT_NOTE entries carrying hostile field values (full-range
+        // p_paddr/p_memsz, valid-but-random p_offset/p_filesz). This is what exercises
+        // the segment-bound + .bss-start paths, not just the early header rejects.
+        if (len >= 320 and rand.boolean()) {
+            @memset(img[0..len], 0);
+            @memcpy(img[0..4], "\x7fELF");
+            img[4] = 2; // ELFCLASS64
+            img[5] = 1; // little-endian
+            std.mem.writeInt(u16, img[18..20], 62, .little); // EM_X86_64
+            const phoff: usize = 64;
+            const phnum: usize = 1 + rand.uintLessThan(usize, 4); // <= 4 -> table fits in 512
+            std.mem.writeInt(u64, img[32..40], phoff, .little);
+            std.mem.writeInt(u16, img[54..56], 56, .little); // phentsize
+            std.mem.writeInt(u16, img[56..58], @intCast(phnum), .little);
+            var k: usize = 0;
+            while (k < phnum) : (k += 1) {
+                const ph = phoff + k * 56;
+                const ptype = ([_]u32{ 1, 4, 0, 0xdead_beef })[rand.uintLessThan(usize, 4)]; // PT_LOAD/PT_NOTE/...
+                const p_offset = rand.uintLessThan(u64, len);
+                const p_filesz = rand.uintLessThan(u64, len - @as(usize, @intCast(p_offset)) + 1);
+                // p_paddr: bias toward the top of the u64 range so `p_paddr + p_filesz`
+                // (the .bss start) actually exercises the overflow path, not just random
+                // values that almost never reach it.
+                const p_paddr = if (rand.boolean()) std.math.maxInt(u64) - rand.uintLessThan(u64, 1024) else rand.int(u64);
+                std.mem.writeInt(u32, img[ph + 0 ..][0..4], ptype, .little);
+                std.mem.writeInt(u64, img[ph + 8 ..][0..8], p_offset, .little);
+                std.mem.writeInt(u64, img[ph + 24 ..][0..8], p_paddr, .little);
+                std.mem.writeInt(u64, img[ph + 32 ..][0..8], p_filesz, .little);
+                std.mem.writeInt(u64, img[ph + 40 ..][0..8], rand.int(u64), .little); // p_memsz: full range
+            }
+        }
+        _ = elf.loadPvh(img[0..len], &sink) catch {};
+    }
 }

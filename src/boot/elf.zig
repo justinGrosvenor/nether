@@ -58,7 +58,13 @@ pub fn loadPvh(image: []const u8, ctx: anytype) !u64 {
         switch (p_type) {
             PT_LOAD => {
                 try ctx.write(p_paddr, seg);
-                if (p_memsz > p_filesz) try ctx.zero(p_paddr + p_filesz, @intCast(p_memsz - p_filesz));
+                if (p_memsz > p_filesz) {
+                    // p_paddr is a full attacker-controlled u64; compute the .bss start
+                    // overflow-safe rather than relying on the writer to reject it (an
+                    // unchecked p_paddr + p_filesz would wrap/panic on a malformed image).
+                    const bss_start = std.math.add(u64, p_paddr, p_filesz) catch return error.BadElf;
+                    try ctx.zero(bss_start, @intCast(p_memsz - p_filesz));
+                }
             },
             PT_NOTE => {
                 if (findPvhNote(seg)) |e| entry = e;
