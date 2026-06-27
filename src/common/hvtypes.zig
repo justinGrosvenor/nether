@@ -19,15 +19,21 @@ pub const Error = error{
 };
 
 /// Little-endian assemble up to 4 bytes into a value (PIO/MMIO data marshalling).
+/// `i < 4` enforces the "up to 4 bytes" contract: the value is a u32, so a wider
+/// access (an oversized guest PIO/MMIO) must not drive the `i*8` shift past the u5
+/// shift width (which would panic). Bytes beyond the low 4 are ignored.
 pub fn readValue(bytes: []const u8) u32 {
     var v: u32 = 0;
-    for (bytes, 0..) |b, i| v |= @as(u32, b) << @intCast(i * 8);
+    for (bytes, 0..) |b, i| {
+        if (i < 4) v |= @as(u32, b) << @intCast(i * 8);
+    }
     return v;
 }
 
-/// Little-endian scatter a value across the given bytes.
+/// Little-endian scatter a value across the given bytes (bytes past the u32's low 4
+/// are zeroed; same shift-width guard as readValue).
 pub fn writeValue(bytes: []u8, value: u32) void {
-    for (bytes, 0..) |*b, i| b.* = @truncate(value >> @intCast(i * 8));
+    for (bytes, 0..) |*b, i| b.* = if (i < 4) @truncate(value >> @intCast(i * 8)) else 0;
 }
 
 test "value round-trips little-endian" {

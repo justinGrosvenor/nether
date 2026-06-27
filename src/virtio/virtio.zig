@@ -300,7 +300,10 @@ pub const Device = struct {
         if (size == 4 and reg == 0x14) return if (self.probe_hi) 0xFFFFFFFF else self.bar1;
         var v: u32 = 0;
         var i: usize = 0;
-        while (i < size and reg + i < self.config.len) : (i += 1) v |= @as(u32, self.config[reg + i]) << @intCast(i * 8);
+        // `i < 4`: a guest can issue a config access wider than 4 bytes (e.g. a 64-bit
+        // ECAM read -> size 8); the response is a u32, so bytes past 4 can't be held,
+        // and an unguarded `i*8` shift would overflow the u5 shift width and panic.
+        while (i < size and i < 4 and reg + i < self.config.len) : (i += 1) v |= @as(u32, self.config[reg + i]) << @intCast(i * 8);
         return v;
     }
 

@@ -79,7 +79,9 @@ pub const Net = struct {
         @memcpy(bytes[0..6], &self.mac);
         var v: u32 = 0;
         var i: u8 = 0;
-        while (i < size and off + i < bytes.len) : (i += 1) {
+        // `i < 4`: the result is a u32, and an oversized guest config access (size > 4)
+        // would otherwise drive the `i*8` shift past the u5 width and panic.
+        while (i < size and i < 4 and off + i < bytes.len) : (i += 1) {
             v |= @as(u32, bytes[off + i]) << @intCast(i * 8);
         }
         return v;

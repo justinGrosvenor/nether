@@ -22,6 +22,7 @@ const virtio = @import("virtio/virtio.zig");
 const vsock = @import("virtio/virtio_vsock.zig");
 const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
+const pci = @import("chipset/pci.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -366,5 +367,40 @@ test "virtio-gpu survives fully hostile control/cursor rings" {
         dev.barWrite(0x2000, 4, gpu.CONTROLQ);
         dev.barWrite(0x2000, 4, gpu.CURSORQ);
         std.mem.doNotOptimizeAway(dev.isr);
+    }
+}
+
+// --- PCI config space (ECAM) -----------------------------------------------
+
+// The guest drives ECAM config accesses of guest-chosen WIDTH at guest-chosen
+// register offsets. A width > 4 (a 64-bit ECAM load) must not panic: the config-read
+// callbacks bound their byte-assembly shift to the u32 result (i < 4). This drives
+// reads AND writes of widths 1..8 at every register offset through the real bus path.
+test "pci config space survives oversized and odd-width accesses" {
+    var ram: [4096]u8 = undefined;
+    @memset(&ram, 0);
+    var nb = net.Net{ .on_tx = netSink };
+    var dev = virtio.Device.init(nb.backend(), .{ .bytes = &ram, .base = 0 });
+    nb.attach(&dev);
+    var host = pci.Host{};
+    try host.addFunction(dev.function(3, 0));
+    const mm = host.mmioDevice();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_11);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        const dnum: u64 = rand.uintLessThan(u64, 4); // device 0..3 (3 is ours, 0..2 absent)
+        const reg: u64 = rand.uintLessThan(u64, 0x1000); // any 12-bit register offset
+        const offset = (dnum << 15) | reg;
+        const width = 1 + rand.uintLessThan(usize, 8); // 1..8 bytes, incl. the oversized case
+        var buf: [8]u8 = undefined;
+        if (rand.boolean()) {
+            mm.read_fn(mm.ptr, offset, buf[0..width]);
+        } else {
+            rand.bytes(buf[0..width]);
+            mm.write_fn(mm.ptr, offset, buf[0..width]);
+        }
+        std.mem.doNotOptimizeAway(buf);
     }
 }
