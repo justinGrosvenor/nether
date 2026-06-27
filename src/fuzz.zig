@@ -4,8 +4,10 @@
 //! virtio-vsock / virtio-net / virtio-gpu device parsers (incl. the gpu control-queue
 //! commands and live framebuffer capture - the richest attacker-controlled input), and
 //! the I/O access surfaces: PCI config space (ECAM) and the virtio BAR MMIO regions, at
-//! every guest-chosen access width (incl. oversized). (The file-transfer reply parser
-//! is fuzzed in control.zig, where its Capture type lives.)
+//! every guest-chosen access width (incl. oversized); the slirp user-mode network stack
+//! (guest frames: Ethernet/ARP/IPv4/ICMP/UDP/DHCP/TCP, with a deny-all firewall so no
+//! host sockets are opened); and the ELF/PVH boot-image loader. (The file-transfer reply
+//! parser is fuzzed in control.zig, where its Capture type lives.)
 //!
 //! These parse attacker-controlled bytes (a guest's serial output, and the
 //! descriptor rings a guest writes into shared memory), so the contract under
@@ -27,6 +29,7 @@ const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
 const pci = @import("chipset/pci.zig");
 const elf = @import("boot/elf.zig");
+const slirp = @import("net/slirp.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -504,5 +507,63 @@ test "ELF/PVH loader survives malformed and hostile images" {
             }
         }
         _ = elf.loadPvh(img[0..len], &sink) catch {};
+    }
+}
+
+// --- slirp user-mode network stack -----------------------------------------
+
+// onGuestFrame parses fully guest-controlled frames - the largest attacker surface
+// in the tree: Ethernet -> ARP / IPv4 -> ICMP / UDP (incl. DHCP) / TCP, plus the reply
+// builders that write into a fixed scratch buffer from guest-derived lengths. We set a
+// deny-all egress firewall (addBlock 0.0.0.0/0) so the outbound NAT paths short-circuit
+// BEFORE creating any host socket - the fuzz exercises only the in-VMM parsing/build
+// code, no real network I/O. Every length/offset is bounds-checked; a hostile frame
+// must process without a safety trip.
+fn slirpSink(ctx: *anyopaque, frame: []const u8) void {
+    _ = ctx;
+    std.mem.doNotOptimizeAway(frame.len);
+}
+
+test "slirp survives fully random guest frames" {
+    var s = slirp.Slirp{};
+    _ = s.addBlock("0.0.0.0/0"); // deny all egress -> no host sockets are opened
+    s.out_fn = slirpSink;
+    s.out_ctx = &s;
+    var prng = std.Random.DefaultPrng.init(0x5117_F0FF);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 8000) : (i += 1) {
+        var frame: [256]u8 = undefined;
+        const n = rand.uintLessThan(usize, frame.len);
+        rand.bytes(frame[0..n]);
+        s.onGuestFrame(frame[0..n]);
+    }
+}
+
+test "slirp survives structured-hostile IPv4 frames (random ihl/proto/doff)" {
+    var s = slirp.Slirp{};
+    _ = s.addBlock("0.0.0.0/0");
+    s.out_fn = slirpSink;
+    s.out_ctx = &s;
+    var prng = std.Random.DefaultPrng.init(0x14_BADD_11);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 12000) : (i += 1) {
+        var frame: [256]u8 = undefined;
+        const n = 14 + rand.uintLessThan(usize, frame.len - 14); // always a full Ethernet hdr
+        rand.bytes(frame[0..n]);
+        // Ethernet: ARP or IPv4 so we reach the sub-parsers, not the early reject.
+        // Ethertype is big-endian on the wire (slirp's rd16 reads .big).
+        const ethertype: u16 = if (rand.boolean()) 0x0800 else 0x0806;
+        std.mem.writeInt(u16, frame[12..14], ethertype, .big);
+        if (ethertype == 0x0800 and n >= 14 + 20) {
+            // IPv4 header with a random-but-plausible IHL and a real protocol so the
+            // ICMP/UDP/TCP sub-parsers (and their reply builders) actually run.
+            const ihl_words: u8 = 5 + rand.uintLessThan(u8, 6); // 5..10 -> 20..40 bytes
+            frame[14] = (4 << 4) | ihl_words; // version 4, IHL
+            frame[14 + 9] = ([_]u8{ 1, 6, 17, 99 })[rand.uintLessThan(usize, 4)]; // ICMP/TCP/UDP/other
+            // leave dst IP random; the deny-all firewall blocks egress regardless.
+        }
+        s.onGuestFrame(frame[0..n]);
     }
 }
