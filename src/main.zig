@@ -180,20 +180,44 @@ fn linuxMain() !void {
         std.debug.print("[nether] virtio-blk: disk.img {d} bytes, BAR 0x{x}\n", .{ disk.len, blk_dev.barBase() });
     }
 
-    // virtio-vsock: the swerver<->guest channel. Opt-in via a `nether-vsock`
-    // marker. PCI function 0:2.0, BAR clear of virtio-blk's (base + 64 KiB), with
-    // a guest CID of 3 (host is 2). As a live exerciser the host listens on port
-    // 1234 and echoes; the engine is heap-allocated (it is large and snapshot
-    // state), the transport/glue are stack locals that outlive `run`.
+    // Core platform state (observe/meter/run): the journal, usage meter, and agent,
+    // cross-wired in place - the same shared bundle the HVF path uses.
+    var core = control.Core{};
+    core.init(GUEST_RAM_SIZE / (1024 * 1024), 1, @intCast(confGetInt("max_output_bytes", 0)));
+
+    // Per-sandbox modes from nether.conf (markers kept as a fallback). A configured
+    // control_socket enables control mode without a marker.
+    var sock_path_buf: [256]u8 = undefined;
+    const have_sock_conf = confGet("control_socket", &sock_path_buf) != null;
+    const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
+    const control_on = modeOn("control", "nether-control") or have_sock_conf;
+    const agent_repl = modeOn("agent", "nether-agent") and !control_on;
+    const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
+    const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
+
+    // Render pillar: in control mode, tee the agent's output into a VT screen so the
+    // platform can fetch a rendered snapshot via __screen__.
+    var render: nether.Render = undefined;
+    if (control_on) {
+        const rows: u16 = @intCast(std.math.clamp(confGetInt("screen_rows", 24), 1, 200));
+        const cols: u16 = @intCast(std.math.clamp(confGetInt("screen_cols", 80), 1, 400));
+        render = try nether.Render.init(allocator, rows, cols);
+        core.agent.render = &render;
+    }
+    defer if (control_on) render.deinit();
+
+    // virtio-vsock (PCI 0:2.0): the host<->guest channel. In agent/control mode the
+    // host serves the in-guest agent on port 5000; otherwise a port-1234 echo
+    // exerciser. The engine is heap-allocated; the transport/glue outlive `run`.
     var vsock_engine: ?*nether.Vsock = null;
     defer if (vsock_engine) |v| allocator.destroy(v);
     var vsdev: nether.VsockDev = undefined;
     var vs_dev: nether.virtio.Device = undefined;
-    if (vsockEnabled()) {
+    if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
-        vs.on_event = vsockEcho;
-        vs.on_event_ctx = vs;
+        vs.on_event = if (agent_mode) agentEvent else vsockEcho;
+        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &core.agent) else @as(*anyopaque, vs);
         vsock_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), .{ .bytes = low, .base = layout.ram_low.base });
@@ -203,8 +227,8 @@ fn linuxMain() !void {
         try pci_host.addFunction(vs_dev.function(2, 0));
         try bus.addMmio(vs_dev.mmio());
         vsdev.attach(&vs_dev);
-        _ = vsdev.hostListen(1234);
-        std.debug.print("[nether] virtio-vsock: guest CID 3, echo on port 1234, BAR 0x{x}\n", .{vs_dev.barBase()});
+        _ = vsdev.hostListen(if (agent_mode) 5000 else 1234);
+        std.debug.print("[nether] virtio-vsock: guest CID 3, {s} on port {d}, BAR 0x{x}\n", .{ if (agent_mode) "agent" else "echo", @as(u16, if (agent_mode) 5000 else 1234), vs_dev.barBase() });
     }
 
     // virtio-net: opt-in via a `nether-net` marker, backed by a host tap device
@@ -217,7 +241,7 @@ fn linuxMain() !void {
     var slirp_stack: nether.Slirp = undefined;
     var net_running = false;
     var net_slirp = false;
-    if (netEnabled()) {
+    if (modeOn("net", "nether-net")) {
         // Default backend: the in-VMM user-mode stack (slirp) with the egress
         // firewall, same as the HVF path, so the guest gets filtered outbound NAT
         // and no host root/tap is needed. `net_tap` opts into the raw tap0 bridge
@@ -248,6 +272,8 @@ fn linuxMain() !void {
             } else {
                 slirp_stack = .{};
                 applyNetFirewall(&slirp_stack);
+                core.meter.net = &slirp_stack; // expose NAT egress/ingress via __stats__
+                slirp_stack.journal = &core.journal; // mirror egress flows into the timeline
                 slirp_stack.out_fn = slirpToNet;
                 slirp_stack.out_ctx = &net_be;
                 net_be.on_tx = netToSlirp;
@@ -339,14 +365,39 @@ fn linuxMain() !void {
         }
     }
 
-    // Runtime budget (govern) on the KVM path: the same shared platform.Watchdogs as
-    // the HVF path, with the KVM force-exit injected as the Stop. Only the hard
-    // wall-clock cap is wired here; the idle timeout needs the control plane (the rest
-    // of the platform port, #2). 0 = unlimited.
+    // The platform layer on the KVM path: the control socket + lifecycle watchdogs,
+    // the same shared helpers as the HVF path, with the KVM force-exit injected as the
+    // Stop. (No virtio-gpu on the KVM path yet, so .gpu = null / gpu = false.)
     var kvm_stop = KvmStop{ .power = &power, .vcpu = &vcpu };
+    var ctl_ctx: control.ControlCtx = undefined; // stable storage for the listener/relay threads
+    if (control_on) {
+        control.startControl(&ctl_ctx, .{
+            .vsdev = &vsdev,
+            .agent = &core.agent,
+            .meter = &core.meter,
+            .journal = &core.journal,
+            .gpu = null,
+            .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
+            .path = ctl_path,
+            .allocator = allocator,
+            .info = .{
+                .cpus = 1,
+                .ram_mb = GUEST_RAM_SIZE / (1024 * 1024),
+                .net = net_running,
+                .firewall = net_slirp and !confBool("net_open"),
+                .gpu = false,
+                .max_runtime_s = confGetInt("max_runtime_s", 0),
+                .idle_timeout_s = confGetInt("idle_timeout_s", 0),
+                .rate_kbps = confGetInt("net_rate_kbps", 0),
+                .max_output_bytes = confGetInt("max_output_bytes", 0),
+            },
+        });
+    }
     var watchdogs = platform.Watchdogs{
         .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
+        .activity = &core.meter.last_activity_ms,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
+        .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
     };
     watchdogs.arm();
 
@@ -370,16 +421,6 @@ fn webInput(ctx: *anyopaque, bytes: []const u8) void {
 /// True if a `nether-web` marker file is present in the working directory.
 fn webEnabled() bool {
     return markerPresent("nether-web");
-}
-
-/// True if a `nether-vsock` marker file is present in the working directory.
-fn vsockEnabled() bool {
-    return markerPresent("nether-vsock");
-}
-
-/// True if a `nether-net` marker file is present in the working directory.
-fn netEnabled() bool {
-    return markerPresent("nether-net");
 }
 
 fn markerPresent(path: [*:0]const u8) bool {
