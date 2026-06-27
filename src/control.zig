@@ -770,8 +770,11 @@ pub fn controlListener(ctx: *ControlCtx) void {
     var addr = SockaddrUn{};
     const p = std.mem.span(ctx.path);
     @memcpy(addr.path[0..p.len], p);
-    addr.len = @intCast(2 + p.len + 1);
-    if (libc.bind(fd, &addr, addr.len) < 0 or libc.listen(fd, 4) < 0) {
+    // `path` is at offset 2 on both OSes; the address length is that + the path + NUL.
+    // Only BSD/macOS has the leading sun_len byte to populate.
+    const addr_len: u32 = @intCast(@offsetOf(SockaddrUn, "path") + p.len + 1);
+    if (@hasField(SockaddrUn, "len")) addr.len = @intCast(addr_len);
+    if (libc.bind(fd, &addr, addr_len) < 0 or libc.listen(fd, 4) < 0) {
         std.debug.print("[control] bind/listen failed on {s}\n", .{ctx.path});
         return;
     }
@@ -790,12 +793,12 @@ pub fn controlListener(ctx: *ControlCtx) void {
     while (true) {
         const c = libc.accept(fd, null, null);
         if (c < 0) continue;
-        // Authoritative gate: only the owning uid may drive the control plane,
-        // even if the socket perms were somehow loosened (race, remount, umask).
-        var euid: u32 = 0;
-        var egid: u32 = 0;
-        if (libc.getpeereid(c, &euid, &egid) != 0 or euid != owner_uid) {
-            std.debug.print("[control] rejected connection from uid {d} (owner {d})\n", .{ euid, owner_uid });
+        // Authoritative gate: only the owning uid may drive the control plane, even if
+        // the socket perms were somehow loosened (race, remount, umask). Portable peer
+        // check: getpeereid on macOS, SO_PEERCRED on Linux.
+        const peer = hostutil.peerUid(c);
+        if (peer == null or peer.? != owner_uid) {
+            std.debug.print("[control] rejected connection from uid {?d} (owner {d})\n", .{ peer, owner_uid });
             _ = libc.close(c);
             continue;
         }
@@ -910,6 +913,17 @@ pub fn agentStdinPump(ctx: *AgentStdinCtx) void {
 
 // --- tests -----------------------------------------------------------------
 const testing = std.testing;
+
+test "peerUid returns the owner uid for a local socketpair" {
+    var fds: [2]c_int = undefined;
+    // Both ends of an AF_UNIX socketpair are this process, so the peer uid == ours.
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    const peer = hostutil.peerUid(fds[0]);
+    try testing.expect(peer != null);
+    try testing.expectEqual(libc.getuid(), peer.?);
+}
 
 test "output cap suppresses body past the limit but always forwards the trailer" {
     var fds: [2]c_int = undefined;

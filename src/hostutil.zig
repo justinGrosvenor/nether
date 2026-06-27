@@ -5,6 +5,7 @@
 //! orchestration.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const libc = struct {
     pub extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
@@ -22,21 +23,50 @@ pub const libc = struct {
     // Control-socket access control: tighten the bound socket to owner-only and
     // verify the connecting peer's uid (the socket grants full control of the VM).
     pub extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
-    pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
     pub extern "c" fn getuid() u32;
+    // Peer-credential check: getpeereid on macOS/BSD, SO_PEERCRED via getsockopt on
+    // Linux. Both are declared; only the host's path is reachable (comptime branch),
+    // so the other never links. See peerUid below.
+    pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
+    pub extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *u32) c_int;
+    pub extern "c" fn socketpair(domain: c_int, ty: c_int, proto: c_int, fds: *[2]c_int) c_int;
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
     // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
     pub extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 };
 pub extern "c" fn usleep(usec: c_uint) c_int;
 
-pub const AF_UNIX: c_int = 1;
-pub const SOCK_STREAM: c_int = 1;
-pub const SockaddrUn = extern struct {
-    len: u8 = 0,
-    family: u8 = AF_UNIX,
-    path: [104]u8 = [_]u8{0} ** 104,
-};
+pub const AF_UNIX: c_int = 1; // same on macOS and Linux
+pub const SOCK_STREAM: c_int = 1; // same on macOS and Linux
+
+// sockaddr_un differs by OS: BSD/macOS leads with a 1-byte sun_len then a u8 family;
+// Linux has a u16 sun_family and no length byte (and a 108-byte path). Selected at
+// comptime so the control socket binds correctly on both. `path` sits at the same
+// offset (2) on both, so callers compute the address length via @offsetOf.
+pub const SockaddrUn = if (builtin.os.tag == .macos)
+    extern struct { len: u8 = 0, family: u8 = AF_UNIX, path: [104]u8 = [_]u8{0} ** 104 }
+else
+    extern struct { family: u16 = AF_UNIX, path: [108]u8 = [_]u8{0} ** 108 };
+
+/// The connecting peer's effective uid on a Unix-domain socket, or null on error.
+/// getpeereid on macOS/BSD; SO_PEERCRED (struct ucred) on Linux. Used to gate the
+/// control socket to its owner regardless of host.
+pub fn peerUid(fd: c_int) ?u32 {
+    if (builtin.os.tag == .macos) {
+        var euid: u32 = 0;
+        var egid: u32 = 0;
+        if (libc.getpeereid(fd, &euid, &egid) != 0) return null;
+        return euid;
+    } else {
+        const Ucred = extern struct { pid: i32 = 0, uid: u32 = 0, gid: u32 = 0 };
+        const SOL_SOCKET: c_int = 1; // Linux
+        const SO_PEERCRED: c_int = 17; // Linux
+        var cred = Ucred{};
+        var len: u32 = @sizeOf(Ucred);
+        if (libc.getsockopt(fd, SOL_SOCKET, SO_PEERCRED, @ptrCast(&cred), &len) != 0) return null;
+        return cred.uid;
+    }
+}
 
 // macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
 const timeval = extern struct { sec: i64, usec: i32 };
