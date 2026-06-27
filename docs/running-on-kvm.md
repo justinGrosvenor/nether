@@ -57,7 +57,9 @@ make x86_64_defconfig
   -e SERIAL_8250 -e SERIAL_8250_CONSOLE \
   -e BLK_DEV_INITRD -e DEVTMPFS -e DEVTMPFS_MOUNT \
   -e ACPI -e KVM_GUEST -e PARAVIRT \
-  -e PCI -e PCI_MSI -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK
+  -e PCI -e PCI_MSI -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK \
+  -e VIRTIO_NET -e VIRTIO_CONSOLE \
+  -e VSOCKETS -e VIRTIO_VSOCKETS
 make olddefconfig
 make -j"$(nproc)"            # vmlinux (ELF, with the PVH note) lands in the build root
 cp vmlinux ../vmlinux && cd ..
@@ -80,6 +82,32 @@ SH
 chmod +x initrd/init
 ( cd initrd && find . | cpio -o -H newc | gzip ) > initramfs
 ```
+
+### initramfs (agent / platform)
+
+For the full platform path (control socket, agent REPL, metering, observe, govern,
+render - the same surfaces as HVF), use the build script instead of the bare shell
+above. It cross-compiles the agent, fetches busybox, and writes an `/init` that
+configures `eth0` to the slirp plan and starts the agent:
+
+```sh
+./tools/build-guest-x86.sh        # -> kernels/initramfs-x86.cpio.gz
+cp kernels/initramfs-x86.cpio.gz initramfs
+```
+
+This needs the kernel built with the platform stack (the `VIRTIO_NET`/`VIRTIO_CONSOLE`
+/`VSOCKETS`/`VIRTIO_VSOCKETS` options above). Then launch with a `nether.conf`:
+
+```
+control_socket=/tmp/nether.sock
+vsock=1
+net=1
+```
+
+and attach with `nc -U /tmp/nether.sock` (the same control protocol as HVF:
+`__info__`, `__stats__`, `__events__`, `__shutdown__`, command relay, `__put__`/
+`__get__`). NOTE: the KVM platform layer is compile-verified but not yet run on
+metal - this is the day-one verification path.
 
 ### Boot
 
