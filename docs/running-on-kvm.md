@@ -106,8 +106,10 @@ net=1
 
 and attach with `nc -U /tmp/nether.sock` (the same control protocol as HVF:
 `__info__`, `__stats__`, `__events__`, `__shutdown__`, command relay, `__put__`/
-`__get__`). NOTE: the KVM platform layer is compile-verified but not yet run on
-metal - this is the day-one verification path.
+`__get__`). **Verified on metal** (box session 1, 2026-06-27): PVH boot, idle
+shell, control plane over vsock, `__shutdown__`, and watchdogs all pass. virtio-net
+interface bring-up and SMP (`cpus>1`) still fail — see
+[Linux platform port](linux-platform-port.md).
 
 ### Boot
 
@@ -168,25 +170,21 @@ echo hello | dd of=/dev/vda bs=512 seek=1   # write path
   ```
   This is the spine for the swerver<->guest channel; the echo is a placeholder
   for the real listener.
-- **virtio-net**: `touch nether-net` before `zig build run` to present a
-  tap-backed NIC (PCI 0:3.0, MAC 52:54:00:12:34:56). The guest kernel needs the
-  virtio-net driver (`-e VIRTIO_NET` in the config recipe above). The host must
-  provide a configured `tap0` first:
-  ```sh
-  # host (run once, as root): create the tap and give it an address
-  ip tuntap add dev tap0 mode tap
-  ip addr add 10.0.0.1/24 dev tap0
-  ip link set tap0 up
-  # for outbound internet, also enable forwarding + NAT to your uplink:
-  sysctl -w net.ipv4.ip_forward=1
-  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-  ```
-  Then in the guest, bring the interface up and confirm the link:
-  ```sh
-  # guest shell:
-  ip addr add 10.0.0.2/24 dev eth0
-  ip link set eth0 up
-  ping -c1 10.0.0.1        # reaches the host tap
-  ```
-  Frames flow guest TX -> tap write, and a host reader thread feeds tap reads
-  into the guest RX. No offloads are negotiated, so frames are plain (MTU 1500).
+- **virtio-net**: enable with `net=1` in `nether.conf` or `touch nether-net`
+  before launch. Presents PCI 0:3.0 (MAC 52:54:00:12:34:56). The guest kernel
+  needs the virtio-net driver (`-e VIRTIO_NET` in the config recipe above).
+  - **Default (slirp):** in-VMM user-mode NAT with the egress firewall — same as
+    HVF. No host tap or root. Address plan 10.0.2.0/24 (guest .15, gateway .2,
+    DNS .3). Tunables: `net_open`, `net_allow`, `net_block`, `net_rate_kbps` in
+    `nether.conf`. **Known issue on KVM:** the NIC enumerates but the guest may not
+    get an `eth` interface yet (under investigation; vsock on the same MSI-X path
+    works).
+  - **Optional (tap):** `net_tap=1` or `touch nether-net-tap` for raw L2 on `tap0`
+    (no egress firewall). The host must pre-create and configure `tap0`:
+    ```sh
+    # host (run once, as root):
+    ip tuntap add dev tap0 mode tap
+    ip addr add 10.0.0.1/24 dev tap0
+    ip link set tap0 up
+    ```
+    Guest: `ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up`.

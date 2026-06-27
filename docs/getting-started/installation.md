@@ -49,13 +49,23 @@ zig version    # 0.16.0
 
 ## Run the smoke test
 
-```sh
-zig build run
-```
+`zig build test` always runs on the host (no KVM/HVF required).
 
-- **Linux + KVM**: runs under real hardware virtualization.
-- **macOS + HVF**: runs the aarch64 first-light guest (PL011 + PSCI).
-- **Other hosts**: cross-compiles only; `zig build run` will not execute a guest.
+To **execute** a guest, you need a runnable binary on hardware virt:
+
+| Host | Command |
+| --- | --- |
+| **Linux + KVM** | `zig build run` (default x86_64-linux artifact) |
+| **macOS + HVF** | `zig build -Dtarget=native` then codesign, then `./zig-out/bin/nether` |
+
+On macOS, `zig build run` with the default target cross-compiles a Linux binary; it does **not** run HVF locally. Use `-Dtarget=native` and codesign for the Apple Silicon path.
+
+Expected smoke output (no kernel in cwd):
+
+- **KVM**: `Nether lives. Phase 0: real-mode guest over COM1.`
+- **HVF**: `Nether lives. Phase 0: aarch64 guest over MMIO UART.`
+
+Both end with `[nether] guest shutdown.`
 
 ## Depend on nether as a library
 

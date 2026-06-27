@@ -13,11 +13,12 @@ against malformed guest input *and* against a hostile local control client.
 The **x86-64/KVM** path stays the reference backend: it PVH-boots Linux 6.12 to an
 interactive shell on bare metal, the userspace IOAPIC routes serial IRQ4 (no more
 16-byte FIFO stall), and virtio-blk reads/writes work end to end; its network path
-now runs through the same slirp + egress firewall. The remaining x86 work is
-porting the HVF-proven platform layer (control plane, metering, observe/govern,
-snapshot) onto KVM - tracked, and gated on standing up an x86 host. The bet is
-that what HVF proved about the device models, control protocol, and snapshot
-format transfers largely intact.
+now runs through the same slirp + egress firewall. The HVF-proven platform layer
+(control plane, metering, observe/govern) is **wired on KVM and run-verified on metal**
+(box session 1, 2026-06-27: steps 0–3 PASS). Remaining KVM gaps: virtio-net guest
+interface, SMP AP boot, snapshot/restore, and GPU. The bet is that what HVF proved
+about the device models and control protocol transfers largely intact; snapshot on KVM
+still needs `KVM_GET/SET_*` work.
 
 See [decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the
 irqchip/IOAPIC, D3 for the concurrency model, and D9 for the backend seam.
@@ -823,9 +824,8 @@ The build-out arc (offline-first chunks):
 
 The x86-64/KVM path stays the reference backend. It PVH-boots to a shell with
 virtio-blk, and its network path now runs through the same slirp + egress firewall
-(the firewall is on **both** backends). The substantive remaining x86 work is
-**porting the HVF-proven platform layer onto KVM** - the control plane, metering,
-observe/govern, and snapshot/restore (per-vCPU threads + INIT/SIPI; KVM's GET/SET
-ioctls + dirty-log) - gated on standing up an x86 host. The deliberate bet of the
-aarch64-first detour is that what HVF proved about the device models, the control
-protocol, and the snapshot format transfers to KVM largely intact.
+(the firewall is on **both** backends). The core platform layer is **ported and
+run-verified** on metal; remaining x86 work is virtio-net bring-up, SMP AP boot,
+snapshot/restore (per-vCPU threads + INIT/SIPI; KVM's GET/SET ioctls + dirty-log),
+and GPU. The deliberate bet of the aarch64-first detour is that what HVF proved
+about the device models and control protocol transfers to KVM largely intact.

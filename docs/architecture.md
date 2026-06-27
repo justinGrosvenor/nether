@@ -65,9 +65,10 @@ table + accessors); shared leaf types live in `common/hvtypes.zig`. The host OS 
 the guest arch, and the two are never mixed in one binary. See
 [decisions.md](decisions.md) D9.
 
-HVF/aarch64 is the *lead* backend (where the platform layer + SMP + snapshot were
-built and live-proven); KVM/x86 is the *reference* backend and trails on the platform
-layer - see [linux-platform-port.md](linux-platform-port.md).
+HVF/aarch64 is the *lead* backend (where the full platform layer + SMP + snapshot were
+built and live-proven). KVM/x86 is the *reference* backend: the platform layer is
+wired there too and run-verified for control/vsock/watchdogs; it still trails on
+virtio-net, SMP, snapshot, and GPU — see [linux-platform-port.md](linux-platform-port.md).
 
 ## Conventions (read before moving or adding a file)
 

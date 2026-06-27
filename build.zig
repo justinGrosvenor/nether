@@ -32,7 +32,11 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run the Nether VMM (requires Linux + /dev/kvm)");
+    const run_desc = if (target.result.os.tag == .macos)
+        "Run the Nether VMM (HVF; codesign with nether.entitlements first)"
+    else
+        "Run the Nether VMM (requires Linux + /dev/kvm)";
+    const run_step = b.step("run", run_desc);
     run_step.dependOn(&run_cmd.step);
 
     // Tests build for the host so `zig build test` runs locally. The pure-logic

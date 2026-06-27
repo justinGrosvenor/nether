@@ -255,7 +255,8 @@ Consequences and rules going forward:
   HVF is now the *lead* backend in practice: it started as a compiling scaffold
   (every op `Unimplemented`) and has since filled in completely over the aarch64 arc
   - it is where SMP, snapshot/fork, the full control plane, and every platform pillar
-  were built and live-proven. The x86/KVM side now trails and gets the platform layer
-  ported back onto it (gated on an x86 host). Both targets stay green every commit:
+  were built and live-proven. The x86/KVM side has the platform layer wired and
+  run-verified for control/vsock/watchdogs; it still trails on virtio-net, SMP,
+  snapshot, and GPU. Both targets stay green every commit:
   `zig build test` (native macOS, HVF path) and `zig build -Dtarget=x86_64-linux`
   (KVM path + binary).

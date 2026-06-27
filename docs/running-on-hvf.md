@@ -152,8 +152,8 @@ the datapaths by hand.
   host moves the bytes over vsock with length framing (binary never crosses the
   line-oriented socket):
   ```sh
-  printf '__put__ /host/task.tar /work/task.tar\n' | nc -U /tmp/sb.sock  # host -> guest
-  printf '__get__ /work/out.bin /host/out.bin\n'   | nc -U /tmp/sb.sock  # guest -> host
+  printf '__put__ /host/task.tar /work/task.tar\n' | nc -U /tmp/nether.sock  # host -> guest
+  printf '__get__ /work/out.bin /host/out.bin\n'   | nc -U /tmp/nether.sock  # guest -> host
   ```
   Each replies `OK <n> bytes -> <path>` or `ERR ...`. Proven byte-identical for
   1 B..8 MiB binary files (16 MiB cap). The guest agent handles `__PUT__`/`__GET__`
@@ -164,7 +164,7 @@ the datapaths by hand.
   With `max_runtime_s` (a watchdog auto-stop) the platform has both ends of sandbox
   lifecycle.
   ```sh
-  printf '__shutdown__\n' | nc -U /tmp/sb.sock   # -> OK shutting down; VM exits
+  printf '__shutdown__\n' | nc -U /tmp/nether.sock   # -> OK shutting down; VM exits
   ```
 - **Render** (over the control socket): `__screen__` returns a snapshot of the
   sandbox's terminal - the agent's command output rendered through a server-side VT
@@ -172,14 +172,14 @@ the datapaths by hand.
   display the agent's visible work without the guest cooperating. Size it with
   `screen_rows` / `screen_cols` in nether.conf (default 24x80).
   ```sh
-  printf '__screen__\n' | nc -U /tmp/sb.sock     # -> the rendered terminal text
+  printf '__screen__\n' | nc -U /tmp/nether.sock     # -> the rendered terminal text
   ```
   To *follow* the screen cheaply, `__screendiff__` returns only the live rows that
   changed since the last call (the first call, or a fresh client, gets the whole
   screen): `SCREEN <rows>x<cols>` then `<row-index> <text>` lines (empty text =
   cleared row), terminated by a blank line. Poll it on one connection to stream.
   ```sh
-  printf '__screendiff__\n' | nc -U /tmp/sb.sock # -> changed rows since last diff
+  printf '__screendiff__\n' | nc -U /tmp/nether.sock # -> changed rows since last diff
   ```
 - **Framebuffer** (virtio-gpu, opt-in `gpu=1`, PCI `0:5.0`): a minimal virtio-gpu 2D
   device a stock guest `virtio_gpu` DRM driver binds (gives `/dev/fb0` +
@@ -190,7 +190,7 @@ the datapaths by hand.
   # in the guest (control/agent): bring up the framebuffer, draw, then on the host:
   modprobe virtio_gpu                              # -> /dev/fb0
   tr '\000' '\377' </dev/zero >/dev/fb0            # fill white
-  printf '__frame__\n' | nc -U /tmp/sb.sock > frame.ppm   # capture (host side)
+  printf '__frame__\n' | nc -U /tmp/nether.sock > frame.ppm   # capture (host side)
   ```
   `__framediff__` streams only the 64x64 tiles that changed since the last call
   (full frame on the first call / after a client reconnects), for cheap visual
@@ -241,7 +241,7 @@ the datapaths by hand.
     tried to reach (last 256), one line per new TCP connection / UDP flow, with the
     firewall verdict - so you can audit what an autonomous agent connected to.
     ```sh
-    printf '__netlog__\n' | nc -U /tmp/sb.sock
+    printf '__netlog__\n' | nc -U /tmp/nether.sock
     # NETLOG 5
     # 1782317399243 TCP 1.1.1.1:443 ALLOW
     # 1782317406241 UDP 8.8.8.8:53 ALLOW          (a DNS lookup, forwarded upstream)
@@ -253,7 +253,7 @@ the datapaths by hand.
     platform ran in the sandbox and their exit codes - "what did this agent run, and
     did it succeed?" Pairs with `__netlog__` for a full record of agent activity.
     ```sh
-    printf '__cmdlog__\n' | nc -U /tmp/sb.sock
+    printf '__cmdlog__\n' | nc -U /tmp/nether.sock
     # CMDLOG 3
     # 1782318926235 exit=0 echo hello
     # 1782318928239 exit=1 ls /no/such/path
@@ -265,14 +265,14 @@ the datapaths by hand.
     cursor - `__events__` for the retained ring, `__events__ <seq>` for only events
     after that sequence number. This is what a platform tails to follow a sandbox.
     ```sh
-    printf '__events__\n' | nc -U /tmp/sb.sock
+    printf '__events__\n' | nc -U /tmp/nether.sock
     # EVENTS 5
     # 1 .. LIFE boot
     # 2 .. LIFE agent connected
     # 3 .. CMD exit=0 echo hi
     # 4 .. NET TCP 1.1.1.1:443 ALLOW
     # 5 .. NET TCP 169.254.169.254:80 BLOCK
-    printf '__events__ 5\n' | nc -U /tmp/sb.sock   # -> only events after seq 5
+    printf '__events__ 5\n' | nc -U /tmp/nether.sock   # -> only events after seq 5
     ```
     Format: `EVENTS <current-seq>` then `<seq> <ms> <CMD|NET|LIFE> <text>` oldest-first;
     pass the header's `<current-seq>` back as the cursor to poll incrementally.
@@ -306,5 +306,5 @@ the datapaths by hand.
   the guest core on Apple Silicon.
 - `zig build run` is not wired for codesigning; run the signed binary directly.
   Cross-compiling the Linux artifact with `zig build` is unaffected and unsigned.
-- Still to come (see [roadmap.md](roadmap.md)): virtio on aarch64 (reuse the
-  device datapath; MSI via the GIC, whose region is already configured).
+- Snapshot save/restore and COW fork are HVF-only today; KVM parity is tracked in
+  [linux-platform-port.md](linux-platform-port.md).

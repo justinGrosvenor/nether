@@ -6,10 +6,14 @@ Honest scope notes for the current tree. These are intentional cuts and sequenci
 
 | Track | Maturity |
 | --- | --- |
-| **HVF / aarch64** | Platform layer live: Linux boot, virtio, snapshot-fork, control plane, govern, observe, meter |
-| **KVM / x86-64** | PVH Linux boot, virtio-blk, IOAPIC; platform layer port in progress |
+| **HVF / aarch64** | Platform layer live: Linux boot, virtio (blk/net/vsock/gpu), snapshot-fork, control plane, govern, observe, meter, SMP |
+| **KVM / x86-64** | PVH Linux boot, virtio-blk, IOAPIC; platform layer wired and **run-verified on metal** for control plane, vsock, metering, watchdogs, and slirp (compile path). Remaining gaps: virtio-net guest interface, SMP AP boot, snapshot/restore, GPU |
 
-See [Linux platform port](../linux-platform-port.md) for the KVM parity checklist.
+See [Linux platform port](../linux-platform-port.md) for the KVM parity checklist and box-session results.
+
+## Snapshot / restore
+
+Snapshot save, rewind demo, and COW restore (`nether-restore` / `restore_from=`) are **HVF-only** today. KVM snapshot work is planned (`KVM_GET/SET_*` vCPU state + dirty pages) but not implemented.
 
 ## Not a general-purpose VMM (yet)
 
