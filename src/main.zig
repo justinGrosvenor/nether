@@ -69,6 +69,7 @@ const macSnapshotter = snapshot.macSnapshotter;
 const macRestore = snapshot.macRestore;
 
 const GUEST_RAM_SIZE = 256 * nether.memmap.mib; // room for a kernel + initramfs
+const KVM_MAX_CPUS: u32 = 8; // SMP ceiling on the KVM/x86 path (sizes the vCPU array)
 const CODE_LOAD_ADDR = 0x1000;
 
 const message = "Nether lives. Phase 0: real-mode guest over COM1.\n";
@@ -180,10 +181,15 @@ fn linuxMain() !void {
         std.debug.print("[nether] virtio-blk: disk.img {d} bytes, BAR 0x{x}\n", .{ disk.len, blk_dev.barBase() });
     }
 
+    // vCPU count (SMP) from nether.conf. x86 APs are brought up by the guest's
+    // INIT/SIPI, delivered by KVM's in-kernel LAPIC, so each AP just needs to exist
+    // and be running KVM_RUN; the MADT (built in pvh.boot) advertises them.
+    const num_cpus: u32 = @intCast(std.math.clamp(confGetInt("cpus", 1), 1, KVM_MAX_CPUS));
+
     // Core platform state (observe/meter/run): the journal, usage meter, and agent,
     // cross-wired in place - the same shared bundle the HVF path uses.
     var core = control.Core{};
-    core.init(GUEST_RAM_SIZE / (1024 * 1024), 1, @intCast(confGetInt("max_output_bytes", 0)));
+    core.init(GUEST_RAM_SIZE / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", 0)));
 
     // Per-sandbox modes from nether.conf (markers kept as a fallback). A configured
     // control_socket enables control mode without a marker.
@@ -285,8 +291,13 @@ fn linuxMain() !void {
         }
     }
 
-    var vcpu = try vm.createVcpu(0);
-    defer vcpu.deinit();
+    // One vCPU per core. cpu0 is the BSP (booted below); the APs (id > 0) are created
+    // up front so KVM's LAPIC can deliver the guest's INIT/SIPI to them, and each
+    // runs KVM_RUN on its own thread (blocked until SIPI).
+    var vcpus: [KVM_MAX_CPUS]nether.Vcpu = undefined;
+    for (0..num_cpus) |i| vcpus[i] = try vm.createVcpu(@intCast(i));
+    defer for (vcpus[0..num_cpus]) |*v| v.deinit();
+    const vcpu = &vcpus[0]; // the BSP
 
     // Boot a PVH kernel if `vmlinux` is present; otherwise run the demo blob.
     const kernel: ?[]u8 = readFile(allocator, "vmlinux") catch null;
@@ -294,7 +305,7 @@ fn linuxMain() !void {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
         defer if (initramfs) |fs| allocator.free(fs);
-        nether.pvh.boot(&vm, &vcpu, layout, k, "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr no_timer_check", initramfs) catch |err| {
+        nether.pvh.boot(&vm, vcpu, layout, k, "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr no_timer_check", initramfs, num_cpus) catch |err| {
             std.debug.print("[nether] PVH boot failed: {s}\n", .{@errorName(err)});
             return err;
         };
@@ -368,7 +379,7 @@ fn linuxMain() !void {
     // The platform layer on the KVM path: the control socket + lifecycle watchdogs,
     // the same shared helpers as the HVF path, with the KVM force-exit injected as the
     // Stop. (No virtio-gpu on the KVM path yet, so .gpu = null / gpu = false.)
-    var kvm_stop = KvmStop{ .power = &power, .vcpu = &vcpu };
+    var kvm_stop = KvmStop{ .power = &power, .vcpu = vcpu };
     var ctl_ctx: control.ControlCtx = undefined; // stable storage for the listener/relay threads
     if (control_on) {
         control.startControl(&ctl_ctx, .{
@@ -381,7 +392,7 @@ fn linuxMain() !void {
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
-                .cpus = 1,
+                .cpus = num_cpus,
                 .ram_mb = GUEST_RAM_SIZE / (1024 * 1024),
                 .net = net_running,
                 .firewall = net_slirp and !confBool("net_open"),
@@ -401,6 +412,22 @@ fn linuxMain() !void {
     };
     watchdogs.arm();
 
+    // Secondary cores: each AP runs KVM_RUN on its own detached thread, blocked until
+    // the guest INIT/SIPIs it (delivered by KVM's in-kernel LAPIC). cpu0 (the BSP)
+    // runs below; when it returns, the process exits and reaps the AP threads (clean
+    // AP teardown on shutdown is a known rough edge, as on the HVF path).
+    if (num_cpus > 1) {
+        var ap: u32 = 1;
+        while (ap < num_cpus) : (ap += 1) {
+            if (std.Thread.spawn(.{}, kvmApRun, .{ &vcpus[ap], &bus, &power, &ioapic })) |t| {
+                t.detach();
+            } else |err| {
+                std.debug.print("[nether] AP {d} thread failed: {s}\n", .{ ap, @errorName(err) });
+            }
+        }
+        std.debug.print("[nether] SMP: {d} vCPUs (BSP + {d} APs)\n", .{ num_cpus, num_cpus - 1 });
+    }
+
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
         std.debug.print("[nether] vcpu stopped: {s}\n", .{@errorName(err)});
         if (nether.trace.on()) dumpConsole(&console);
@@ -408,6 +435,12 @@ fn linuxMain() !void {
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
     if (nether.trace.on()) dumpConsole(&console);
+}
+
+/// A secondary (AP) vCPU run loop on the KVM path: just enter KVM_RUN; the guest's
+/// INIT/SIPI (via KVM's LAPIC) starts it. Errors/halts end this thread only.
+fn kvmApRun(vcpu: *nether.Vcpu, bus: *nether.Bus, power: *nether.Power, apic: *nether.IoApic) void {
+    _ = vcpu.run(bus, power, apic) catch {};
 }
 
 /// Web console input sink: deliver browser keystrokes to the serial RX (the same

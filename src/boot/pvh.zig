@@ -107,6 +107,7 @@ pub fn boot(
     kernel: []const u8,
     cmdline: []const u8,
     initramfs: ?[]const u8,
+    num_cpus: u32,
 ) !void {
     const Ctx = struct {
         vm: *vmm.Vm,
@@ -128,7 +129,7 @@ pub fn boot(
 
     // ACPI tables at acpi_addr; RSDP handed to the kernel via start_info.
     var acpi_buf: [1024]u8 = undefined;
-    const tables = acpi.build(&acpi_buf, acpi_addr, 1);
+    const tables = acpi.build(&acpi_buf, acpi_addr, num_cpus); // MADT advertises N LAPICs
     try vm.guestWrite(acpi_addr, acpi_buf[0..tables.len]);
 
     // initramfs placed page-aligned near the top of low RAM, above the kernel.
