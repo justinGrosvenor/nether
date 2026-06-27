@@ -252,6 +252,7 @@ const CMD_TEXT_MAX = 120;
 const CmdEvent = struct {
     ms: i64 = 0,
     exit: i32 = -1,
+    cpu_ms: i64 = 0, // process CPU consumed while this command ran (delta over its lifetime)
     text: [CMD_TEXT_MAX]u8 = undefined,
     text_len: usize = 0,
 };
@@ -297,6 +298,7 @@ pub const AgentCtx = struct {
     pend_text: [CMD_TEXT_MAX]u8 = undefined,
     pend_len: usize = 0, // 0 = no command awaiting an exit code
     pend_ms: i64 = 0,
+    pend_cpu_ms: i64 = 0, // process CPU at command start, for the per-command delta
     audit_in_exit: bool = false, // mid-scan of the trailer's exit digits
     audit_exit: [16]u8 = undefined,
     audit_exit_len: usize = 0,
@@ -313,6 +315,7 @@ pub const AgentCtx = struct {
         @memcpy(a.pend_text[0..n], line[0..n]);
         a.pend_len = n;
         a.pend_ms = nowMs();
+        a.pend_cpu_ms = @intCast(hostutil.processCpuMs());
     }
 
     /// Scan agent reply bytes for the 0x1e<exit>\n trailer; on completion, commit the
@@ -380,7 +383,11 @@ pub const AgentCtx = struct {
             a.cmd_lock.unlock();
             return;
         }
-        var e = CmdEvent{ .ms = a.pend_ms, .exit = exit, .text_len = a.pend_len };
+        // CPU consumed since the command was forwarded. Process-wide (the guest's vCPU
+        // threads dominate while a request/response command runs and the host is idle),
+        // so it's a close attribution for compute-bound commands; clamped at 0.
+        const cpu_delta = @max(0, @as(i64, @intCast(hostutil.processCpuMs())) - a.pend_cpu_ms);
+        var e = CmdEvent{ .ms = a.pend_ms, .exit = exit, .cpu_ms = cpu_delta, .text_len = a.pend_len };
         @memcpy(e.text[0..a.pend_len], a.pend_text[0..a.pend_len]);
         a.cmd_log[a.cmd_head] = e;
         a.cmd_head = (a.cmd_head + 1) % CMD_LOG_CAP;
@@ -389,8 +396,8 @@ pub const AgentCtx = struct {
         a.cmd_lock.unlock();
 
         if (a.journal) |j| {
-            var b: [CMD_TEXT_MAX + 24]u8 = undefined;
-            const s = std.fmt.bufPrint(&b, "exit={d} {s}", .{ exit, e.text[0..e.text_len] }) catch return;
+            var b: [CMD_TEXT_MAX + 40]u8 = undefined;
+            const s = std.fmt.bufPrint(&b, "exit={d} cpu_ms={d} {s}", .{ exit, cpu_delta, e.text[0..e.text_len] }) catch return;
             j.emit(.cmd, s);
         }
     }
@@ -406,7 +413,7 @@ pub const AgentCtx = struct {
         var i: usize = 0;
         while (i < retained) : (i += 1) {
             const e = a.cmd_log[(start + i) % CMD_LOG_CAP];
-            const line = std.fmt.bufPrint(out[n..], "{d} exit={d} {s}\n", .{ e.ms, e.exit, e.text[0..e.text_len] }) catch break;
+            const line = std.fmt.bufPrint(out[n..], "{d} exit={d} cpu_ms={d} {s}\n", .{ e.ms, e.exit, e.cpu_ms, e.text[0..e.text_len] }) catch break;
             n += line.len;
         }
         return n;
@@ -1156,9 +1163,13 @@ test "command audit log records commands with exit codes oldest-first" {
     var buf: [4096]u8 = undefined;
     const out = buf[0..a.cmdLog(&buf)];
     try testing.expect(std.mem.startsWith(u8, out, "CMDLOG 3\n"));
-    try testing.expect(std.mem.indexOf(u8, out, "exit=0 echo hi\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "exit=1 false\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "exit=2 grep x f\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cpu_ms=") != null); // per-command CPU attribution
+    try testing.expect(std.mem.indexOf(u8, out, "exit=0 cpu_ms=") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " echo hi\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit=1 cpu_ms=") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " false\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit=2 cpu_ms=") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " grep x f\n") != null);
     // oldest-first ordering
     try testing.expect(std.mem.indexOf(u8, out, "echo hi").? < std.mem.indexOf(u8, out, "false").?);
 }
@@ -1170,7 +1181,8 @@ test "command audit log handles a trailer split across reads" {
     a.auditRecv("2\n"); // continues: exit code is "12"
     var buf: [256]u8 = undefined;
     const out = buf[0..a.cmdLog(&buf)];
-    try testing.expect(std.mem.indexOf(u8, out, "exit=12 cmd\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit=12 cpu_ms=") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " cmd\n") != null);
 }
 
 test "command audit log ring wraps and keeps the lifetime total" {
