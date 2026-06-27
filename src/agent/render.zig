@@ -9,8 +9,8 @@
 //! terminal output reaches the grid.
 
 const std = @import("std");
-const Screen = @import("vt/Screen.zig");
-const Lock = @import("common/lock.zig").Lock;
+const Screen = @import("../vt/Screen.zig");
+const Lock = @import("../common/lock.zig").Lock;
 
 pub const Render = struct {
     screen: Screen,

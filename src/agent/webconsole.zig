@@ -19,10 +19,10 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const Screen = @import("vt/Screen.zig");
+const Screen = @import("../vt/Screen.zig");
 const Color = Screen.Color;
 const Style = Screen.Style;
-const Lock = @import("common/lock.zig").Lock;
+const Lock = @import("../common/lock.zig").Lock;
 
 // --- HTML rendering (pure) -------------------------------------------------
 

@@ -11,8 +11,8 @@
 //! path, so this module needs no dependency on main.zig.
 
 const std = @import("std");
-const nether = @import("root.zig");
-const hostutil = @import("common/hostutil.zig");
+const nether = @import("../root.zig");
+const hostutil = @import("../common/hostutil.zig");
 const armdev = @import("armdev.zig");
 
 const libc = hostutil.libc;
@@ -60,7 +60,7 @@ fn countDiff(a: []const u8, b: []const u8) u64 {
 /// Force all vCPUs out of the guest and wait until each has parked at the snapshot
 /// rendezvous (self-captured or self-restored its own context).
 fn quiesce(sn: anytype, handles: []const u64, n: u32, phase: u8) void {
-    const hvf = @import("hvf.zig");
+    const hvf = @import("../hvf.zig");
     sn.parked.store(0, .release);
     sn.phase.store(phase, .release);
     while (sn.parked.load(.acquire) < n) {
@@ -108,7 +108,7 @@ fn readGuestInsn(ram: []const u8, ttbr1: u64, va: u64) ?u32 {
 const WFI_INSN: u32 = 0xd503_207f;
 // Comptime index of TTBR1_EL1 within the snapshot sys-reg order.
 const TTBR1_SNAP_IDX = blk: {
-    for (@import("hvf.zig").SNAPSHOT_SYS_REGS, 0..) |r, i| if (r == 0xc101) break :blk i;
+    for (@import("../hvf.zig").SNAPSHOT_SYS_REGS, 0..) |r, i| if (r == 0xc101) break :blk i;
     @compileError("TTBR1_EL1 missing from SNAPSHOT_SYS_REGS");
 };
 
@@ -120,7 +120,7 @@ const TTBR1_SNAP_IDX = blk: {
 /// all-idle capture. A busy guest that never converges within `max_attempts`
 /// falls through with the last (best-effort) capture. Returns true if all-idle.
 fn quiesceSafe(sn: anytype, ram: []const u8, handles: []const u64, n: u32, max_attempts: u32) bool {
-    const hvfb = @import("hvf_backend.zig");
+    const hvfb = @import("../hvf_backend.zig");
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         quiesce(sn, handles, n, @intFromEnum(hvfb.SnapPhase.quiesce));
@@ -150,8 +150,8 @@ fn quiesceSafe(sn: anytype, ram: []const u8, handles: []const u64, n: u32, max_a
 /// snapshot. That the 4-core Linux guest stays healthy afterwards is the proof the
 /// captured state is complete and consistent.
 pub fn macSnapshotter(ctx: *SnapCtx) void {
-    const hvf = @import("hvf.zig");
-    const hvfb = @import("hvf_backend.zig");
+    const hvf = @import("../hvf.zig");
+    const hvfb = @import("../hvf_backend.zig");
     const sn: *hvfb.SnapCtl = @ptrCast(@alignCast(ctx.snap));
     const n = ctx.num_cpus;
 
@@ -308,7 +308,7 @@ const RestoreCtx = struct {
 };
 
 fn macRestoreCpu(ctx: *RestoreCtx) void {
-    const hvfb = @import("hvf_backend.zig");
+    const hvfb = @import("../hvf_backend.zig");
     var vcpu = ctx.vm.createVcpu(ctx.id) catch {
         _ = ctx.ready.fetchAdd(1, .release);
         return;
@@ -326,8 +326,8 @@ fn macRestoreCpu(ctx: *RestoreCtx) void {
 /// reinstall the framework GIC state and the virtio device state, and resume.
 /// No kernel/DTB load - the snapshot *is* the booted guest.
 pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
-    const hvf = @import("hvf.zig");
-    const hvfb = @import("hvf_backend.zig");
+    const hvf = @import("../hvf.zig");
+    const hvfb = @import("../hvf_backend.zig");
 
     const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
     if (fd < 0) {

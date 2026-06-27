@@ -40,11 +40,11 @@ pub const vt = struct {
 
 /// The render pillar: a server-side terminal model of the agent's session, fed by
 /// its output and snapshot via the `__screen__` control command.
-pub const Render = @import("render.zig").Render;
-pub const audit = @import("audit.zig");
+pub const Render = @import("agent/render.zig").Render;
+pub const audit = @import("agent/audit.zig");
 pub const Journal = audit.Journal;
 
-pub const webconsole = @import("webconsole.zig");
+pub const webconsole = @import("agent/webconsole.zig");
 pub const WebConsole = webconsole.Server;
 
 pub const trace = @import("common/trace.zig");
@@ -88,17 +88,17 @@ test {
     _ = @import("vt/parse_table.zig");
     _ = @import("vt/osc.zig");
     _ = @import("vt/Screen.zig");
-    _ = @import("render.zig");
-    _ = @import("webconsole.zig");
+    _ = @import("agent/render.zig");
+    _ = @import("agent/webconsole.zig");
     _ = @import("virtio/virtio_vsock.zig");
     _ = @import("virtio/virtio_net.zig");
     _ = @import("virtio/virtio_console.zig");
     _ = @import("virtio/virtio_gpu.zig");
     _ = @import("smp.zig");
     _ = @import("slirp.zig");
-    _ = @import("control.zig");
-    _ = @import("audit.zig");
-    _ = @import("snapshot.zig"); // snapshot file-format validation (mac path)
+    _ = @import("agent/control.zig");
+    _ = @import("agent/audit.zig");
+    _ = @import("agent/snapshot.zig"); // snapshot file-format validation (mac path)
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
     _ = @import("fuzz.zig");
 }

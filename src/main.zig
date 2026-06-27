@@ -32,7 +32,7 @@ const macMarkerPresent = conf.markerPresent;
 
 // Control plane (control socket, agent plumbing, metering, lifecycle) lives in
 // control.zig.
-const control = @import("control.zig");
+const control = @import("agent/control.zig");
 const Metering = control.Metering;
 const AgentCtx = control.AgentCtx;
 const ControlCtx = control.ControlCtx;
@@ -44,7 +44,7 @@ const agentStdinPump = control.agentStdinPump;
 const stopSandbox = control.stopSandbox;
 
 // Shared aarch64 device wiring (boot + restore) lives in armdev.zig.
-const armdev = @import("armdev.zig");
+const armdev = @import("agent/armdev.zig");
 const ARM_RAM_BASE = armdev.ARM_RAM_BASE;
 const ARM_UART_BASE = armdev.ARM_UART_BASE;
 const ARM_RAM_SIZE = armdev.ARM_RAM_SIZE;
@@ -65,7 +65,7 @@ const armEnableRawMode = armdev.armEnableRawMode;
 const armRestoreTermios = armdev.armRestoreTermios;
 
 // Snapshot/restore host orchestration lives in snapshot.zig.
-const snapshot = @import("snapshot.zig");
+const snapshot = @import("agent/snapshot.zig");
 const SnapCtx = snapshot.SnapCtx;
 const macSnapshotter = snapshot.macSnapshotter;
 const macRestore = snapshot.macRestore;
