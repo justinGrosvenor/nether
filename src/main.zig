@@ -436,6 +436,7 @@ fn linuxMain() !void {
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+    if (control_on) core.finalUsage(@tagName(reason)); // the teardown bill (any stop reason)
     if (nether.trace.on()) dumpConsole(&console);
 }
 
@@ -1095,6 +1096,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         return err;
     };
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
+    if (control_on) core.finalUsage(@tagName(reason)); // the teardown bill (any stop reason)
 }
 
 /// The HVF backend's guest stop, adapted to `platform.Stop`: the PSCI-poweroff path

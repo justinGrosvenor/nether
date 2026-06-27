@@ -75,6 +75,29 @@ pub const Metering = struct {
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
+
+    /// One-line, machine-readable usage summary for the teardown "bill" - the same
+    /// numbers as `__stats__` (compute, memory, I/O, network) but compact and emitted
+    /// unconditionally at session end, so the platform always captures a final
+    /// accounting even if the client never polled `__stats__`.
+    pub fn summary(self: *Metering, buf: []u8) []const u8 {
+        const net_tx = if (self.net) |s| s.tx_bytes.load(.monotonic) else 0;
+        const net_rx = if (self.net) |s| s.rx_bytes.load(.monotonic) else 0;
+        const net_blocked = if (self.net) |s| s.blocked_count.load(.monotonic) else 0;
+        return std.fmt.bufPrint(buf, "uptime_ms={d} cpu_ms={d} mem_peak_mb={d} ram_mb={d} cpus={d} commands={d} bytes_in={d} bytes_out={d} net_tx={d} net_rx={d} net_blocked={d}", .{
+            nowMs() - self.start_ms,
+            hostutil.processCpuMs(),
+            hostutil.processMaxRssMb(),
+            self.ram_mb,
+            self.cpus,
+            self.commands.load(.acquire),
+            self.bytes_in.load(.acquire),
+            self.bytes_out.load(.acquire),
+            net_tx,
+            net_rx,
+            net_blocked,
+        }) catch buf[0..0];
+    }
 };
 
 /// Static, per-sandbox capabilities and limits, set once at launch from the
@@ -153,6 +176,20 @@ pub const Core = struct {
         self.agent.meter = &self.meter; // agent output is activity for the idle watchdog
         self.agent.max_output = max_output; // govern: per-command output cap
         self.journal.emit(.life, "boot");
+    }
+
+    /// Emit the final usage record at sandbox teardown: print it (the platform that
+    /// spawned nether reads its stdout/stderr) and mirror it into the journal as a LIFE
+    /// event. Called once when the run loop returns - for ANY reason (guest shutdown,
+    /// runtime/cpu/idle budget, __shutdown__) - so every session ends with a guaranteed,
+    /// machine-readable bill, closing the meter -> settlement loop.
+    pub fn finalUsage(self: *Core, reason: []const u8) void {
+        var buf: [256]u8 = undefined;
+        const line = self.meter.summary(&buf);
+        std.debug.print("[nether] final usage (reason={s}): {s}\n", .{ reason, line });
+        var jbuf: [320]u8 = undefined;
+        const ev = std.fmt.bufPrint(&jbuf, "session ended (reason={s}): {s}", .{ reason, line }) catch return;
+        self.journal.emit(.life, ev);
     }
 };
 
@@ -1026,9 +1063,27 @@ test "sandbox info report renders capabilities and limits with the exit frame" {
     try testing.expect(std.mem.indexOf(u8, out, "firewall=on\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "gpu=off\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "max_runtime_s=60\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "max_cpu_s=0\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "idle_timeout_s=8\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "net_rate_kbps=0\n") != null);
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) != null); // exit frame
+}
+
+test "metering summary is a one-line bill carrying compute, memory, and I/O" {
+    var m = Metering{ .start_ms = nowMs(), .ram_mb = 512, .cpus = 2 };
+    m.commands.store(3, .release);
+    m.bytes_in.store(27, .release);
+    m.bytes_out.store(287, .release);
+    var buf: [256]u8 = undefined;
+    const line = m.summary(&buf);
+    // Compact (single line) and carries the metered dimensions.
+    try testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    try testing.expect(std.mem.indexOf(u8, line, "cpu_ms=") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "mem_peak_mb=") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "ram_mb=512") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "commands=3") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "bytes_out=287") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "net_tx=0") != null); // net=null -> zeros
 }
 
 test "transfer jail containment check rejects escapes and sibling-prefixes" {
