@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Screen = @import("vt/Screen.zig");
-const Lock = @import("lock.zig").Lock;
+const Lock = @import("common/lock.zig").Lock;
 
 pub const Render = struct {
     screen: Screen,

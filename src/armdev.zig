@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const nether = @import("root.zig");
-const libc = @import("hostutil.zig").libc;
+const libc = @import("common/hostutil.zig").libc;
 
 // Standard arm64 "virt" memory map: RAM at 1 GiB, PL011 UART at 0x0900_0000.
 pub const ARM_RAM_BASE: u64 = 0x4000_0000;

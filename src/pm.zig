@@ -5,7 +5,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const io = @import("io.zig");
-const pwr = @import("power.zig");
+const pwr = @import("common/power.zig");
 
 pub const Pm = struct {
     power: *pwr.Power,

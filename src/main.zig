@@ -10,7 +10,7 @@ const nether = @import("root.zig");
 
 // Host-OS primitives live in hostutil.zig; alias the ones the boot path still uses
 // so the orchestration bodies below read unchanged.
-const hostutil = @import("hostutil.zig");
+const hostutil = @import("common/hostutil.zig");
 const libc = hostutil.libc;
 const usleep = hostutil.usleep;
 const nowMs = hostutil.nowMs;
@@ -23,7 +23,7 @@ const AF_UNIX = hostutil.AF_UNIX;
 const SOCK_STREAM = hostutil.SOCK_STREAM;
 
 // Per-sandbox config (nether.conf) lives in conf.zig.
-const conf = @import("conf.zig");
+const conf = @import("common/conf.zig");
 const confGet = conf.confGet;
 const confGetInt = conf.confGetInt;
 const confBool = conf.confBool;

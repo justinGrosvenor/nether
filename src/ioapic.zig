@@ -9,8 +9,8 @@ const std = @import("std");
 const io = @import("io.zig");
 const memmap = @import("memmap.zig");
 const irqchip = @import("irqchip.zig");
-const trace = @import("trace.zig");
-const Lock = @import("lock.zig").Lock;
+const trace = @import("common/trace.zig");
+const Lock = @import("common/lock.zig").Lock;
 
 pub const num_gsi = 24;
 

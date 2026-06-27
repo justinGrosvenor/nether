@@ -6,8 +6,8 @@
 
 const std = @import("std");
 const nether = @import("root.zig");
-const hostutil = @import("hostutil.zig");
-const Lock = @import("lock.zig").Lock;
+const hostutil = @import("common/hostutil.zig");
+const Lock = @import("common/lock.zig").Lock;
 
 const libc = hostutil.libc;
 const usleep = hostutil.usleep;

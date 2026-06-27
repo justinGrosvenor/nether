@@ -3,7 +3,7 @@
 //! path pokes 0xCF9 despite the no-legacy stance, so it is irreducible.
 
 const io = @import("io.zig");
-const pwr = @import("power.zig");
+const pwr = @import("common/power.zig");
 
 pub const Reset = struct {
     power: *pwr.Power,

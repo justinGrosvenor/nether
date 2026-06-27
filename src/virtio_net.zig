@@ -22,8 +22,8 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
-const Lock = @import("lock.zig").Lock;
-const trace = @import("trace.zig");
+const Lock = @import("common/lock.zig").Lock;
+const trace = @import("common/trace.zig");
 
 pub const VIRTIO_ID_NET = 1;
 pub const RXQ: u16 = 0; // host -> guest (device-initiated)

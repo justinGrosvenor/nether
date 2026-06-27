@@ -4,7 +4,7 @@
 //! dropped (logged, not fatal), so firmware probing does not kill the vCPU.
 
 const std = @import("std");
-const Lock = @import("lock.zig").Lock;
+const Lock = @import("common/lock.zig").Lock;
 
 pub const max_pio = 16;
 pub const max_mmio = 16;

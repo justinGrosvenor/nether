@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const io = @import("io.zig");
-const Lock = @import("lock.zig").Lock;
+const Lock = @import("common/lock.zig").Lock;
 
 pub const Pl011 = struct {
     // Host -> guest receive ring (MPSC: a host thread pushes, the vCPU drains).

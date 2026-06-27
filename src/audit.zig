@@ -9,8 +9,8 @@
 //! `emit` from its own thread, so the ring is guarded by a leaf lock.
 
 const std = @import("std");
-const Lock = @import("lock.zig").Lock;
-const nowMs = @import("hostutil.zig").nowMs;
+const Lock = @import("common/lock.zig").Lock;
+const nowMs = @import("common/hostutil.zig").nowMs;
 
 const CAP = 512; // retained events (older ones age out of the ring)
 const TEXT_MAX = 160;

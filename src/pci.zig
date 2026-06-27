@@ -9,7 +9,7 @@
 const std = @import("std");
 const io = @import("io.zig");
 const memmap = @import("memmap.zig");
-const trace = @import("trace.zig");
+const trace = @import("common/trace.zig");
 
 pub const max_functions = 16;
 

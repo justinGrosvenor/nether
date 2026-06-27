@@ -28,7 +28,7 @@ pub const pci = @import("pci.zig");
 pub const PciHost = pci.Host;
 pub const IoApic = @import("ioapic.zig").IoApic;
 
-pub const Lock = @import("lock.zig").Lock;
+pub const Lock = @import("common/lock.zig").Lock;
 
 /// Vendored VT parser (from ghostty, ported to 0.16). The state-machine heart
 /// of a future server-side console / VT-aware golden tests. See src/vt/PORTING.md.
@@ -47,7 +47,7 @@ pub const Journal = audit.Journal;
 pub const webconsole = @import("webconsole.zig");
 pub const WebConsole = webconsole.Server;
 
-pub const trace = @import("trace.zig");
+pub const trace = @import("common/trace.zig");
 pub const virtq = @import("virtq.zig");
 pub const virtio = @import("virtio.zig");
 pub const virtio_mmio = @import("virtio_mmio.zig");
@@ -66,7 +66,7 @@ pub const vsock = @import("virtio_vsock.zig");
 pub const Vsock = vsock.Vsock;
 pub const VsockDev = vsock.VsockDev;
 
-const power = @import("power.zig");
+const power = @import("common/power.zig");
 pub const Power = power.Power;
 pub const PowerAction = power.Action;
 
@@ -79,7 +79,7 @@ pub const FwCfg = @import("fw_cfg.zig").FwCfg;
 
 test {
     @import("std").testing.refAllDecls(@This());
-    _ = @import("hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
+    _ = @import("common/hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
     _ = @import("pl011.zig"); // aarch64 PL011 UART
     _ = @import("dtb.zig"); // aarch64 device-tree generator
     _ = @import("virtio_mmio.zig"); // virtio-mmio transport

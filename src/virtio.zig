@@ -9,8 +9,8 @@ const std = @import("std");
 const virtq = @import("virtq.zig");
 const io = @import("io.zig");
 const pci = @import("pci.zig");
-const trace = @import("trace.zig");
-const Lock = @import("lock.zig").Lock;
+const trace = @import("common/trace.zig");
+const Lock = @import("common/lock.zig").Lock;
 
 pub const max_queues = 8;
 pub const num_vectors = 4; // MSI-X table entries

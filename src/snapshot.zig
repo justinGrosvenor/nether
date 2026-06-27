@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const nether = @import("root.zig");
-const hostutil = @import("hostutil.zig");
+const hostutil = @import("common/hostutil.zig");
 const armdev = @import("armdev.zig");
 
 const libc = hostutil.libc;

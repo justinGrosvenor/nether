@@ -14,10 +14,10 @@
 
 const std = @import("std");
 const io = @import("io.zig");
-const pwr = @import("power.zig");
+const pwr = @import("common/power.zig");
 const hvf = @import("hvf.zig");
 const arm = @import("memmap_arm.zig");
-const hvtypes = @import("hvtypes.zig");
+const hvtypes = @import("common/hvtypes.zig");
 const smp = @import("smp.zig");
 
 const StopReason = hvtypes.StopReason;

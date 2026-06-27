@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
-const hvtypes = @import("hvtypes.zig");
+const hvtypes = @import("common/hvtypes.zig");
 
 const impl = backend.impl;
 const max_regions = 8;

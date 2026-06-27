@@ -17,8 +17,8 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
-const Lock = @import("lock.zig").Lock;
-const trace = @import("trace.zig");
+const Lock = @import("common/lock.zig").Lock;
+const trace = @import("common/trace.zig");
 
 pub const VIRTIO_ID_GPU = 16;
 pub const CONTROLQ: u16 = 0; // guest -> host commands
