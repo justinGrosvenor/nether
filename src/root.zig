@@ -48,21 +48,21 @@ pub const webconsole = @import("webconsole.zig");
 pub const WebConsole = webconsole.Server;
 
 pub const trace = @import("common/trace.zig");
-pub const virtq = @import("virtq.zig");
-pub const virtio = @import("virtio.zig");
-pub const virtio_mmio = @import("virtio_mmio.zig");
+pub const virtq = @import("virtio/virtq.zig");
+pub const virtio = @import("virtio/virtio.zig");
+pub const virtio_mmio = @import("virtio/virtio_mmio.zig");
 pub const VirtioMmio = virtio_mmio.Mmio;
-pub const VirtioRng = @import("virtio_rng.zig").Rng;
-pub const VirtioBlk = @import("virtio_blk.zig").Blk;
-pub const net = @import("virtio_net.zig");
+pub const VirtioRng = @import("virtio/virtio_rng.zig").Rng;
+pub const VirtioBlk = @import("virtio/virtio_blk.zig").Blk;
+pub const net = @import("virtio/virtio_net.zig");
 pub const VirtioNet = net.Net;
-pub const console = @import("virtio_console.zig");
+pub const console = @import("virtio/virtio_console.zig");
 pub const VirtioConsole = console.Console;
-pub const VirtioGpu = @import("virtio_gpu.zig").Gpu;
+pub const VirtioGpu = @import("virtio/virtio_gpu.zig").Gpu;
 pub const smp = @import("smp.zig");
 pub const slirp = @import("slirp.zig");
 pub const Slirp = slirp.Slirp;
-pub const vsock = @import("virtio_vsock.zig");
+pub const vsock = @import("virtio/virtio_vsock.zig");
 pub const Vsock = vsock.Vsock;
 pub const VsockDev = vsock.VsockDev;
 
@@ -82,7 +82,7 @@ test {
     _ = @import("common/hvtypes.zig"); // backend-agnostic helpers (moved from vm.zig)
     _ = @import("pl011.zig"); // aarch64 PL011 UART
     _ = @import("dtb.zig"); // aarch64 device-tree generator
-    _ = @import("virtio_mmio.zig"); // virtio-mmio transport
+    _ = @import("virtio/virtio_mmio.zig"); // virtio-mmio transport
     // Pull in the vendored VT files so their tests run too.
     _ = @import("vt/Parser.zig");
     _ = @import("vt/parse_table.zig");
@@ -90,10 +90,10 @@ test {
     _ = @import("vt/Screen.zig");
     _ = @import("render.zig");
     _ = @import("webconsole.zig");
-    _ = @import("virtio_vsock.zig");
-    _ = @import("virtio_net.zig");
-    _ = @import("virtio_console.zig");
-    _ = @import("virtio_gpu.zig");
+    _ = @import("virtio/virtio_vsock.zig");
+    _ = @import("virtio/virtio_net.zig");
+    _ = @import("virtio/virtio_console.zig");
+    _ = @import("virtio/virtio_gpu.zig");
     _ = @import("smp.zig");
     _ = @import("slirp.zig");
     _ = @import("control.zig");

@@ -23,8 +23,8 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
-const Lock = @import("common/lock.zig").Lock;
-const trace = @import("common/trace.zig");
+const Lock = @import("../common/lock.zig").Lock;
+const trace = @import("../common/trace.zig");
 
 pub const HOST_CID: u64 = 2;
 pub const HDR_LEN = 44;

@@ -13,10 +13,10 @@
 const std = @import("std");
 const Parser = @import("vt/Parser.zig");
 const Screen = @import("vt/Screen.zig");
-const virtq = @import("virtq.zig");
-const virtio = @import("virtio.zig");
-const vsock = @import("virtio_vsock.zig");
-const net = @import("virtio_net.zig");
+const virtq = @import("virtio/virtq.zig");
+const virtio = @import("virtio/virtio.zig");
+const vsock = @import("virtio/virtio_vsock.zig");
+const net = @import("virtio/virtio_net.zig");
 
 // --- VT parser -------------------------------------------------------------
 

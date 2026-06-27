@@ -9,7 +9,7 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
-const trace = @import("common/trace.zig");
+const trace = @import("../common/trace.zig");
 
 pub const Blk = struct {
     disk: []u8,
