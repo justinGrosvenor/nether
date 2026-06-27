@@ -434,7 +434,11 @@ pub const ControlCtx = struct {
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     info: SandboxInfo = .{}, // static capabilities/limits, for __info__
+    // The primary control client (fd) - the one connection that drives the sandbox
+    // and receives the agent relay stream. Additional connections are read-only
+    // observers (host-intercepted queries only); -1 = no primary.
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // File-transfer jail, pinned once at listener start (not per call) so the jail
     // can't move if the process cwd ever changes. Empty until set => fail closed.
     xfer_root_buf: [1024]u8 = undefined,
@@ -594,7 +598,7 @@ fn reply(c: c_int, msg: []const u8) void {
 /// Send one command line to the guest agent (waiting for it to connect), counting
 /// it for metering. `__stats__` and `__shutdown__` are intercepted here and
 /// answered by the host without touching the guest.
-fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
+fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool) void {
     ctx.meter.touch(); // any client command counts as activity (resets the idle timer)
     if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
         var rep: [512]u8 = undefined;
@@ -669,6 +673,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     // (the first call emits the whole screen). Lets the platform follow the screen
     // cheaply by polling.
     if (std.mem.eql(u8, line, "__screendiff__\n") or std.mem.eql(u8, line, "__screendiff__")) {
+        if (!is_primary) return reply(c, "ERR __screendiff__ is primary-only (per-client diff state)\n");
         if (ctx.agent.render) |rd| {
             var buf: [64 * 1024]u8 = undefined;
             const n = rd.diff(&buf);
@@ -696,6 +701,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     // on the first call / after a client reconnects). Same binary-on-the-socket
     // model as __frame__.
     if (std.mem.eql(u8, line, "__framediff__\n") or std.mem.eql(u8, line, "__framediff__")) {
+        if (!is_primary) return reply(c, "ERR __framediff__ is primary-only (per-client diff state)\n");
         if (ctx.gpu) |g| {
             const sz = g.shadowSize();
             if (sz == 0) {
@@ -707,6 +713,13 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
                 _ = ctx.meter.bytes_out.fetchAdd(n, .release);
             } else |_| reply(c, "ERR out of memory\n");
         } else reply(c, "ERR gpu not enabled\n");
+        return;
+    }
+    // Everything below this point drives or tears down the sandbox (shutdown, file
+    // transfer, and relaying a command to the agent). Only the primary client may do
+    // so; observers are read-only and limited to the host-intercepted queries above.
+    if (!is_primary) {
+        reply(c, "ERR read-only observer; only the primary control client may drive the sandbox\n");
         return;
     }
     // Lifecycle: on-demand clean teardown (the platform stops a sandbox without
@@ -741,6 +754,11 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     _ = ctx.meter.commands.fetchAdd(1, .release);
     _ = ctx.meter.bytes_in.fetchAdd(line.len, .release);
 }
+
+/// Concurrent control connections allowed: the platform's primary driver plus a
+/// handful of read-only observers. The socket is owner-uid-gated, so this only
+/// bounds an accidental fan-out, not an attacker.
+const MAX_CLIENTS: u32 = 8;
 
 pub fn controlListener(ctx: *ControlCtx) void {
     const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
@@ -781,53 +799,80 @@ pub fn controlListener(ctx: *ControlCtx) void {
             _ = libc.close(c);
             continue;
         }
-        ctx.client.store(c, .release);
-        if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh client gets a full screen first
+        // Bound concurrent connections (the platform's driver + a few observers). The
+        // socket is owner-uid-gated, so this just caps an accidental fan-out.
+        if (ctx.active_clients.fetchAdd(1, .acq_rel) >= MAX_CLIENTS) {
+            _ = ctx.active_clients.fetchSub(1, .release);
+            reply(c, "ERR too many control clients\n");
+            _ = libc.close(c);
+            continue;
+        }
+        // One thread per connection: an observer can poll while the primary's command
+        // output streams (they can't share a socket without interleaving bytes).
+        if (std.Thread.spawn(.{}, clientThread, .{ ctx, c })) |t| {
+            t.detach();
+        } else |_| {
+            _ = ctx.active_clients.fetchSub(1, .release);
+            _ = libc.close(c);
+        }
+    }
+}
+
+/// Serve one control connection. The first connection to claim the primary slot
+/// drives the sandbox and receives the agent relay stream; the rest are read-only
+/// observers limited to the host-intercepted queries - so the platform can follow
+/// events/stats/the screen on a side connection while a long command streams on the
+/// primary (a single socket can't carry both without interleaving). Detached thread.
+fn clientThread(ctx: *ControlCtx, c: c_int) void {
+    defer _ = libc.close(c);
+    defer _ = ctx.active_clients.fetchSub(1, .release);
+    // Claim the primary slot if it is free; otherwise serve as an observer.
+    const is_primary = ctx.client.cmpxchgStrong(-1, c, .acq_rel, .acquire) == null;
+    defer if (is_primary) ctx.client.store(-1, .release);
+    if (is_primary) {
+        if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh primary gets a full screen first
         if (ctx.gpu) |g| g.resetFrameDiff(); // ...and a full framebuffer first
-        // Line-buffer the client stream so `__stats__` can be intercepted and each
-        // command metered; everything else is forwarded verbatim to the agent.
-        var buf: [4096]u8 = undefined;
-        var len: usize = 0;
-        var skipping = false; // discarding the tail of an overlong line until its '\n'
-        while (true) {
-            const r = libc.read(c, buf[len..].ptr, buf.len - len);
-            if (r <= 0) break;
-            len += @intCast(r);
-            // Resync after an overlong line: drop everything up to and including the
-            // next newline, then resume normal parsing on whatever follows.
-            if (skipping) {
-                if (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |nl| {
-                    std.mem.copyForwards(u8, buf[0 .. len - (nl + 1)], buf[nl + 1 .. len]);
-                    len -= nl + 1;
-                    skipping = false;
-                } else {
-                    len = 0; // still no newline; keep discarding
-                    continue;
-                }
-            }
-            var start: usize = 0;
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                if (buf[i] == '\n') {
-                    controlCommand(ctx, c, buf[start .. i + 1]);
-                    start = i + 1;
-                }
-            }
-            if (start > 0) {
-                std.mem.copyForwards(u8, buf[0 .. len - start], buf[start..len]);
-                len -= start;
-            }
-            // A full buffer with no newline is an overlong command: reject it
-            // explicitly (rather than silently dropping) and skip its remainder so
-            // the tail is never misparsed as a fresh command.
-            if (len == buf.len) {
-                reply(c, "ERR line too long (max 4096 bytes)\n");
-                len = 0;
-                skipping = true;
+    }
+    // Line-buffer the client stream so `__stats__` etc. are intercepted per line.
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    var skipping = false; // discarding the tail of an overlong line until its '\n'
+    while (true) {
+        const r = libc.read(c, buf[len..].ptr, buf.len - len);
+        if (r <= 0) break;
+        len += @intCast(r);
+        // Resync after an overlong line: drop everything up to and including the next
+        // newline, then resume normal parsing on whatever follows.
+        if (skipping) {
+            if (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |nl| {
+                std.mem.copyForwards(u8, buf[0 .. len - (nl + 1)], buf[nl + 1 .. len]);
+                len -= nl + 1;
+                skipping = false;
+            } else {
+                len = 0; // still no newline; keep discarding
+                continue;
             }
         }
-        ctx.client.store(-1, .release);
-        _ = libc.close(c);
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            if (buf[i] == '\n') {
+                controlCommand(ctx, c, buf[start .. i + 1], is_primary);
+                start = i + 1;
+            }
+        }
+        if (start > 0) {
+            std.mem.copyForwards(u8, buf[0 .. len - start], buf[start..len]);
+            len -= start;
+        }
+        // A full buffer with no newline is an overlong command: reject it explicitly
+        // (rather than silently dropping) and skip its remainder so the tail is never
+        // misparsed as a fresh command.
+        if (len == buf.len) {
+            reply(c, "ERR line too long (max 4096 bytes)\n");
+            len = 0;
+            skipping = true;
+        }
     }
 }
 

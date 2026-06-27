@@ -465,6 +465,23 @@ The build-out arc (offline-first chunks):
      `echo`, an `1.1.1.1:80`+`:443` fetch, an `exit=7`, a `169.254.169.254:80 BLOCK`,
      all in one ordered timeline, and `__events__ <seq>` then returns only the next
      command - true incremental following.
+   - **Concurrent observer clients (DONE).** The control socket served one client at a
+     time, and even on a single connection a controller couldn't poll `__events__`/
+     `__stats__` while a command streamed (the intercepted reply and the relayed output
+     would interleave on the same socket) - defeating the journal's whole async-follow
+     purpose. The listener is now thread-per-connection: the first connection claims the
+     **primary** slot (CAS on `client`) - it drives the agent and receives the relay
+     stream; the rest are **read-only observers** limited to the host-intercepted
+     queries, so the platform follows events/stats/info/screen on a side connection
+     while a long command runs on the primary. Driving commands (a relayed command,
+     `__put__`/`__get__`, `__shutdown__`) and the per-client stateful diffs
+     (`__screendiff__`/`__framediff__`) are primary-only; the stateless snapshots
+     (`__screen__`/`__frame__`) and the cursor-based `__events__` work for observers
+     (that cursor is the right follow primitive - client-supplied, no shared state).
+     Connections are capped (`MAX_CLIENTS`) and uid-gated as before. Proven live: while
+     a primary ran a 6 s `sleep`, an observer concurrently got `__info__`/`__stats__`
+     and was refused `echo ...` ("read-only observer") and `__screendiff__`
+     ("primary-only"); the primary command path is unchanged.
    - **Bandwidth cap (DONE) - govern.** `net_rate_kbps` token-bucket-limits the
      download (internet->guest) rate, so an untrusted sandbox can't saturate the
      host uplink or run up unbounded bandwidth cost (the metered dimension). When the
