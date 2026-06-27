@@ -472,6 +472,18 @@ The build-out arc (offline-first chunks):
      slows the sender (lossless, no drops); burst ~250 ms smooths it. Unit-tested
      (refill/cap math, kbps->bytes) and proven live: a 4 MB fetch is ~2 s uncapped,
      ~9 s at 4000 kbps (500 KB/s), ~17 s at 2000 kbps - proportional and matching.
+   - **Output cap (DONE) - govern (control-plane volume axis).** Bandwidth bounds
+     network volume; this bounds control-plane volume: `max_output_bytes` caps how
+     much of a single command's output is relayed to the controller before the rest
+     is dropped, so a runaway or malicious command (`yes`, `cat /dev/urandom`) can't
+     flood the client or run up unbounded billed `bytes_out`. The cap is per-command
+     and the 0x1e<exit> trailer is always forwarded (the client still gets the exit
+     code), so framing survives; `relayCapped` mirrors the audit parser's trailer
+     detection and writes forward-spans (no large buffer, any chunk size). Reported by
+     `__info__`; 0 = unlimited. Unit-tested (body capped, notice once, trailer
+     preserved, counter resets per command) and proven live: with `max_output_bytes=
+     2000`, `seq 1 100000` (~580 KB raw) is bounded to 2022 bytes with `[output
+     capped]` and an intact `exit 0` frame, while `echo hello` is untouched.
    - **File push/pull over the agent channel (DONE) - the run pillar.** Getting a
      task payload into the sandbox and artifacts back out, host-mediated so binary
      never crosses the line-oriented control socket: the operator sends text commands

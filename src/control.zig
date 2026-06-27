@@ -86,6 +86,7 @@ pub const SandboxInfo = struct {
     max_runtime_s: u64 = 0, // hard wall-clock cap (0 = unlimited)
     idle_timeout_s: u64 = 0, // idle reclamation (0 = disabled)
     rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
+    max_output_bytes: u64 = 0, // per-command output cap (0 = unlimited)
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -103,6 +104,7 @@ pub const SandboxInfo = struct {
             \\max_runtime_s={d}
             \\idle_timeout_s={d}
             \\net_rate_kbps={d}
+            \\max_output_bytes={d}
             \\{c}0
             \\
         , .{
@@ -116,6 +118,7 @@ pub const SandboxInfo = struct {
             self.max_runtime_s,
             self.idle_timeout_s,
             self.rate_kbps,
+            self.max_output_bytes,
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
@@ -221,6 +224,15 @@ pub const AgentCtx = struct {
     journal: ?*nether.Journal = null,
     /// Usage meter, so agent output counts as activity for the idle watchdog.
     meter: ?*Metering = null,
+    /// Per-command output cap (govern): bytes of a single command's output relayed
+    /// to the control client before the rest is suppressed. The 0x1e<exit>\n trailer
+    /// still flows (the client always gets the exit code). 0 = unlimited. Bounds a
+    /// runaway or malicious command's output flood (and the billed bytes_out). The
+    /// three fields below track the current command's relay state.
+    max_output: usize = 0,
+    cmd_out_bytes: usize = 0, // body bytes relayed for the current command
+    cmd_truncated: bool = false, // emitted the "[output capped]" notice this command
+    relay_in_trailer: bool = false, // mid-relay of the trailer (0x1e..\n, always forwarded)
 
     // Command audit log. cmd_lock is a leaf lock guarding the ring + the pending slot;
     // controlCommand (control thread) sets `pending`, the vsock callback records on the
@@ -270,6 +282,45 @@ pub const AgentCtx = struct {
                 a.audit_in_exit = true;
             }
         }
+    }
+
+    /// Relay agent reply bytes to the control client (pipe_w) with a per-command
+    /// output cap. Body bytes past `max_output` are dropped (with a one-time notice),
+    /// but the trailer (0x1e<exit>\n) is always forwarded so the client still gets the
+    /// exit code, and the counter resets on each trailer. Written in forward-spans so
+    /// there is no large buffer and it handles any chunk size. Mirrors auditRecv's
+    /// 0x1e trailer detection. Only called when max_output > 0.
+    fn relayCapped(a: *AgentCtx, bytes: []const u8) void {
+        var span: usize = 0; // start of the current run of bytes to forward
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            const b = bytes[i];
+            var forward = true;
+            if (a.relay_in_trailer) {
+                // inside the trailer: always forward
+            } else if (b == 0x1e) {
+                a.relay_in_trailer = true; // forward the 0x1e too
+            } else if (a.cmd_out_bytes >= a.max_output) {
+                forward = false; // body past the cap
+            } else {
+                a.cmd_out_bytes += 1;
+            }
+            if (forward) {
+                if (a.relay_in_trailer and b == '\n') { // trailer complete -> next command
+                    a.relay_in_trailer = false;
+                    a.cmd_out_bytes = 0;
+                    a.cmd_truncated = false;
+                }
+            } else {
+                if (i > span) _ = writeAll(a.pipe_w, bytes[span..i]); // flush forwarded run
+                if (!a.cmd_truncated) {
+                    a.cmd_truncated = true;
+                    _ = writeAll(a.pipe_w, "\n...[output capped]\n");
+                }
+                span = i + 1; // skip the suppressed byte
+            }
+        }
+        if (bytes.len > span) _ = writeAll(a.pipe_w, bytes[span..bytes.len]);
     }
 
     fn commitPending(a: *AgentCtx, exit: i32) void {
@@ -355,7 +406,9 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             if (a.render) |rd| rd.feed(r.bytes); // tee command output into the render screen
             a.auditRecv(r.bytes); // observe exit codes for the command audit log
             if (a.pipe_w >= 0) {
-                _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
+                if (a.max_output == 0) {
+                    _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
+                } else a.relayCapped(r.bytes); // govern: bound a runaway command's output
             } else a.onRecv(r.bytes);
         },
         .shutdown, .reset => a.conn_id.store(-1, .release),
@@ -812,6 +865,36 @@ pub fn agentStdinPump(ctx: *AgentStdinCtx) void {
 
 // --- tests -----------------------------------------------------------------
 const testing = std.testing;
+
+test "output cap suppresses body past the limit but always forwards the trailer" {
+    var fds: [2]c_int = undefined;
+    try testing.expect(libc.pipe(&fds) == 0);
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    var a = AgentCtx{ .pipe_w = fds[1], .max_output = 5 };
+    a.relayCapped("AAAAAAAAAAAAAAAAAAAA\x1e0\n"); // 20 body bytes + trailer (exit 0)
+
+    var buf: [256]u8 = undefined;
+    const n = libc.read(fds[0], &buf, buf.len);
+    try testing.expect(n > 0);
+    const out = buf[0..@intCast(n)];
+    try testing.expect(std.mem.startsWith(u8, out, "AAAAA")); // first 5 forwarded
+    try testing.expect(std.mem.indexOf(u8, out, "[output capped]") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "\x1e0\n")); // exit frame intact
+    var as: usize = 0;
+    for (out) |c| {
+        if (c == 'A') as += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), as); // body capped at exactly 5
+
+    // A second command resets the cap (counter cleared on the trailer).
+    a.relayCapped("BBB\x1e1\n");
+    const n2 = libc.read(fds[0], &buf, buf.len);
+    const out2 = buf[0..@intCast(n2)];
+    try testing.expect(std.mem.indexOf(u8, out2, "BBB") != null); // under cap -> all forwarded
+    try testing.expect(std.mem.indexOf(u8, out2, "capped") == null);
+    try testing.expect(std.mem.endsWith(u8, out2, "\x1e1\n"));
+}
 
 test "sandbox info report renders capabilities and limits with the exit frame" {
     const info = SandboxInfo{

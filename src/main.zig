@@ -793,6 +793,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var journal = nether.Journal{};
     agent_ctx.journal = &journal;
     agent_ctx.meter = &meter; // agent output counts as activity for the idle watchdog
+    agent_ctx.max_output = @intCast(confGetInt("max_output_bytes", 0)); // govern: per-command output cap
     journal.emit(.life, "boot");
     // Control socket path from nether.conf (per-sandbox), else the default. A
     // configured path also enables control mode (no marker needed).
@@ -931,6 +932,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .max_runtime_s = confGetInt("max_runtime_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
+                .max_output_bytes = confGetInt("max_output_bytes", 0),
             } };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
