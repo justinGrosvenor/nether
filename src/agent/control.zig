@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const nether = @import("../root.zig");
+const platform = @import("platform.zig");
 const hostutil = @import("../common/hostutil.zig");
 const Lock = @import("../common/lock.zig").Lock;
 
@@ -128,19 +129,6 @@ fn onOff(b: bool) []const u8 {
     return if (b) "on" else "off";
 }
 
-/// Clean sandbox stop: request a PSCI-style poweroff, then force the vCPUs out of
-/// `hv_vcpu_run` (re-fired for any between runs or parked in WFI) so the run loop
-/// observes the action and returns `.shutdown` - cpu0's return unwinds macBootLinux
-/// and the process exits. Shared by the runtime watchdog and __shutdown__.
-pub fn stopSandbox(power: *nether.Power, handles: []const u64, num_cpus: u32) void {
-    const hvf = @import("../hv/hvf.zig");
-    power.request(.shutdown);
-    var tries: u32 = 0;
-    while (tries < 50) : (tries += 1) {
-        _ = hvf.hv_vcpus_exit(handles.ptr, num_cpus);
-        _ = usleep(20_000);
-    }
-}
 
 /// A diverted capture of the agent's reply, used by the host-mediated file
 /// transfer (`__put__`/`__get__`). While `AgentCtx.capture` points at one of these,
@@ -428,9 +416,7 @@ pub const ControlCtx = struct {
     path: [*:0]const u8,
     pipe_r: i32,
     allocator: std.mem.Allocator,
-    power: *nether.Power, // for the __shutdown__ lifecycle command
-    handles: []const u64, // vCPU handles to force out on shutdown
-    num_cpus: u32,
+    stop: platform.Stop, // backend-agnostic guest stop, for the __shutdown__ command
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     info: SandboxInfo = .{}, // static capabilities/limits, for __info__
@@ -729,7 +715,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         if (ctx.journal) |j| j.emit(.life, "shutdown requested");
         reply(c, "OK shutting down\n");
         std.debug.print("\n[nether] __shutdown__ requested; stopping sandbox\n", .{});
-        stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
+        ctx.stop.call();
         return;
     }
     var id = ctx.agent.conn_id.load(.acquire);

@@ -42,7 +42,6 @@ const agentEvent = control.agentEvent;
 const controlListener = control.controlListener;
 const controlRelay = control.controlRelay;
 const agentStdinPump = control.agentStdinPump;
-const stopSandbox = control.stopSandbox;
 
 // Shared aarch64 device wiring (boot + restore) lives in armdev.zig.
 const armdev = @import("agent/armdev.zig");
@@ -916,6 +915,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     try vcpu.setAarch64Entry(ARM_RAM_BASE, ARM_RAM_BASE + ARM_DTB_OFF); // PC=kernel, X0=DTB
 
+    // The HVF guest stop, injected into both the control plane (__shutdown__) and the
+    // watchdogs so neither is backend-specific. Lives in the boot frame; the detached
+    // threads hold &hvf_stop for the VM's lifetime.
+    var hvf_stop = HvfStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
+
     // Control plane: in nether-control mode a Unix-domain socket drives the agent
     // (the platform attaches without owning this process's stdio). A pipe carries
     // the agent's replies from the recv handler to the relay thread.
@@ -924,7 +928,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal, .info = .{
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call }, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal, .info = .{
                 .cpus = num_cpus,
                 .ram_mb = ram_size / (1024 * 1024),
                 .net = net_on,
@@ -978,7 +982,6 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // sandbox with no control-plane activity). Shared module; the HVF stop
     // (hv_vcpus_exit via stopSandbox) is injected so the same code serves the KVM
     // path. 0 = unlimited / disabled.
-    var hvf_stop = HvfStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs = platform.Watchdogs{
         .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
         .activity = &meter.last_activity_ms,
@@ -1009,6 +1012,20 @@ const HvfStop = struct {
         stopSandbox(self.power, self.handles, self.num_cpus);
     }
 };
+
+/// Clean sandbox stop on HVF: request a PSCI-style poweroff, then force the vCPUs out
+/// of `hv_vcpu_run` (re-fired for any between runs or parked in WFI) so the run loop
+/// returns `.shutdown` and the process exits. The HVF half of `HvfStop`; the KVM path
+/// will signal its vCPU thread so `KVM_RUN` returns EINTR instead.
+fn stopSandbox(power: *nether.Power, handles: []const u64, num_cpus: u32) void {
+    const hvf = @import("hv/hvf.zig");
+    power.request(.shutdown);
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        _ = hvf.hv_vcpus_exit(handles.ptr, num_cpus);
+        _ = usleep(20_000);
+    }
+}
 
 /// Per-secondary-core thread context. The vCPU is created inside the thread (HVF
 /// binds a vCPU to its creating thread), so only the id and the shared VM/bus/
