@@ -741,6 +741,46 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
     _ = ctx.meter.bytes_in.fetchAdd(line.len, .release);
 }
 
+/// Inputs to wire one sandbox's control socket, supplied by the boot path.
+pub const ControlOpts = struct {
+    vsdev: *nether.VsockDev,
+    agent: *AgentCtx,
+    meter: *Metering,
+    journal: *nether.Journal,
+    gpu: ?*nether.VirtioGpu = null,
+    stop: platform.Stop, // backend-agnostic guest stop for __shutdown__
+    info: SandboxInfo,
+    path: [*:0]const u8,
+    allocator: std.mem.Allocator,
+};
+
+/// Open the control socket and start the listener + relay threads. `ctl` is filled
+/// in place and held by the detached threads, so it must be stable storage in the
+/// caller's frame (the boot frame). The agent's reply pipe is created here and wired
+/// into both the agent (pipe_w) and the relay (pipe_r). Shared by both boot paths.
+pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
+    var pipe: [2]c_int = undefined;
+    if (libc.pipe(&pipe) != 0) {
+        std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
+        return;
+    }
+    o.agent.pipe_w = pipe[1];
+    ctl.* = .{
+        .vsdev = o.vsdev,
+        .agent = o.agent,
+        .meter = o.meter,
+        .path = o.path,
+        .pipe_r = pipe[0],
+        .allocator = o.allocator,
+        .stop = o.stop,
+        .gpu = o.gpu,
+        .journal = o.journal,
+        .info = o.info,
+    };
+    if (std.Thread.spawn(.{}, controlListener, .{ctl})) |t| t.detach() else |_| {}
+    if (std.Thread.spawn(.{}, controlRelay, .{ctl})) |t| t.detach() else |_| {}
+}
+
 /// Concurrent control connections allowed: the platform's primary driver plus a
 /// handful of read-only observers. The socket is owner-uid-gated, so this only
 /// bounds an accidental fan-out, not an attacker.

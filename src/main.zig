@@ -39,8 +39,6 @@ const AgentCtx = control.AgentCtx;
 const ControlCtx = control.ControlCtx;
 const AgentStdinCtx = control.AgentStdinCtx;
 const agentEvent = control.agentEvent;
-const controlListener = control.controlListener;
-const controlRelay = control.controlRelay;
 const agentStdinPump = control.agentStdinPump;
 
 // Shared aarch64 device wiring (boot + restore) lives in armdev.zig.
@@ -921,14 +919,20 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var hvf_stop = HvfStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
 
     // Control plane: in nether-control mode a Unix-domain socket drives the agent
-    // (the platform attaches without owning this process's stdio). A pipe carries
-    // the agent's replies from the recv handler to the relay thread.
-    var ctl_pipe: [2]c_int = undefined;
-    var ctl_ctx: ControlCtx = undefined;
+    // (the platform attaches without owning this process's stdio). Shared setup -
+    // the same call the KVM path will make once its platform layer lands.
+    var ctl_ctx: ControlCtx = undefined; // stable storage for the listener/relay threads
     if (control_on) {
-        if (libc.pipe(&ctl_pipe) == 0) {
-            agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call }, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal, .info = .{
+        control.startControl(&ctl_ctx, .{
+            .vsdev = &vsdev,
+            .agent = &agent_ctx,
+            .meter = &meter,
+            .journal = &journal,
+            .gpu = if (gpu_on) &gpu_be else null,
+            .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
+            .path = ctl_path,
+            .allocator = allocator,
+            .info = .{
                 .cpus = num_cpus,
                 .ram_mb = ram_size / (1024 * 1024),
                 .net = net_on,
@@ -938,10 +942,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", 0),
-            } };
-            if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
-            if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
-        } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
+            },
+        });
     }
 
     // Host stdin: in agent-REPL mode it drives the guest agent (stdin -> sandbox
