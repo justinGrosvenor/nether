@@ -13,12 +13,12 @@
 //! and the (x86-only) PVH loader keep compiling on macOS; they never run here.
 
 const std = @import("std");
-const io = @import("io.zig");
-const pwr = @import("common/power.zig");
-const hvf = @import("hvf.zig");
-const arm = @import("memmap_arm.zig");
-const hvtypes = @import("common/hvtypes.zig");
-const smp = @import("smp.zig");
+const io = @import("../chipset/io.zig");
+const pwr = @import("../common/power.zig");
+const hvf = @import("../hv/hvf.zig");
+const arm = @import("../mem/memmap_arm.zig");
+const hvtypes = @import("../common/hvtypes.zig");
+const smp = @import("../hv/smp.zig");
 
 const StopReason = hvtypes.StopReason;
 const Error = hvtypes.Error;

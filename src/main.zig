@@ -640,8 +640,8 @@ fn macMain() !void {
 /// Boot an arm64 Linux kernel: place the Image, DTB, and initramfs in guest RAM,
 /// create the GIC, and enter the kernel with X0 = DTB (the arm64 boot protocol).
 fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]const u8) !void {
-    const hvf = @import("hvf.zig");
-    const hvfb = @import("hvf_backend.zig");
+    const hvf = @import("hv/hvf.zig");
+    const hvfb = @import("hv/hvf_backend.zig");
 
     // Per-sandbox sizing from nether.conf (cpus, ram_mb), with sane clamps. RAM is
     // kept >= 256 MiB so the DTB/initrd offsets (192 MiB) fit.
@@ -1063,7 +1063,7 @@ const SmpCtx = struct {
 /// readiness, then park until PSCI CPU_ON gives it an entry point and run from
 /// there. x0 = the PSCI context_id, per the boot protocol.
 fn macSecondaryCpu(ctx: *SmpCtx) void {
-    const hvfb = @import("hvf_backend.zig");
+    const hvfb = @import("hv/hvf_backend.zig");
     var vcpu = ctx.vm.createVcpu(ctx.id) catch {
         _ = ctx.created.fetchAdd(1, .release); // count anyway so the boot core proceeds
         return;
@@ -1084,7 +1084,7 @@ fn macSecondaryCpu(ctx: *SmpCtx) void {
 /// (MMIO, dispatched through the same Bus the x86 path uses) and powers off via
 /// PSCI. Proves hv_vm_create/map, hv_vcpu_run, and the data-abort/HVC decode.
 fn macBlobDemo(allocator: std.mem.Allocator) !void {
-    const hvf = @import("hvf.zig");
+    const hvf = @import("hv/hvf.zig");
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();

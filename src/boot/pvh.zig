@@ -4,10 +4,10 @@
 //! UEFI, no real-mode trampoline. This is the edge fast-boot path.
 
 const std = @import("std");
-const memmap = @import("memmap.zig");
-const elf = @import("elf.zig");
-const acpi = @import("acpi.zig");
-const vmm = @import("vm.zig");
+const memmap = @import("../mem/memmap.zig");
+const elf = @import("../boot/elf.zig");
+const acpi = @import("../chipset/acpi.zig");
+const vmm = @import("../hv/vm.zig");
 
 pub const magic = 0x336ec578; // XEN_HVM_START_MAGIC_VALUE
 pub const E820_RAM = 1;

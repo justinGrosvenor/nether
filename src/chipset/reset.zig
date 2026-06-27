@@ -2,8 +2,8 @@
 //! initiates a platform reset. Part of the firmware floor: OVMF's ResetSystem
 //! path pokes 0xCF9 despite the no-legacy stance, so it is irreducible.
 
-const io = @import("io.zig");
-const pwr = @import("common/power.zig");
+const io = @import("../chipset/io.zig");
+const pwr = @import("../common/power.zig");
 
 pub const Reset = struct {
     power: *pwr.Power,

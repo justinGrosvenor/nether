@@ -9,8 +9,8 @@
 //! 0x00041011) succeeds when the device is described in the DTB.
 
 const std = @import("std");
-const io = @import("io.zig");
-const Lock = @import("common/lock.zig").Lock;
+const io = @import("../chipset/io.zig");
+const Lock = @import("../common/lock.zig").Lock;
 
 pub const Pl011 = struct {
     // Host -> guest receive ring (MPSC: a host thread pushes, the vCPU drains).

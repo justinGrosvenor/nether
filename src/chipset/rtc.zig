@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const io = @import("io.zig");
+const io = @import("../chipset/io.zig");
 
 pub const Rtc = struct {
     index: u8 = 0,

@@ -15,8 +15,8 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const kvm = @import("kvm.zig");
-const trace = @import("common/trace.zig");
+const kvm = @import("../hv/kvm.zig");
+const trace = @import("../common/trace.zig");
 
 pub const Error = error{SyscallFailed} || kvm.Error;
 

@@ -9,7 +9,7 @@
 //! the FDT *encoding* is what these tests pin down.
 
 const std = @import("std");
-const arm = @import("memmap_arm.zig");
+const arm = @import("../mem/memmap_arm.zig");
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;

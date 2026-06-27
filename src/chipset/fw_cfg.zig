@@ -8,7 +8,7 @@
 //! plus the etc/table-loader linker/loader script, are the next steps.
 
 const std = @import("std");
-const io = @import("io.zig");
+const io = @import("../chipset/io.zig");
 
 pub const FwCfg = struct {
     selector: u16 = 0,

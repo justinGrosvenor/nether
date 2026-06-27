@@ -7,9 +7,9 @@
 //! empty bus 0, which is exactly what a PVH guest expects to find via MCFG.
 
 const std = @import("std");
-const io = @import("io.zig");
-const memmap = @import("memmap.zig");
-const trace = @import("common/trace.zig");
+const io = @import("../chipset/io.zig");
+const memmap = @import("../mem/memmap.zig");
+const trace = @import("../common/trace.zig");
 
 pub const max_functions = 16;
 

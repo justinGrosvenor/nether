@@ -14,7 +14,7 @@
 const std = @import("std");
 const virtio = @import("virtio.zig");
 const virtq = @import("virtq.zig");
-const io = @import("../io.zig");
+const io = @import("../chipset/io.zig");
 const trace = @import("../common/trace.zig");
 
 pub const region_size = 0x200;

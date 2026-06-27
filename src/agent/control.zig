@@ -133,7 +133,7 @@ fn onOff(b: bool) []const u8 {
 /// observes the action and returns `.shutdown` - cpu0's return unwinds macBootLinux
 /// and the process exits. Shared by the runtime watchdog and __shutdown__.
 pub fn stopSandbox(power: *nether.Power, handles: []const u64, num_cpus: u32) void {
-    const hvf = @import("../hvf.zig");
+    const hvf = @import("../hv/hvf.zig");
     power.request(.shutdown);
     var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {

@@ -9,12 +9,12 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const kvm = @import("kvm.zig");
-const io = @import("io.zig");
-const pwr = @import("common/power.zig");
-const irqchip = @import("irqchip.zig");
-const ioapic = @import("ioapic.zig");
-const hvtypes = @import("common/hvtypes.zig");
+const kvm = @import("../hv/kvm.zig");
+const io = @import("../chipset/io.zig");
+const pwr = @import("../common/power.zig");
+const irqchip = @import("../hv/irqchip.zig");
+const ioapic = @import("../hv/ioapic.zig");
+const hvtypes = @import("../common/hvtypes.zig");
 
 const StopReason = hvtypes.StopReason;
 const readValue = hvtypes.readValue;

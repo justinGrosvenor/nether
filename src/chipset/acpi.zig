@@ -8,8 +8,8 @@
 //! only content is the _S5 package, matching pm.zig's S5 soft-off.
 
 const std = @import("std");
-const memmap = @import("memmap.zig");
-const pm = @import("pm.zig");
+const memmap = @import("../mem/memmap.zig");
+const pm = @import("../chipset/pm.zig");
 
 const oem_id = [6]u8{ 'N', 'E', 'T', 'H', 'E', 'R' };
 const oem_table = [8]u8{ 'N', 'E', 'T', 'H', 'E', 'R', '0', ' ' };

@@ -6,10 +6,10 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const io = @import("io.zig");
-const ioapic = @import("ioapic.zig");
-const Lock = @import("common/lock.zig").Lock;
-const Screen = @import("vt/Screen.zig");
+const io = @import("../chipset/io.zig");
+const ioapic = @import("../hv/ioapic.zig");
+const Lock = @import("../common/lock.zig").Lock;
+const Screen = @import("../vt/Screen.zig");
 
 pub const Serial = struct {
     out_fd: i32 = 1,

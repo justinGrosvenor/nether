@@ -54,7 +54,7 @@ pub const IntxLine = struct {
     intid: u32,
     pub fn set(ctx: *anyopaque, level: bool) void {
         const self: *IntxLine = @ptrCast(@alignCast(ctx));
-        const hvf = @import("../hvf.zig");
+        const hvf = @import("../hv/hvf.zig");
         _ = hvf.hv_gic_set_spi(self.intid, level);
     }
 };
@@ -64,7 +64,7 @@ pub const IntxLine = struct {
 /// as if the device had written the doorbell.
 pub fn armSendMsi(ctx: *anyopaque, addr: u64, data: u32) void {
     _ = ctx;
-    const hvf = @import("../hvf.zig");
+    const hvf = @import("../hv/hvf.zig");
     _ = hvf.hv_gic_send_msi(addr, data);
 }
 
@@ -76,7 +76,7 @@ pub const ARM_UART_INTID: u32 = 32 + nether.memmap_arm.uart_spi;
 /// (on DR drain) and the stdin thread (on RX); hv_gic_set_spi is global.
 pub fn armUartIrq(ctx: *anyopaque, level: bool) void {
     _ = ctx;
-    const hvf = @import("../hvf.zig");
+    const hvf = @import("../hv/hvf.zig");
     _ = hvf.hv_gic_set_spi(ARM_UART_INTID, level);
 }
 

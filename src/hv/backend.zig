@@ -9,7 +9,7 @@
 const builtin = @import("builtin");
 
 pub const impl = switch (builtin.os.tag) {
-    .linux => @import("kvm_backend.zig"),
-    .macos => @import("hvf_backend.zig"),
+    .linux => @import("../hv/kvm_backend.zig"),
+    .macos => @import("../hv/hvf_backend.zig"),
     else => @compileError("Nether needs a KVM (Linux) or HVF (macOS) host"),
 };

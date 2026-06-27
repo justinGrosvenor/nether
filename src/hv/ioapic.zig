@@ -6,11 +6,11 @@
 //! injects it via KVM (which delivers to the in-kernel LAPIC).
 
 const std = @import("std");
-const io = @import("io.zig");
-const memmap = @import("memmap.zig");
-const irqchip = @import("irqchip.zig");
-const trace = @import("common/trace.zig");
-const Lock = @import("common/lock.zig").Lock;
+const io = @import("../chipset/io.zig");
+const memmap = @import("../mem/memmap.zig");
+const irqchip = @import("../hv/irqchip.zig");
+const trace = @import("../common/trace.zig");
+const Lock = @import("../common/lock.zig").Lock;
 
 pub const num_gsi = 24;
 

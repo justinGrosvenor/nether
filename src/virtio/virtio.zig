@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const virtq = @import("virtq.zig");
-const io = @import("../io.zig");
-const pci = @import("../pci.zig");
+const io = @import("../chipset/io.zig");
+const pci = @import("../chipset/pci.zig");
 const trace = @import("../common/trace.zig");
 const Lock = @import("../common/lock.zig").Lock;
 
