@@ -391,6 +391,16 @@ The build-out arc (offline-first chunks):
      Proven live: after 3 commands, `__stats__` over the socket returns
      `commands=3 bytes_in=27 bytes_out=287` etc. Nether exposes the usage; the
      billing plane (the platform/x402) settles on it.
+   - **Sandbox introspection (DONE) - `__info__`.** The companion to `__stats__`:
+     where stats answers "how much has it used?", `__info__` answers "what IS this
+     sandbox and what are its limits?" - a host-intercepted report of the static
+     capabilities and caps a controller launched it with, so the platform can verify
+     what it got and discover features without re-parsing its own config: `backend`
+     (hvf/kvm), `arch`, `cpus`, `ram_mb`, `net`, `firewall`, `gpu`, `max_runtime_s`,
+     `idle_timeout_s`, `net_rate_kbps`. Built once at launch into a `SandboxInfo` on
+     ControlCtx from the resolved nether.conf. Unit-tested and proven live: a sandbox
+     launched `cpus=2 ram_mb=384 net=1 gpu=1 idle_timeout_s=10 max_runtime_s=40
+     net_rate_kbps=2000` reports each value back exactly over the control socket.
    - **Network egress metering (DONE).** slirp counts payload bytes that traverse
      the NAT (`tx_bytes` guest->internet, `rx_bytes` internet->guest), surfaced via
      `__stats__` as `net_tx_bytes`/`net_rx_bytes`. Bandwidth is a real
@@ -670,6 +680,17 @@ The build-out arc (offline-first chunks):
      (network-limited). The near-zero in-process RTT keeps the guest's ACKs flowing so
      the TCP window stays open and `poll` returns immediately. An adaptive 5ms/200ms
      poll was A/B'd (0.28 s vs 0.29 s for 20 MB - identical) and reverted; no fix needed.
+   - **TCP window scaling is inert here (finding).** The 64 KiB window listed as a NAT
+     limit is never the bottleneck, for the same reason as above. RFC 7323 window
+     scaling was implemented (negotiate the guest's WScale, advertise ours, scale the
+     guest's advertised window) and proven to negotiate correctly live (guest offered
+     shift 6, we offered 7), but it changed nothing: the slirp<->guest hop is in-process
+     and zero-RTT, so the guest ACKs instantly and the in-flight-to-guest count never
+     builds toward the window (a debug probe confirmed it never exceeds 64 KiB even with
+     scaling on). Download throughput is bounded by the real external link (the host's
+     own TCP, which already scales) or the ~69 MB/s local NAT ceiling - not by this
+     window. The change was reverted as complexity with no measurable benefit. Don't
+     re-attempt it without a reason the slirp<->guest hop has become latency-bound.
    - **virtio-net + user-mode networking (DONE).** Rather than a privileged host
      backend (vmnet needs root/an entitlement + XPC), networking is a tiny in-VMM
      stack (`slirp.zig`): the guest's virtio-net TX frames go to it and replies come

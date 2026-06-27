@@ -72,6 +72,59 @@ pub const Metering = struct {
     }
 };
 
+/// Static, per-sandbox capabilities and limits, set once at launch from the
+/// resolved nether.conf and reported by the `__info__` control command. Where
+/// `__stats__` answers "how much has this sandbox used?", `__info__` answers "what
+/// IS this sandbox and what are its limits?" - so a controller can verify what it
+/// got and discover capabilities without parsing the config it sent.
+pub const SandboxInfo = struct {
+    cpus: u32 = 0,
+    ram_mb: u64 = 0,
+    net: bool = false, // user-mode networking enabled
+    firewall: bool = false, // egress firewall enforcing (net on and not net_open)
+    gpu: bool = false, // virtio-gpu framebuffer present
+    max_runtime_s: u64 = 0, // hard wall-clock cap (0 = unlimited)
+    idle_timeout_s: u64 = 0, // idle reclamation (0 = disabled)
+    rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
+
+    /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
+    fn report(self: *const SandboxInfo, buf: []u8) usize {
+        const builtin = @import("builtin");
+        const backend = if (builtin.os.tag == .macos) "hvf" else "kvm";
+        return (std.fmt.bufPrint(buf,
+            \\nether sandbox info
+            \\backend={s}
+            \\arch={s}
+            \\cpus={d}
+            \\ram_mb={d}
+            \\net={s}
+            \\firewall={s}
+            \\gpu={s}
+            \\max_runtime_s={d}
+            \\idle_timeout_s={d}
+            \\net_rate_kbps={d}
+            \\{c}0
+            \\
+        , .{
+            backend,
+            @tagName(builtin.cpu.arch),
+            self.cpus,
+            self.ram_mb,
+            onOff(self.net),
+            onOff(self.firewall),
+            onOff(self.gpu),
+            self.max_runtime_s,
+            self.idle_timeout_s,
+            self.rate_kbps,
+            @as(u8, 0x1e),
+        }) catch return 0).len;
+    }
+};
+
+fn onOff(b: bool) []const u8 {
+    return if (b) "on" else "off";
+}
+
 /// Clean sandbox stop: request a PSCI-style poweroff, then force the vCPUs out of
 /// `hv_vcpu_run` (re-fired for any between runs or parked in WFI) so the run loop
 /// observes the action and returns `.shutdown` - cpu0's return unwinds macBootLinux
@@ -327,6 +380,7 @@ pub const ControlCtx = struct {
     num_cpus: u32,
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
+    info: SandboxInfo = .{}, // static capabilities/limits, for __info__
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     // File-transfer jail, pinned once at listener start (not per call) so the jail
     // can't move if the process cwd ever changes. Empty until set => fail closed.
@@ -492,6 +546,15 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8) void {
     if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
         var rep: [512]u8 = undefined;
         const n = ctx.meter.report(&rep);
+        _ = writeAll(c, rep[0..n]);
+        _ = ctx.meter.bytes_out.fetchAdd(n, .release);
+        return;
+    }
+    // Introspection: the sandbox's static capabilities + limits (what it IS, vs
+    // __stats__'s what it has used). Host-intercepted.
+    if (std.mem.eql(u8, line, "__info__\n") or std.mem.eql(u8, line, "__info__")) {
+        var rep: [512]u8 = undefined;
+        const n = ctx.info.report(&rep);
         _ = writeAll(c, rep[0..n]);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
@@ -749,6 +812,30 @@ pub fn agentStdinPump(ctx: *AgentStdinCtx) void {
 
 // --- tests -----------------------------------------------------------------
 const testing = std.testing;
+
+test "sandbox info report renders capabilities and limits with the exit frame" {
+    const info = SandboxInfo{
+        .cpus = 4,
+        .ram_mb = 512,
+        .net = true,
+        .firewall = true,
+        .gpu = false,
+        .max_runtime_s = 60,
+        .idle_timeout_s = 8,
+        .rate_kbps = 0,
+    };
+    var buf: [512]u8 = undefined;
+    const out = buf[0..info.report(&buf)];
+    try testing.expect(std.mem.indexOf(u8, out, "cpus=4\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ram_mb=512\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "net=on\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "firewall=on\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "gpu=off\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "max_runtime_s=60\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "idle_timeout_s=8\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "net_rate_kbps=0\n") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) != null); // exit frame
+}
 
 test "transfer jail containment check rejects escapes and sibling-prefixes" {
     // Inside the jail.

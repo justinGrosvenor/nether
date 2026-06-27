@@ -922,7 +922,16 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         if (libc.pipe(&ctl_pipe) == 0) {
             agent_ctx.pipe_w = ctl_pipe[1];
-            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal };
+            ctl_ctx = .{ .vsdev = &vsdev, .agent = &agent_ctx, .meter = &meter, .path = ctl_path, .pipe_r = ctl_pipe[0], .allocator = allocator, .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .gpu = if (gpu_on) &gpu_be else null, .journal = &journal, .info = .{
+                .cpus = num_cpus,
+                .ram_mb = ram_size / (1024 * 1024),
+                .net = net_on,
+                .firewall = net_on and !confBool("net_open"),
+                .gpu = gpu_on,
+                .max_runtime_s = confGetInt("max_runtime_s", 0),
+                .idle_timeout_s = confGetInt("idle_timeout_s", 0),
+                .rate_kbps = confGetInt("net_rate_kbps", 0),
+            } };
             if (std.Thread.spawn(.{}, controlListener, .{&ctl_ctx})) |t| t.detach() else |_| {}
             if (std.Thread.spawn(.{}, controlRelay, .{&ctl_ctx})) |t| t.detach() else |_| {}
         } else std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
