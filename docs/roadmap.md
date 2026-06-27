@@ -74,7 +74,10 @@ The real first hard milestone. None of this is glamorous; all of it is load-bear
   DSDT.
 - **Test harness** - kvm-unit-tests as the inner loop (it exercises APIC/IOAPIC
   routing, PCI, MSI, PM timer and reports over serial); serial golden-output
-  tests. See [decisions D5](decisions.md#d5-test-harness).
+  tests. See [decisions D5](decisions.md#d5-test-harness). (The *parser* side of D5
+  is now in place: a `zig build fuzz` coverage-guided target over every guest-facing
+  parser, via std.testing.fuzz - see SESSION-HANDOFF; kvm-unit-tests on metal is the
+  remaining inner-loop piece.)
 
 **Done when:** kvm-unit-tests' core APIC/PCI suites pass, and the substrate can
 present a PCIe host bridge + the firmware floor to a guest.

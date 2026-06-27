@@ -57,4 +57,12 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run ABI/layout tests");
     test_step.dependOn(&run_tests.step);
+
+    // Coverage-guided fuzzing of the guest-facing parsers (the `fuzz:` tests in
+    // src/fuzz.zig, driven via std.testing.fuzz). `zig build fuzz` runs the whole
+    // suite once (the always-on smoke); `zig build fuzz --fuzz` starts the
+    // coverage-guided fuzzer (web UI) over the same harnesses. Same binary as the
+    // test step, exposed under its own name so the intent is discoverable.
+    const fuzz_step = b.step("fuzz", "Fuzz the guest-facing parsers (add --fuzz for coverage-guided mode)");
+    fuzz_step.dependOn(&run_tests.step);
 }

@@ -15,9 +15,11 @@
 //! must *terminate* and stay in bounds, never crash, hang, or read/write
 //! outside guest memory. Seeds are fixed so a failure reproduces exactly.
 //!
-//! This is the always-on smoke that runs with `zig build test` (it surfaces
-//! panics under Debug/ReleaseSafe). A full AFL-style `zig build fuzz` target is
-//! a later D5 item. Pattern borrowed from a private path tests/fuzz.zig.
+//! Two layers: (1) always-on fixed-seed smoke (the `survives ...` tests) that runs
+//! with `zig build test` and surfaces panics under Debug/ReleaseSafe, reproducibly;
+//! (2) coverage-guided entry points (the `fuzz: ...` tests, via std.testing.fuzz) that
+//! `zig build fuzz --fuzz` drives over the same harnesses. Pattern borrowed from
+//! a private path tests/fuzz.zig.
 
 const std = @import("std");
 const Parser = @import("vt/Parser.zig");
@@ -566,4 +568,100 @@ test "slirp survives structured-hostile IPv4 frames (random ihl/proto/doff)" {
         }
         s.onGuestFrame(frame[0..n]);
     }
+}
+
+// --- coverage-guided fuzz entry points (zig build test --fuzz) -------------
+// The tests above are fixed-seed smoke (always-on, reproducible). These mirror them
+// through std.testing.fuzz, so `zig build fuzz` (-> test --fuzz) drives the same
+// parsers coverage-guided. Under a plain `zig build test` they run a quick smoke pass.
+test "fuzz: vt parser" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [256]u8 = undefined;
+            const n = smith.slice(&buf);
+            feedParser(buf[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: screen grid" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var s = Screen.init(std.testing.allocator, 24, 80) catch return;
+            defer s.deinit();
+            var buf: [256]u8 = undefined;
+            const n = smith.slice(&buf);
+            s.write(buf[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: virtqueue" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var ram: [1024]u8 = undefined;
+            smith.bytes(&ram);
+            feedVirtq(&ram);
+        }
+    }.one, .{});
+}
+
+test "fuzz: vsock engine" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [256]u8 = undefined;
+            const n = smith.slice(&buf);
+            var vs = vsock.Vsock{ .guest_cid = 3 };
+            _ = vs.listen(1024);
+            feedVsock(&vs, buf[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: virtio-net" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var ram: [4096]u8 = undefined;
+            smith.bytes(&ram);
+            var frame: [256]u8 = undefined;
+            const n = smith.slice(&frame);
+            feedNet(&ram, frame[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: virtio-gpu command" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var cmd: [512]u8 = undefined;
+            const n = smith.slice(&cmd);
+            var ram: [4096]u8 = undefined;
+            feedGpuCmd(&ram, cmd[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: slirp guest frame" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var frame: [256]u8 = undefined;
+            const n = smith.slice(&frame);
+            var s = slirp.Slirp{};
+            _ = s.addBlock("0.0.0.0/0"); // deny-all -> no host sockets
+            s.out_fn = slirpSink;
+            s.out_ctx = &s;
+            s.onGuestFrame(frame[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: ELF/PVH loader" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var img: [512]u8 = undefined;
+            const n = smith.slice(&img);
+            var sink = ElfSink{};
+            _ = elf.loadPvh(img[0..n], &sink) catch {};
+        }
+    }.one, .{});
 }
