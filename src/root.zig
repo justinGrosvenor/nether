@@ -98,6 +98,7 @@ test {
     _ = @import("net/slirp.zig");
     _ = @import("agent/control.zig");
     _ = @import("agent/audit.zig");
+    _ = @import("agent/platform.zig"); // shared platform init (watchdogs)
     _ = @import("agent/snapshot.zig"); // snapshot file-format validation (mac path)
     // Always-on fuzz-smoke for the guest-facing parsers (vt, virtqueue, vsock, net).
     _ = @import("fuzz.zig");

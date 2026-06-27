@@ -33,6 +33,7 @@ const macMarkerPresent = conf.markerPresent;
 // Control plane (control socket, agent plumbing, metering, lifecycle) lives in
 // control.zig.
 const control = @import("agent/control.zig");
+const platform = @import("agent/platform.zig");
 const Metering = control.Metering;
 const AgentCtx = control.AgentCtx;
 const ControlCtx = control.ControlCtx;
@@ -972,30 +973,19 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         std.debug.print("[nether] snapshot {s} armed\n", .{if (snap_ctx.save) "save-to-file" else "rewind demo"});
     }
 
-    // Runtime budget (govern): a watchdog stops the sandbox after max_runtime_s of
-    // wall clock - a hard cap on cost/runaway for untrusted agents (the time axis,
-    // alongside the firewall/bandwidth/sizing controls). 0 = unlimited.
-    var wd_ctx: WatchdogCtx = undefined;
-    const max_runtime_s = confGetInt("max_runtime_s", 0);
-    if (max_runtime_s > 0) {
-        wd_ctx = .{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .start_ms = nowMs(), .budget_ms = @intCast(max_runtime_s * 1000) };
-        if (std.Thread.spawn(.{}, macWatchdog, .{&wd_ctx})) |t| t.detach() else |_| {}
-        std.debug.print("[nether] runtime budget armed: {d}s\n", .{max_runtime_s});
-    }
-
-    // Idle timeout (govern): reclaim a sandbox that has seen no control-plane
-    // activity (a client command or agent output) for idle_timeout_s, so a finished
-    // or abandoned sandbox does not burn the host until its max_runtime_s ceiling.
-    // The clock starts at boot, so a sandbox the platform never attaches to is also
-    // reclaimed. 0 = disabled. (max_runtime_s remains the hard wall-clock cap.)
-    var idle_ctx: IdleWatchdogCtx = undefined;
-    const idle_timeout_s = confGetInt("idle_timeout_s", 0);
-    if (idle_timeout_s > 0) {
-        meter.last_activity_ms.store(nowMs(), .release); // start counting from boot
-        idle_ctx = .{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus, .activity = &meter.last_activity_ms, .idle_ms = @intCast(idle_timeout_s * 1000) };
-        if (std.Thread.spawn(.{}, macIdleWatchdog, .{&idle_ctx})) |t| t.detach() else |_| {}
-        std.debug.print("[nether] idle timeout armed: {d}s\n", .{idle_timeout_s});
-    }
+    // Lifecycle watchdogs (govern): the runtime budget (a hard wall-clock cap, the
+    // time axis alongside firewall/bandwidth/sizing) and the idle timeout (reclaim a
+    // sandbox with no control-plane activity). Shared module; the HVF stop
+    // (hv_vcpus_exit via stopSandbox) is injected so the same code serves the KVM
+    // path. 0 = unlimited / disabled.
+    var hvf_stop = HvfStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
+    var watchdogs = platform.Watchdogs{
+        .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
+        .activity = &meter.last_activity_ms,
+        .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
+        .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
+    };
+    watchdogs.arm();
 
     std.debug.print("[nether] booting arm64 Image: {d} cpus, kernel {d}B, initramfs {d}B, DTB {d}B, GIC d=0x{x} rbase=0x{x} rsize=0x{x}\n", .{ num_cpus, kernel.len, if (initramfs) |fs| fs.len else 0, dtb_len, vm.hv.gicd_size, gicr_base, vm.hv.gicr_size });
     const reason = vcpu.runSmp(&bus, &power, &smpc, &snapctl) catch |err| {
@@ -1005,44 +995,20 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     std.debug.print("\n[nether] guest {s}.\n", .{@tagName(reason)});
 }
 
-/// Runtime-budget watchdog context: a deadline plus what it needs to stop the VM.
-const WatchdogCtx = struct {
+/// The HVF backend's guest stop, adapted to `platform.Stop`: the PSCI-poweroff path
+/// (request shutdown, then `hv_vcpus_exit` the vCPUs out of `hv_vcpu_run`) so the run
+/// loop returns `.shutdown` and the process exits. The KVM path will provide its own
+/// adapter (signal the vCPU thread -> KVM_RUN EINTR). Lives in the boot frame; the
+/// watchdog threads are detached and hold &it for the VM's lifetime.
+const HvfStop = struct {
     power: *nether.Power,
     handles: []const u64,
     num_cpus: u32,
-    start_ms: i64, // matches nowMs()
-    budget_ms: i64,
+    fn call(p: *anyopaque) void {
+        const self: *HvfStop = @ptrCast(@alignCast(p));
+        stopSandbox(self.power, self.handles, self.num_cpus);
+    }
 };
-
-/// Stop the sandbox once its wall-clock budget elapses. Uses the same path a guest
-/// PSCI poweroff takes: request a shutdown, then force the vCPUs out of
-/// `hv_vcpu_run` so the run loop observes the action and returns `.shutdown`
-/// (cpu0's return unwinds macBootLinux and the process exits). Re-fires the exit a
-/// few times in case a vCPU is between runs or parked in WFI inside HVF.
-fn macWatchdog(ctx: *WatchdogCtx) void {
-    while (nowMs() - ctx.start_ms < ctx.budget_ms) _ = usleep(200_000); // ~5 Hz
-    std.debug.print("\n[nether] runtime budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.budget_ms, 1000)});
-    stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
-}
-
-/// Idle-timeout watchdog context: a last-activity timestamp plus what it needs to
-/// stop the VM. `activity` is updated by the control plane (client commands and
-/// agent output); the sandbox is stopped once it has been stale for `idle_ms`.
-const IdleWatchdogCtx = struct {
-    power: *nether.Power,
-    handles: []const u64,
-    num_cpus: u32,
-    activity: *std.atomic.Value(i64), // last activity, matches nowMs()
-    idle_ms: i64,
-};
-
-/// Stop the sandbox once no control-plane activity has occurred for `idle_ms`.
-/// Polls the shared last-activity timestamp; same stop path as the runtime budget.
-fn macIdleWatchdog(ctx: *IdleWatchdogCtx) void {
-    while (nowMs() - ctx.activity.load(.acquire) < ctx.idle_ms) _ = usleep(200_000); // ~5 Hz
-    std.debug.print("\n[nether] idle timeout ({d}s) reached; stopping sandbox\n", .{@divTrunc(ctx.idle_ms, 1000)});
-    stopSandbox(ctx.power, ctx.handles, ctx.num_cpus);
-}
 
 /// Per-secondary-core thread context. The vCPU is created inside the thread (HVF
 /// binds a vCPU to its creating thread), so only the id and the shared VM/bus/
