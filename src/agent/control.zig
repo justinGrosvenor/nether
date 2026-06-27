@@ -129,6 +129,25 @@ fn onOff(b: bool) []const u8 {
     return if (b) "on" else "off";
 }
 
+/// The core observe/meter/run state every sandbox has: the event Journal, the usage
+/// Meter, and the AgentCtx, with the agent cross-wired to the journal + meter. Both
+/// boot paths construct it the same way via `init`. The cross-pointers are to its own
+/// fields, so it must be initialized in place and not moved after - declare it in the
+/// boot frame, call init, then hand out &core.agent / &core.journal / &core.meter.
+pub const Core = struct {
+    journal: nether.Journal = .{},
+    meter: Metering = .{},
+    agent: AgentCtx = .{},
+
+    /// Wire the core state in place and emit the boot lifecycle event.
+    pub fn init(self: *Core, ram_mb: u64, cpus: u32, max_output: usize) void {
+        self.meter = .{ .start_ms = nowMs(), .ram_mb = ram_mb, .cpus = cpus };
+        self.agent.journal = &self.journal;
+        self.agent.meter = &self.meter; // agent output is activity for the idle watchdog
+        self.agent.max_output = max_output; // govern: per-command output cap
+        self.journal.emit(.life, "boot");
+    }
+};
 
 /// A diverted capture of the agent's reply, used by the host-mediated file
 /// transfer (`__put__`/`__get__`). While `AgentCtx.capture` points at one of these,

@@ -648,7 +648,10 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
 
     // Per-sandbox metering (declared early so the net block can point it at the
     // NAT for egress byte counts; read by the __stats__ control command).
-    var meter = Metering{ .start_ms = nowMs(), .ram_mb = ram_size / (1024 * 1024), .cpus = num_cpus };
+    // Core platform state (observe/meter/run): the journal, usage meter, and agent,
+    // cross-wired in place. Shared bundle; linuxMain constructs it the same way.
+    var core = control.Core{};
+    core.init(ram_size / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", 0)));
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
@@ -784,15 +787,6 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var vsdev: nether.VsockDev = undefined;
     var vs_dev: nether.virtio.Device = undefined;
     var vs_intx: IntxLine = undefined;
-    var agent_ctx = AgentCtx{};
-    // Unified event journal (observe): one sequenced timeline of commands, network
-    // flows, and lifecycle events, polled via __events__. Shared by the agent (CMD),
-    // slirp (NET), and lifecycle emitters.
-    var journal = nether.Journal{};
-    agent_ctx.journal = &journal;
-    agent_ctx.meter = &meter; // agent output counts as activity for the idle watchdog
-    agent_ctx.max_output = @intCast(confGetInt("max_output_bytes", 0)); // govern: per-command output cap
-    journal.emit(.life, "boot");
     // Control socket path from nether.conf (per-sandbox), else the default. A
     // configured path also enables control mode (no marker needed).
     var sock_path_buf: [256]u8 = undefined;
@@ -810,14 +804,14 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         const rows: u16 = @intCast(std.math.clamp(confGetInt("screen_rows", 24), 1, 200));
         const cols: u16 = @intCast(std.math.clamp(confGetInt("screen_cols", 80), 1, 400));
         render = try nether.Render.init(allocator, rows, cols);
-        agent_ctx.render = &render;
+        core.agent.render = &render;
     }
     defer if (control_on) render.deinit();
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
         vs.on_event = if (agent_mode) agentEvent else vsockEcho;
-        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &agent_ctx) else @as(*anyopaque, vs);
+        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &core.agent) else @as(*anyopaque, vs);
         vs_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
@@ -858,8 +852,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         slirp_stack.out_ctx = &net_be;
         net_be.on_tx = netToSlirp;
         net_be.on_tx_ctx = &slirp_stack;
-        meter.net = &slirp_stack; // expose NAT egress/ingress bytes via __stats__
-        slirp_stack.journal = &journal; // mirror egress flows into the event timeline
+        core.meter.net = &slirp_stack; // expose NAT egress/ingress bytes via __stats__
+        slirp_stack.journal = &core.journal; // mirror egress flows into the event timeline
         // Host thread: poll NAT sockets and inject replies back into the guest.
         if (std.Thread.spawn(.{}, slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
     }
@@ -925,9 +919,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (control_on) {
         control.startControl(&ctl_ctx, .{
             .vsdev = &vsdev,
-            .agent = &agent_ctx,
-            .meter = &meter,
-            .journal = &journal,
+            .agent = &core.agent,
+            .meter = &core.meter,
+            .journal = &core.journal,
             .gpu = if (gpu_on) &gpu_be else null,
             .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
             .path = ctl_path,
@@ -949,7 +943,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // Host stdin: in agent-REPL mode it drives the guest agent (stdin -> sandbox
     // exec -> stdout). Otherwise (interactive or control mode) it feeds the PL011
     // RX for a guest shell; control mode drives the agent over the Unix socket.
-    var agent_stdin = AgentStdinCtx{ .vsdev = &vsdev, .agent = &agent_ctx };
+    var agent_stdin = AgentStdinCtx{ .vsdev = &vsdev, .agent = &core.agent };
     const saved_termios = if (agent_repl) null else armEnableRawMode();
     defer if (saved_termios) |s| armRestoreTermios(s);
     if (agent_repl) {
@@ -986,7 +980,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // path. 0 = unlimited / disabled.
     var watchdogs = platform.Watchdogs{
         .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
-        .activity = &meter.last_activity_ms,
+        .activity = &core.meter.last_activity_ms,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
         .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
     };
