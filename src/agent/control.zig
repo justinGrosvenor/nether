@@ -1037,6 +1037,51 @@ test "transfer jail containment check rejects escapes and sibling-prefixes" {
     try testing.expect(!within("/jail/sub", "/jail/other"));
 }
 
+test "transfer jail (jailedPath) confines real paths, incl symlink escapes" {
+    const c = struct {
+        extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+        extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
+        extern "c" fn rmdir(path: [*:0]const u8) c_int;
+    };
+    const jail = "/tmp/nether-jailtest";
+    const inside = jail ++ "/inside.txt";
+    const escape = jail ++ "/escape"; // a symlink pointing OUT of the jail
+    // Clean any leftovers, then build the jail fresh.
+    _ = libc.unlink(inside);
+    _ = libc.unlink(escape);
+    _ = c.rmdir(jail);
+    if (c.mkdir(jail, 0o700) != 0) return error.SkipZigTest;
+    defer {
+        _ = libc.unlink(inside);
+        _ = libc.unlink(escape);
+        _ = c.rmdir(jail);
+    }
+    const O_CREAT = 0x0200;
+    const O_WRONLY = 0x0001;
+    const fd = libc.open(inside, O_CREAT | O_WRONLY, @as(c_int, 0o600));
+    if (fd >= 0) _ = libc.close(fd) else return error.SkipZigTest;
+    _ = c.symlink("/etc/hosts", escape); // escapes to a real file outside the jail
+
+    // The jail root is the canonical path (/tmp is a symlink to /private/tmp on macOS).
+    var rootbuf: [1024]u8 = undefined;
+    const root_c = libc.realpath(jail, &rootbuf) orelse return error.SkipZigTest;
+    const root = std.mem.span(root_c);
+
+    var out: [1024]u8 = undefined;
+    // Read of a file inside the jail -> accepted.
+    try testing.expect(jailedPath(&out, root, inside, false) != null);
+    // Read through a symlink that escapes the jail -> rejected (realpath resolves out).
+    try testing.expect(jailedPath(&out, root, escape, false) == null);
+    // Read of a path plainly outside the jail -> rejected.
+    try testing.expect(jailedPath(&out, root, "/etc/hosts", false) == null);
+    // Create a new file in the jail (parent exists) -> accepted.
+    try testing.expect(jailedPath(&out, root, jail ++ "/new.txt", true) != null);
+    // Create with a `..` that escapes the jail -> rejected (parent resolves outside).
+    try testing.expect(jailedPath(&out, root, jail ++ "/../escape.txt", true) == null);
+    // Create into a non-existent subdir -> rejected (parent realpath fails).
+    try testing.expect(jailedPath(&out, root, jail ++ "/nope/x.txt", true) == null);
+}
+
 test "command audit log records commands with exit codes oldest-first" {
     var a = AgentCtx{};
     a.auditForward("echo hi\n");
