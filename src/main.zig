@@ -398,6 +398,7 @@ fn linuxMain() !void {
                 .firewall = net_slirp and !confBool("net_open"),
                 .gpu = false,
                 .max_runtime_s = confGetInt("max_runtime_s", 0),
+                .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", 0),
@@ -409,6 +410,7 @@ fn linuxMain() !void {
         .activity = &core.meter.last_activity_ms,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
         .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
+        .cpu_ms = @intCast(confGetInt("max_cpu_s", 0) * 1000),
     };
     watchdogs.arm();
 
@@ -1032,6 +1034,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .firewall = net_on and !confBool("net_open"),
                 .gpu = gpu_on,
                 .max_runtime_s = confGetInt("max_runtime_s", 0),
+                .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", 0),
@@ -1082,6 +1085,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .activity = &core.meter.last_activity_ms,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
         .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
+        .cpu_ms = @intCast(confGetInt("max_cpu_s", 0) * 1000),
     };
     watchdogs.arm();
 

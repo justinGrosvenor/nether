@@ -87,6 +87,7 @@ pub const SandboxInfo = struct {
     firewall: bool = false, // egress firewall enforcing (net on and not net_open)
     gpu: bool = false, // virtio-gpu framebuffer present
     max_runtime_s: u64 = 0, // hard wall-clock cap (0 = unlimited)
+    max_cpu_s: u64 = 0, // hard CPU-time cap (0 = unlimited)
     idle_timeout_s: u64 = 0, // idle reclamation (0 = disabled)
     rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
     max_output_bytes: u64 = 0, // per-command output cap (0 = unlimited)
@@ -105,6 +106,7 @@ pub const SandboxInfo = struct {
             \\firewall={s}
             \\gpu={s}
             \\max_runtime_s={d}
+            \\max_cpu_s={d}
             \\idle_timeout_s={d}
             \\net_rate_kbps={d}
             \\max_output_bytes={d}
@@ -119,6 +121,7 @@ pub const SandboxInfo = struct {
             onOff(self.firewall),
             onOff(self.gpu),
             self.max_runtime_s,
+            self.max_cpu_s,
             self.idle_timeout_s,
             self.rate_kbps,
             self.max_output_bytes,

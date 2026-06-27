@@ -14,6 +14,7 @@ const hostutil = @import("../common/hostutil.zig");
 
 const nowMs = hostutil.nowMs;
 const usleep = hostutil.usleep;
+const processCpuMs = hostutil.processCpuMs;
 
 /// A backend-agnostic guest stop: force the guest down its PSCI-poweroff path so the
 /// run loop returns `.shutdown` and the process exits cleanly. The `ctx` outlives the
@@ -37,6 +38,7 @@ pub const Watchdogs = struct {
     start_ms: i64 = 0, // set by arm()
     runtime_ms: i64 = 0, // hard wall-clock cap (0 = unlimited)
     idle_ms: i64 = 0, // idle reclamation (0 = disabled; needs `activity`)
+    cpu_ms: i64 = 0, // hard CPU-time cap (0 = unlimited): total process CPU consumed
 
     /// Start the clock and spawn the enabled watchdog threads. A budget of 0 means
     /// that watchdog is not armed. The idle watchdog also needs `activity` (the runtime
@@ -54,6 +56,10 @@ pub const Watchdogs = struct {
                 std.debug.print("[nether] idle timeout armed: {d}s\n", .{@divTrunc(self.idle_ms, 1000)});
             }
         }
+        if (self.cpu_ms > 0) {
+            if (std.Thread.spawn(.{}, cpuLoop, .{self})) |t| t.detach() else |_| {}
+            std.debug.print("[nether] cpu budget armed: {d}s\n", .{@divTrunc(self.cpu_ms, 1000)});
+        }
     }
 
     /// Stop once the wall-clock budget elapses.
@@ -69,6 +75,16 @@ pub const Watchdogs = struct {
         const activity = self.activity.?;
         while (nowMs() - activity.load(.acquire) < self.idle_ms) _ = usleep(200_000); // ~5 Hz
         std.debug.print("\n[nether] idle timeout ({d}s) reached; stopping sandbox\n", .{@divTrunc(self.idle_ms, 1000)});
+        self.stop.call();
+    }
+
+    /// Stop once the sandbox's total CPU time exceeds `cpu_ms`. Unlike the wall-clock
+    /// runtime budget, this charges only actual compute (getrusage process CPU), so an
+    /// idle sandbox is never billed out while a CPU-pinning one is caught quickly. The
+    /// signal is the same `cpu_ms` reported by __stats__.
+    fn cpuLoop(self: *Watchdogs) void {
+        while (@as(i64, @intCast(processCpuMs())) < self.cpu_ms) _ = usleep(200_000); // ~5 Hz
+        std.debug.print("\n[nether] cpu budget ({d}s) reached; stopping sandbox\n", .{@divTrunc(self.cpu_ms, 1000)});
         self.stop.call();
     }
 };
