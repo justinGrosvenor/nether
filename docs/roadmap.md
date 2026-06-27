@@ -1,19 +1,26 @@
 # Nether - Roadmap
 
-**Status (verified on a bare-metal KVM host):** the substrate runs live, Nether
-**PVH-boots Linux 6.12 to an interactive shell**, the userspace IOAPIC routes
-serial IRQ4 (console no longer stalls at 16 bytes), and **virtio-blk reads and
-writes work end to end** (the guest enumerates the device over the ACPI PCIe host
-bridge, claims its BAR, and the kernel reads/writes `/dev/vda` with MSI-X
-completions, writes landing on the host image). Built and unit-tested offline,
-awaiting live verification: **continuous interactive stdin** via a host I/O
-thread that feeds the serial RX and raises IRQ4 so an idle shell still receives
-input (the first concrete [D3](decisions.md) per-device-lock instance);
-**virtio-vsock** (the swerver<->guest channel); and **virtio-net** (a tap-backed
-NIC), which completes the Phase 3 datapath device set (block + net + MSI-X) - so
-the win condition is now gated on a live boot of a networked image rather than on
-any missing device. See [decisions.md](decisions.md) D8 for the PVH gotchas, D6
-for the irqchip/IOAPIC, and D3 for the concurrency model.
+**Status.** Phase 3 (the win condition) is **achieved on the aarch64/Apple-HVF
+backend**: Nether boots Alpine Linux 6.12 to an interactive shell over virtio-pci
+with MSI-X, with virtio-console, virtio-blk, virtio-vsock, and virtio-net all
+live. On top of that datapath we built the **agent-platform track**: a control
+plane (a Unix-socket API + an in-guest agent REPL + host-mediated file transfer),
+live surfaces for all six platform pillars (observe / govern / isolate / meter /
+run / render), and **snapshot -> copy-on-write fork -> ~90 ms lazy restore** - the
+microVM fork primitive the edge product is built on. The whole stack is hardened
+against malformed guest input *and* against a hostile local control client.
+
+The **x86-64/KVM** path stays the reference backend: it PVH-boots Linux 6.12 to an
+interactive shell on bare metal, the userspace IOAPIC routes serial IRQ4 (no more
+16-byte FIFO stall), and virtio-blk reads/writes work end to end; its network path
+now runs through the same slirp + egress firewall. The remaining x86 work is
+porting the HVF-proven platform layer (control plane, metering, observe/govern,
+snapshot) onto KVM - tracked, and gated on standing up an x86 host. The bet is
+that what HVF proved about the device models, control protocol, and snapshot
+format transfers largely intact.
+
+See [decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the
+irqchip/IOAPIC, D3 for the concurrency model, and D9 for the backend seam.
 
 Re-cut from the original six-phase plan. Two changes from the first draft:
 
@@ -24,13 +31,17 @@ Re-cut from the original six-phase plan. Two changes from the first draft:
    MCFG/MADT/FADT to boot over virtio-pci); the hard ACPI - SRAT/SLIT, per-CPU
    SSDT, hotplug AML - stays in Phases 4-5 where it belongs.
 
-The win condition is **Phase 3**: a clean modern-only VMM that boots a Linux disk
-image over virtio-block/net with MSI-X. Everything past it is bonus, and each
-later phase is its own project measured in months.
+The win condition was **Phase 3**: a clean modern-only VMM that boots Linux over
+virtio-block/net with MSI-X. **That line is crossed** (on the aarch64/HVF
+backend), and rather than stop there the project ran forward into the platform
+track below - the agent surfaces (observe/govern/meter/run/render) and the
+snapshot-fork primitive - built ahead of the general-VMM phases. Phases 4-6
+(Windows, passthrough/NUMA, live migration) remain real future scope, each its own
+project measured in months.
 
 ---
 
-## Phase 0 - KVM skeleton
+## Phase 0 - KVM skeleton  ·  DONE
 
 VM, vCPU, memory regions, `KVM_RUN` loop, serial out.
 
@@ -41,7 +52,7 @@ VM, vCPU, memory regions, `KVM_RUN` loop, serial out.
 
 **Done when:** a tiny code blob runs under `KVM_RUN` and prints over serial.
 
-## Phase 1.5 - Platform substrate
+## Phase 1.5 - Platform substrate  ·  DONE (kvm-unit-tests harness still pending, see D5)
 
 The real first hard milestone. None of this is glamorous; all of it is load-bearing.
 
@@ -67,9 +78,12 @@ The real first hard milestone. None of this is glamorous; all of it is load-bear
 **Done when:** kvm-unit-tests' core APIC/PCI suites pass, and the substrate can
 present a PCIe host bridge + the firmware floor to a guest.
 
-## Phase 2 - OVMF boots
+## Phase 2 - OVMF boots  ·  DEFERRED (PVH direct-boot is the edge path; OVMF stays for general/Windows guests)
 
-OVMF reaches the UEFI shell on top of the substrate.
+OVMF reaches the UEFI shell on top of the substrate. Not on the critical path for
+ephemeral agent guests - PVH boots them faster with no UEFI - so this is sequenced
+behind the platform track, not descoped. `fw_cfg.zig` (PIO) and `acpi.zig` (the
+fixed table set) are in; the ACPI linker/loader + fw_cfg DMA are what remain (D1).
 
 - Map OVMF_CODE.fd / OVMF_VARS.fd.
 - Verify OVMF consumes fw_cfg (memory, ACPI linker-loader) cleanly.
@@ -77,7 +91,7 @@ OVMF reaches the UEFI shell on top of the substrate.
 
 **Done when:** OVMF reaches the UEFI shell with no hand-holding.
 
-## Phase 3 - Boot Linux (WIN CONDITION)
+## Phase 3 - Boot Linux (WIN CONDITION)  ·  DONE on aarch64/HVF
 
 virtio-pci block and net, MSI-X, boot a Linux disk image.
 
@@ -88,8 +102,11 @@ virtio-pci block and net, MSI-X, boot a Linux disk image.
   [decisions D2](decisions.md#d2-which-devices-go-out-of-process)).
 - virtio-rng/console as warm-ups.
 
-**Done when:** a stock Linux cloud image boots to a login prompt over
-virtio-block/net with MSI-X interrupts.
+**Done when:** a Linux image boots to an interactive shell over virtio-block/net
+with MSI-X interrupts. **DONE on the aarch64/HVF backend** (Alpine 6.12, with
+virtio-console/blk/vsock/net and both MSI-X and legacy INTx). The x86/KVM
+equivalent boots to a shell with virtio-blk; a live networked boot is the
+remaining step there.
 
 ## Phase 4 - Boot Windows
 
@@ -391,6 +408,17 @@ The build-out arc (offline-first chunks):
      denied attempts metered as `net_blocked`. Unit-tested (deny/allow/block/parse)
      and proven live: guest fetches http://example.com (allowed), is refused on
      http://192.168.1.2 with a RST, `__stats__` shows `net_blocked=1`.
+   - **Egress firewall parity on the KVM/x86 path (DONE).** The firewall was
+     HVF-only; the KVM path used a raw `tap0` bridge (full L2, no filtering). The
+     in-VMM slirp stack is portable, so `linuxMain` now makes slirp + the egress
+     firewall the **default** net backend on the KVM path too (no host tap/bridge/
+     root required), with `net_tap` (conf/marker) opting back into the raw bridge for
+     trusted setups, logged as unfirewalled. The firewall config (net_open/net_allow/
+     net_block/net_rate_kbps) is factored into a shared `applyNetFirewall` helper used
+     by both backends, and `build.zig` now links libc on every target (slirp + the
+     control plumbing use the C socket APIs). Default-deny egress now applies to Linux
+     guests as well. Cross-compile-verified (x86_64-linux); the firewall logic itself
+     is unit-tested and live-proven on the HVF path.
    - **Egress audit log (DONE) - the observe pillar.** "What did this agent connect
      to?" slirp keeps a ring (last 256) of every destination the sandbox tried to
      reach - one record per new TCP connection / UDP flow - with the firewall's
@@ -466,6 +494,26 @@ The build-out arc (offline-first chunks):
      an intentional safety choice - device models aren't individually thread-safe, so
      it serializes possibly-malicious concurrent vCPU access; per-device locking is
      the scalability follow-up (see io.zig).
+   - **Hardening pass 2: the host control plane (DONE).** A two-round external audit
+     of the platform surface (not the guest datapath) closed the host-side gaps: (1)
+     the control socket granted full VM control but lived world-reachable in /tmp with
+     no auth - now `fchmod` 0600 plus an authoritative `getpeereid` owner-uid check on
+     every accept; (2) host-mediated `__put__`/`__get__` took arbitrary host paths -
+     now confined to a jail (`realpath`-canonicalized, sibling-prefix-safe, pinned at
+     listener start) so a control client cannot read/write outside the launch dir; (3)
+     `vm.guestSlice` used a wrapping `gpa + len` bound - now the room-left form matching
+     `virtq.GuestMem.slice`; (4) the web console bound `0.0.0.0` with no auth - now
+     loopback-only behind a per-process token; (5) the ELF loader and `readFileMac`
+     gained bounds/short-read checks; (6) the snapshot restore path now validates the
+     header (magic + a format **version** + a struct-layout fingerprint that catches
+     silent layout drift) and the file length before mapping RAM, so a stale, corrupt,
+     or truncated `nether.snap` fails with a clear error instead of a layout-mismatched
+     read or a SIGBUS on the mapped tail. Each is unit-tested where logic-bearing, and
+     the socket/jail/snapshot paths are live-proven (cross-uid rejection by reasoning;
+     bad-version / bad-magic / oversized-disk / truncated snapshots rejected cleanly on
+     HVF). The takeaway from the audit: the guest->host boundary (the stated primary
+     threat model) came back clean; the real exposure was the operator/local-process
+     control plane, now closed.
    - **Render pillar (DONE).** The platform must be able to show an untrusted
      agent's work. `render.zig` maintains a server-side VT `Screen` (the same parser/
      grid the serial console uses) fed by the agent's command output, so the
@@ -723,7 +771,11 @@ The build-out arc (offline-first chunks):
    or an out-of-bounds write into the fixed disk buffer. Unit-tested and proven live
    (a wrong-version, wrong-magic, and oversized-disk snapshot are each rejected cleanly).
 
-The x86-64/KVM path stays the reference backend; its one remaining Phase 3 step
-(a live networked boot) is independent of this track. SMP and snapshot on the KVM
-path (per-vCPU threads + INIT/SIPI; KVM's GET/SET ioctls + dirty-log) are the
-analogous follow-ups there.
+The x86-64/KVM path stays the reference backend. It PVH-boots to a shell with
+virtio-blk, and its network path now runs through the same slirp + egress firewall
+(the firewall is on **both** backends). The substantive remaining x86 work is
+**porting the HVF-proven platform layer onto KVM** - the control plane, metering,
+observe/govern, and snapshot/restore (per-vCPU threads + INIT/SIPI; KVM's GET/SET
+ioctls + dirty-log) - gated on standing up an x86 host. The deliberate bet of the
+aarch64-first detour is that what HVF proved about the device models, the control
+protocol, and the snapshot format transfers to KVM largely intact.

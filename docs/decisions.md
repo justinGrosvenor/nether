@@ -7,7 +7,12 @@ retrofit. Each has a recommendation; mark them RESOLVED as they're locked.
 
 ## D1 - OVMF coupling: fw_cfg vs forked firmware
 
-**Status:** open · **Recommendation:** fw_cfg (option a)
+**Status:** open, sequenced behind PVH · **Recommendation:** fw_cfg (option a)
+
+For ephemeral agent guests the live path is **PVH direct-boot** (fast, no UEFI),
+already working on both backends; OVMF stays for general/Windows guests and is
+sequenced behind the platform track (roadmap Phase 2), not on the critical path. The
+fw_cfg/linker-loader work below is what unlocks it when that phase comes up.
 
 Stock OVMF does not build its own ACPI for a QEMU-class machine. The tables come
 from the VMM over **fw_cfg** plus the **ACPI linker/loader** protocol (a command
@@ -67,9 +72,10 @@ First instances landed with the interactive-stdin I/O thread. The host stdin
 thread feeds `Serial.pushRx` while the vCPU thread services serial register
 exits, and the IOAPIC redirection table is read on `raise()` from both threads
 while the guest programs it from the vCPU thread. Each device carries its own
-`Lock` (`src/lock.zig`, a spin lock over `std.atomic.Mutex`, since the critical
-sections are a few field writes). The rules that keep it correct, to be repeated
-for every future device:
+`Lock` (`src/lock.zig`, now a plain `std.atomic.Value` spinlock - it dropped the
+version-volatile `std.atomic.Mutex` so the tree builds on both 0.16.0 stable and
+dev nightlies - since the critical sections are a few field writes). The rules
+that keep it correct, to be repeated for every future device:
 
 - **One lock order, globally:** serial -> ioapic. A device raising an IRQ
   releases its own lock first, then calls into the IOAPIC.
@@ -87,9 +93,28 @@ directly rather than the locking `host*` API (the spin lock is non-recursive) -
 documented as the VsockDev re-entrancy contract. The lock stays independent of
 the serial -> ioapic order because vsock never nests with them.
 
+The "shard later if needed" half has since landed too, driven by SMP. The global
+bus lock came off the virtio hot path: the device registry is immutable after init,
+so the bus lock now only guards lookup + simple self-locking devices, while each
+virtio `Device` carries its own `dev_lock` (vCPU<->vCPU) and a separate `irq_lock`
+(host<->vCPU interrupt state). The global order is now `dev_lock -> backend lock ->
+irq_lock`, with backends releasing their lock before `interruptQueue`; a
+50k-iteration concurrent test guards against deadlock/torn state. So concurrent vCPUs
+run in different devices in parallel, and a notify's host I/O no longer holds a
+global lock.
+
 ## D4 - virtio-gpu scope
 
-**Status:** open · **Recommendation:** 2D-only for core, or cut to a spike
+**Status:** RESOLVED -> 2D dumb-framebuffer in core, no virgl (option 1, shipped)
+
+`virtio_gpu.zig` implements exactly option 1: a minimal 2D virtio-gpu (device id 16)
+over the existing virtio-pci transport - GET_DISPLAY_INFO / RESOURCE_CREATE_2D /
+ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH / UNREF, all
+guest fields bounds-checked, no 3D/virgl host command parser. A stock Linux
+`virtio_gpu` DRM driver binds it (`/dev/fb0`, `/dev/dri/card0`) and the framebuffer
+is read live and emitted as a PPM (`__frame__`) with a tile-diff stream
+(`__framediff__`). The CVE-fountain 3D path stays out of core; if 3D is ever wanted
+it goes out-of-process behind a rutabaga-style boundary (option 2), not into core.
 
 virtio-gpu with 3D/virgl is a host-side GL/Vulkan command parser fed
 attacker-controlled buffers - historically a CVE fountain and bigger than the
@@ -106,7 +131,8 @@ Whatever the choice, it is explicit and not riding in on `rng`'s coattails.
 
 ## D5 - Test harness
 
-**Status:** open · **Recommendation:** kvm-unit-tests + serial golden + fuzz
+**Status:** partial -> fuzz-smoke built; unit suite at 181 tests; kvm-unit-tests +
+serial-golden layers still to stand up (not descoped)
 
 A VMM is the worst place to have no test story. Three layers, stood up early:
 
@@ -166,7 +192,9 @@ Update: the **userspace IOAPIC is now built** (`ioapic.zig`). Without it the gue
 read all-ones from 0xFEC00000 and disabled legacy IRQ routing, so serial (IRQ4)
 interrupts never fired and the tty console stalled after 16 FIFO bytes. The
 IOAPIC translates a redirection entry to an MSI on `raise(gsi)` and injects via
-`signalMsi`; serial raises IRQ4 on THR-empty/RX-ready. Live verification pending.
+`signalMsi`; serial raises IRQ4 on THR-empty/RX-ready. **Live-verified** on bare
+metal: the KVM guest boots to an interactive shell with serial IRQ4 firing and no
+16-byte FIFO stall (see D8).
 
 ## D8 - PVH bring-up gotchas (resolved, verified on KVM)
 
@@ -223,8 +251,11 @@ Consequences and rules going forward:
   backend fields. Arch-specific modules (PVH loader, IOAPIC) stay compiled but
   unused on the other backend; HVF keeps inert x86 boot-entry stubs so the shared
   `Vcpu` type and the PVH loader compile on macOS.
-- KVM stays the reference backend (the one with a live-verified boot). HVF lands
-  as a compiling scaffold first (every op returns Unimplemented), then fills in
-  over the aarch64 arc in [roadmap.md](roadmap.md). Both targets must stay green:
+- KVM is the *reference* backend (x86, the original live-verified PVH boot), but
+  HVF is now the *lead* backend in practice: it started as a compiling scaffold
+  (every op `Unimplemented`) and has since filled in completely over the aarch64 arc
+  - it is where SMP, snapshot/fork, the full control plane, and every platform pillar
+  were built and live-proven. The x86/KVM side now trails and gets the platform layer
+  ported back onto it (gated on an x86 host). Both targets stay green every commit:
   `zig build test` (native macOS, HVF path) and `zig build -Dtarget=x86_64-linux`
   (KVM path + binary).
