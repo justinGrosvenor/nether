@@ -1,0 +1,6 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Nether">
+  <title>Nether</title>
+  <rect width="32" height="32" rx="6" fill="#0A0B0D"/>
+  <path d="M7 12 L7 8 L25 8 L25 12" fill="none" stroke="#2BCEC0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="11" y="15" width="10" height="10" rx="1" fill="#E8E6E0"/>
+</svg>

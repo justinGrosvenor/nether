@@ -1,0 +1,98 @@
+/* nether docs theme: void + styx accent, matches the brand tokens */
+
+:root {
+  --nh-styx: #2bcec0;
+  --nh-styx-muted: rgba(43, 206, 192, 0.14);
+  --nh-ash: #e8e6e0;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color:           #0a0b0d;
+  --md-default-bg-color--light:    #14161a;
+  --md-default-bg-color--lighter:  #1b1e23;
+  --md-default-bg-color--lightest: #2a2d33;
+
+  --md-primary-fg-color:           #0a0b0d;
+  --md-primary-fg-color--light:    #14161a;
+  --md-primary-fg-color--dark:     #0a0b0d;
+  --md-primary-bg-color:           #e8e6e0;
+  --md-primary-bg-color--light:    #9a9ea6;
+
+  --md-accent-fg-color:            var(--nh-styx);
+  --md-accent-fg-color--transparent: var(--nh-styx-muted);
+  --md-accent-bg-color:            #0a0b0d;
+
+  --md-typeset-a-color:            var(--nh-styx);
+
+  --md-code-bg-color:              #14161a;
+  --md-code-fg-color:              #e8e6e0;
+
+  --md-footer-bg-color:            #0a0b0d;
+  --md-footer-bg-color--dark:      #07080a;
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #14161a;
+  --md-primary-bg-color: #f3f1ea;
+  --md-accent-fg-color:  #1b9e93;
+  --md-typeset-a-color:  #1b9e93;
+}
+
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid #2a2d33;
+}
+
+.md-header__title,
+.md-nav__title {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: -0.02em;
+  text-transform: lowercase;
+}
+
+[data-md-color-scheme="slate"] .md-typeset pre {
+  border: 1px solid #1e2127;
+  border-radius: 8px;
+}
+
+[data-md-color-scheme="slate"] .md-typeset pre > code,
+[data-md-color-scheme="slate"] .md-typeset :not(pre) > code {
+  background-color: #14161a;
+  color: #e8e6e0;
+}
+
+[data-md-color-scheme="slate"] .md-typeset table th,
+[data-md-color-scheme="slate"] .md-typeset table td,
+[data-md-color-scheme="slate"] .md-typeset hr {
+  border-color: #2a2d33;
+}
+
+[data-md-color-scheme="slate"] .md-nav__link--active,
+[data-md-color-scheme="slate"] .md-nav__item--active > .md-nav__link {
+  color: var(--nh-styx);
+}
+
+::selection {
+  background: var(--nh-styx-muted);
+  color: var(--nh-styx);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li {
+  border: 1px solid #1e2127;
+  background: #14161a;
+  border-radius: 10px;
+}
+
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--nh-styx);
+}
+
+/* boundary motif on the home hero */
+.nether-tagline {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.8125rem;
+  letter-spacing: 0.14em;
+  text-transform: lowercase;
+  color: var(--nh-styx);
+  margin-bottom: 1rem;
+}

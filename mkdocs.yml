@@ -1,0 +1,100 @@
+site_name: nether
+site_description: A type-2 hypervisor in Zig. Modern guests only. The isolation layer of the edge runtime.
+site_url: https://docs.nether.dev/
+repo_url: https://github.com/justinGrosvenor/nether
+repo_name: justinGrosvenor/nether
+edit_uri: edit/main/docs/
+copyright: Built in Zig. MIT licensed.
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.instant
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/nether.css
+
+extra:
+  social:
+    - icon: fontawesome/solid/globe
+      link: https://swerver.net
+      name: swerver (edge gateway)
+    - icon: fontawesome/brands/github
+      link: https://github.com/justinGrosvenor/nether
+      name: nether on GitHub
+
+exclude_docs: |
+  SESSION-HANDOFF.md
+  references/
+  README.md
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Running on KVM: running-on-kvm.md
+      - Running on HVF (Apple Silicon): running-on-hvf.md
+  - Guide:
+      - Source layout: architecture.md
+      - Sandbox policy: guide/sandbox-policy.md
+  - Operations:
+      - Bringup notes: bringup-notes.md
+      - Linux platform port: linux-platform-port.md
+  - About:
+      - Platform thesis: thesis.md
+      - Design: design.md
+      - Roadmap: roadmap.md
+      - Decisions: decisions.md
+      - Limitations: about/limitations.md

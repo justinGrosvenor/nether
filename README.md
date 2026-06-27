@@ -3,7 +3,7 @@
 A type-2 KVM-backed VMM in Zig. Modern guests only, no legacy hardware. Runs in
 the layer below the guest, hence the name.
 
-See [`docs/`](docs/README.md) for design, roadmap, and decisions.
+**Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)). Design, roadmap, and bringup guides live there.
 
 ## Status
 
