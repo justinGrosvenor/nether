@@ -1,8 +1,11 @@
 //! Deterministic fuzz-smoke for Nether's guest-facing parsers.
 //!
-//! Covered: the VT parser + screen grid, the virtqueue descriptor walk, and the
+//! Covered: the VT parser + screen grid, the virtqueue descriptor walk, the
 //! virtio-vsock / virtio-net / virtio-gpu device parsers (incl. the gpu control-queue
-//! commands and live framebuffer capture - the richest attacker-controlled input).
+//! commands and live framebuffer capture - the richest attacker-controlled input), and
+//! the I/O access surfaces: PCI config space (ECAM) and the virtio BAR MMIO regions, at
+//! every guest-chosen access width (incl. oversized). (The file-transfer reply parser
+//! is fuzzed in control.zig, where its Capture type lives.)
 //!
 //! These parse attacker-controlled bytes (a guest's serial output, and the
 //! descriptor rings a guest writes into shared memory), so the contract under
@@ -403,4 +406,34 @@ test "pci config space survives oversized and odd-width accesses" {
         }
         std.mem.doNotOptimizeAway(buf);
     }
+}
+
+// --- virtio BAR MMIO read surface ------------------------------------------
+
+// The guest reads the device BAR at any offset and width: common config (0..0x1000),
+// the ISR byte, the device-specific config region (-> backend.config_read, where the
+// oversized-read panic lived), the MSI-X table, and the PBA. Every region must answer
+// a read of width 1..8 without a safety trip. Reads have no notify side effects, so
+// this stays fast and focused on the audited read path.
+test "virtio BAR MMIO reads survive every offset and width" {
+    var ram: [4096]u8 = undefined;
+    @memset(&ram, 0);
+    var nb = net.Net{ .on_tx = netSink };
+    var dev = virtio.Device.init(nb.backend(), .{ .bytes = &ram, .base = 0 });
+    nb.attach(&dev);
+    var prng = std.Random.DefaultPrng.init(0xBA12_EAD);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 30000) : (i += 1) {
+        const off = rand.uintLessThan(u64, 0x6000); // spans common/isr/notify/cfg/msix/pba
+        const width: u8 = @intCast(1 + rand.uintLessThan(usize, 8)); // 1..8, incl. oversized
+        std.mem.doNotOptimizeAway(dev.barRead(off, width));
+        // Also fuzz the MSI-X table + common-config WRITE side (no notify -> no drain):
+        // pick a safe write region so we never kick a queue here.
+        if (rand.boolean()) {
+            const woff: u64 = if (rand.boolean()) rand.uintLessThan(u64, 0x1000) else 0x4000 + rand.uintLessThan(u64, 0x2000);
+            dev.barWrite(woff, width, rand.int(u32));
+        }
+    }
+    std.mem.doNotOptimizeAway(dev.isr);
 }

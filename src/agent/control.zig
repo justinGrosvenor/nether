@@ -1199,3 +1199,51 @@ test "command audit log ring wraps and keeps the lifetime total" {
     try testing.expect(std.mem.indexOf(u8, out, " cmd0\n") == null); // earliest dropped
     try testing.expect(std.mem.indexOf(u8, out, " cmd130\n") != null); // newest retained
 }
+
+test "Capture.feed survives hostile agent replies (GET + PUT, split chunks)" {
+    // The host-mediated transfer parses the GUEST AGENT's reply bytes (attacker
+    // controlled): a "OK <len>\n" header then a raw body for GET, a status line for
+    // PUT. Drive random and header-shaped replies in random chunk splits; assert no
+    // safety trip and that the completed GET body slice stays in bounds.
+    var prng = std.Random.DefaultPrng.init(0xCA97_07E);
+    const rand = prng.random();
+    var round: usize = 0;
+    while (round < 30000) : (round += 1) {
+        const is_get = (round & 1) == 0;
+        var gbuf: [512]u8 = undefined;
+        var cap = Capture{ .is_get = is_get, .buf = &gbuf };
+
+        // Build a reply: often header-shaped (real parser path), sometimes pure random.
+        var reply_buf: [900]u8 = undefined;
+        var rlen: usize = 0;
+        if (is_get and rand.boolean()) {
+            // "OK <flen>\n" + flen body bytes; flen sometimes exceeds the buffer cap
+            // (must be rejected), sometimes fits.
+            const flen = rand.uintLessThan(usize, 700);
+            const hdr = std.fmt.bufPrint(&reply_buf, "OK {d}\n", .{flen}) catch unreachable;
+            rlen = hdr.len;
+            const body = @min(flen, reply_buf.len - rlen);
+            rand.bytes(reply_buf[rlen..][0..body]);
+            rlen += body;
+        } else {
+            rlen = rand.uintLessThan(usize, reply_buf.len);
+            rand.bytes(reply_buf[0..rlen]);
+        }
+
+        // Feed in random-sized chunks until done or exhausted.
+        var off: usize = 0;
+        while (off < rlen and !cap.done.load(.acquire)) {
+            const chunk = 1 + rand.uintLessThan(usize, 17);
+            const end = @min(off + chunk, rlen);
+            cap.feed(reply_buf[off..end]);
+            off = end;
+        }
+
+        // Invariant: a completed, non-error GET yields an in-bounds body slice.
+        if (is_get and cap.done.load(.acquire) and !cap.err) {
+            try testing.expect(cap.body_off <= cap.expect);
+            try testing.expect(cap.expect <= gbuf.len);
+            std.mem.doNotOptimizeAway(cap.buf[cap.body_off..cap.expect]);
+        }
+    }
+}
