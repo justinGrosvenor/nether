@@ -5,12 +5,15 @@
 A **type-2 hypervisor** in pure [Zig](https://ziglang.org). Modern guests only: no SeaBIOS, no IDE, no legacy chipset emulation. Runs beneath the guest on hardware-assisted virtualization (KVM on Linux/x86-64, Apple Hypervisor.framework on aarch64).
 
 ```
-host (swerver) ──► nether ──► KVM / HVF ──► microVM
-                      │
-                      ├── egress firewall + budgets (when net enabled)
-                      ├── control plane + virtio-vsock
-                      └── snapshot → COW fork (HVF only, ~90ms)
+swerver (one binary, embeds nether) ──► KVM / HVF ──► microVM
+              │
+              ├── egress firewall + budgets (when net enabled)
+              ├── control plane + virtio-vsock
+              └── snapshot → COW fork (HVF only, ~90ms)
 ```
+
+The standalone `nether` executable in this repo is a dev/bringup wrapper around the
+embeddable core (`src/root.zig`). Production is swerver importing that library.
 
 !!! warning "Building"
     nether is past Phase 3 on Apple Silicon (Linux boots, virtio works, snapshots fork). The x86/KVM platform layer is wired and **verified on metal** for PVH boot, control plane, vsock, and watchdogs; remaining KVM gaps are virtio-net bring-up, SMP, snapshot/restore, and GPU. See [Roadmap](roadmap.md), [Linux platform port](linux-platform-port.md), and [Limitations](about/limitations.md).

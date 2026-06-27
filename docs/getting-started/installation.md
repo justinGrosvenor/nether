@@ -67,9 +67,15 @@ Expected smoke output (no kernel in cwd):
 
 Both end with `[nether] guest shutdown.`
 
-## Depend on nether as a library
+## Shipping shape: embedded in swerver
 
-nether exports an embeddable core from `src/root.zig`. The default binary in `src/main.zig` is a thin wrapper. [swerver](https://docs.swerver.net) is the intended host: allocator-injected, vsock and eventfds registered into swerver's `IoRuntime`.
+The edge runtime ships as **one binary**: [swerver](https://docs.swerver.net) imports
+embedded nether. The `nether` executable built from `src/main.zig` is a thin
+dev/bringup wrapper around the library in `src/root.zig` — useful for KVM/HVF
+smoke tests and platform work without rebuilding the gateway.
+
+In production, swerver owns the process: allocator-injected nether core, vsock and
+device eventfds registered into swerver's `IoRuntime`, per-VM-per-worker pinning.
 
 !!! note "Embedding API"
     The library surface is still stabilizing. See [Platform thesis](../thesis.md) for the integration contract and [Decisions](../decisions.md) D2 for the device split.

@@ -73,8 +73,9 @@ The no-old-hardware cut line:
   host I/O thread (today a blocking stdin reader feeding the serial RX; the
   target is one epoll/io_uring loop over eventfds: irqfd, ioeventfd, stdin,
   vsock). No async runtime.
-- **Embeddable core as a compile-time boundary.** The host (swerver, or the thin
-  default binary) is selected behind a seam, not referenced by the core; the core
+- **Embeddable core as a compile-time boundary.** Production is swerver importing
+  nether in one binary; the thin `main.zig` wrapper is for dev/bringup only. The
+  host is selected behind a seam, not referenced by the core; the core
   is planned to export both a Zig API and a C ABI from one build. See the apprt
   and one-library-two-ABIs patterns in
   [references/ghostty-patterns.md](references/ghostty-patterns.md).

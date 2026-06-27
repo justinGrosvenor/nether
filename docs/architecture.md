@@ -11,8 +11,8 @@ contract and new files land in the right place. This is the *map of the code*; t
 src/
   root.zig    the library root - the public API surface (nether.*); what main and
               embedders import. Re-exports the types each domain offers.
-  main.zig    the thin binary: per-OS boot orchestration (linuxMain / macBootLinux)
-              + the watchdogs. The one place that wires the domains together.
+  main.zig    dev/bringup binary wrapper: per-OS boot orchestration (linuxMain /
+              macBootLinux) + watchdogs. Production embeds via root.zig inside swerver.
   fuzz.zig    always-on fuzz-smoke over the guest-facing parsers (vt, virtq, vsock, net).
 
   common/     shared kernel - leaf utilities with no domain deps.

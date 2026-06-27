@@ -24,7 +24,10 @@ Snapshot save, rewind demo, and COW restore (`nether-restore` / `restore_from=`)
 
 ## Embedding
 
-The swerver integration (vsock spine, per-VM-per-worker, eventfd registration) is designed but not fully wired in production. nether runs standalone today.
+The shipping artifact is one swerver binary with embedded nether. The integration
+contract (vsock spine, per-VM-per-worker, eventfd registration into `IoRuntime`) is
+designed but not fully wired yet. The standalone `nether` executable remains for
+dev and bringup only.
 
 ## API stability
 
@@ -32,7 +35,8 @@ The library root (`src/root.zig`) and control protocol may change before 1.0. Do
 
 ## Platform
 
-nether is the **isolate + govern** layer. It does not replace a gateway (that's [swerver](https://docs.swerver.net)), billing rails (x402), or agent orchestration.
+nether is the **isolate + govern** layer inside the swerver binary. It does not own
+routing, TLS, or billing — those stay in swerver and x402 above the embed boundary.
 
 ## Roadmap
 

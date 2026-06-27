@@ -144,9 +144,9 @@ product shapes the core instead of being bolted on. The principle: **build the
 edge path forward of the general-VMM path**, but never ahead of the Phase 3
 done-line.
 
-- **Embeddable core from Phase 0.** Library + thin binary, allocator injected,
-  no process-global state, device I/O expressed as fds. Costs ~nothing now;
-  enables swerver to host Nether later. (Already true of the Phase 0 scaffold.)
+- **Embeddable core from Phase 0.** Library + thin dev binary, allocator injected,
+  no process-global state, device I/O expressed as fds. The shipping artifact is one
+  swerver binary that imports embedded nether. (Already true of the Phase 0 scaffold.)
   Make the host boundary a hard *compile-time* seam (not a convention) and plan
   the core to export both a Zig API and a C ABI from one build. See the apprt and
   one-library-two-ABIs patterns in
