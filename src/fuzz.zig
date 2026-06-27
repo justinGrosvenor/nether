@@ -1,5 +1,9 @@
 //! Deterministic fuzz-smoke for Nether's guest-facing parsers.
 //!
+//! Covered: the VT parser + screen grid, the virtqueue descriptor walk, and the
+//! virtio-vsock / virtio-net / virtio-gpu device parsers (incl. the gpu control-queue
+//! commands and live framebuffer capture - the richest attacker-controlled input).
+//!
 //! These parse attacker-controlled bytes (a guest's serial output, and the
 //! descriptor rings a guest writes into shared memory), so the contract under
 //! test is the security posture from docs/design.md: parsing ANY byte string
@@ -17,6 +21,7 @@ const virtq = @import("virtio/virtq.zig");
 const virtio = @import("virtio/virtio.zig");
 const vsock = @import("virtio/virtio_vsock.zig");
 const net = @import("virtio/virtio_net.zig");
+const gpu = @import("virtio/virtio_gpu.zig");
 
 // --- VT parser -------------------------------------------------------------
 
@@ -259,5 +264,107 @@ test "virtio-net survives hostile rings and frames" {
         const flen = rand.uintLessThan(usize, frame.len);
         rand.bytes(frame[0..flen]);
         feedNet(&ram, frame[0..flen]);
+    }
+}
+
+// --- virtio-gpu device -----------------------------------------------------
+
+// The control queue parses the richest attacker-controlled input in the tree: a
+// guest command chain whose header, resource ids, dimensions, scatter-gather backing
+// entry count, and entry addr/len are all guest-set. Then the capture path (frame /
+// frameDiff) reads the (possibly hostile) backing live. Every id/count/dim/address is
+// bounds-checked; a malformed command must process and capture without a safety trip.
+
+// Drive a single hostile command through the real notify -> gather -> dispatch ->
+// scatter -> complete path, then exercise the capture path against the state it left.
+fn feedGpuCmd(ram: []u8, cmd: []const u8) void {
+    @memset(ram, 0);
+    var g = gpu.Gpu{};
+    var dev = virtio.Device.init(g.backend(), .{ .bytes = ram, .base = 0 });
+    g.attach(&dev);
+    // A 2-descriptor chain on the control queue: desc0 -> readable command buffer
+    // (0x400), desc1 -> writable response buffer (0x800).
+    const clen: u32 = @intCast(@min(cmd.len, 0x400));
+    std.mem.writeInt(u64, ram[0x000..][0..8], 0x400, .little); // desc0.addr
+    std.mem.writeInt(u32, ram[0x008..][0..4], clen, .little); // desc0.len
+    std.mem.writeInt(u16, ram[0x00c..][0..2], 1, .little); // desc0.flags = NEXT
+    std.mem.writeInt(u16, ram[0x00e..][0..2], 1, .little); // desc0.next = 1
+    std.mem.writeInt(u64, ram[0x010..][0..8], 0x800, .little); // desc1.addr
+    std.mem.writeInt(u32, ram[0x018..][0..4], 256, .little); // desc1.len
+    std.mem.writeInt(u16, ram[0x01c..][0..2], 2, .little); // desc1.flags = WRITE
+    std.mem.writeInt(u16, ram[0x100..][0..2], 0, .little); // avail.flags
+    std.mem.writeInt(u16, ram[0x102..][0..2], 1, .little); // avail.idx
+    std.mem.writeInt(u16, ram[0x104..][0..2], 0, .little); // avail.ring[0] = head 0
+    @memcpy(ram[0x400..][0..clen], cmd[0..clen]);
+
+    dev.barWrite(0x16, 2, gpu.CONTROLQ);
+    dev.barWrite(0x18, 2, 8); // queue size
+    dev.barWrite(0x20, 4, 0x000); // desc
+    dev.barWrite(0x28, 4, 0x100); // avail
+    dev.barWrite(0x30, 4, 0x180); // used
+    dev.barWrite(0x1c, 2, 1); // enable
+    dev.barWrite(0x2000, 4, gpu.CONTROLQ); // kick: drain + dispatch the hostile command
+
+    // Capture against whatever (hostile) scanout/backing state the command left. Both
+    // bound to the passed buffers, so a huge guest dimension just yields 0.
+    var out: [16384]u8 = undefined;
+    var shadow: [4096]u8 = undefined;
+    std.mem.doNotOptimizeAway(g.frame(&out));
+    std.mem.doNotOptimizeAway(g.frameDiff(&shadow, &out));
+}
+
+// The real virtio-gpu command types; biasing cmd_type to these exercises the actual
+// per-command parsers (not just the ERR_UNSPEC default) with hostile field values.
+const GPU_CMDS = [_]u32{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x0300, 0x0301, 0xdead_beef };
+
+test "virtio-gpu survives header-shaped hostile commands + capture" {
+    var prng = std.Random.DefaultPrng.init(0x69_70_75);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 6000) : (i += 1) {
+        var cmd: [512]u8 = undefined;
+        const len = 24 + rand.uintLessThan(usize, cmd.len - 24); // always >= a full header
+        rand.bytes(cmd[0..len]);
+        // Bias the type to a real command so the actual parsers run; the 24-byte
+        // header and all command fields (ids, dims, nr_entries, entry addr/len) stay
+        // random/hostile.
+        std.mem.writeInt(u32, cmd[0..4], GPU_CMDS[rand.uintLessThan(usize, GPU_CMDS.len)], .little);
+        var ram: [4096]u8 = undefined;
+        feedGpuCmd(&ram, cmd[0..len]);
+    }
+}
+
+test "virtio-gpu survives fully hostile control/cursor rings" {
+    // Pure-random rings on BOTH queues (the control + cursor drain paths), exercising
+    // the descriptor walk + dispatch with no structure at all.
+    var prng = std.Random.DefaultPrng.init(0x6_C0_FF_EE);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var ram: [4096]u8 = undefined;
+        rand.bytes(&ram);
+        var g = gpu.Gpu{};
+        var dev = virtio.Device.init(g.backend(), .{ .bytes = &ram, .base = 0 });
+        g.attach(&dev);
+        // control queue 0: desc 0x000 / avail 0x100 / used 0x180
+        dev.barWrite(0x16, 2, gpu.CONTROLQ);
+        dev.barWrite(0x18, 2, 8);
+        dev.barWrite(0x20, 4, 0x000);
+        dev.barWrite(0x28, 4, 0x100);
+        dev.barWrite(0x30, 4, 0x180);
+        dev.barWrite(0x1c, 2, 1);
+        // cursor queue 1: desc 0x200 / avail 0x300 / used 0x380
+        dev.barWrite(0x16, 2, gpu.CURSORQ);
+        dev.barWrite(0x18, 2, 8);
+        dev.barWrite(0x20, 4, 0x200);
+        dev.barWrite(0x28, 4, 0x300);
+        dev.barWrite(0x30, 4, 0x380);
+        dev.barWrite(0x1c, 2, 1);
+        // Bound the avail indices so the drains stay cheap; the rest is random.
+        std.mem.writeInt(u16, ram[0x102..][0..2], rand.uintLessThan(u16, 16), .little);
+        std.mem.writeInt(u16, ram[0x302..][0..2], rand.uintLessThan(u16, 16), .little);
+        dev.barWrite(0x2000, 4, gpu.CONTROLQ);
+        dev.barWrite(0x2000, 4, gpu.CURSORQ);
+        std.mem.doNotOptimizeAway(dev.isr);
     }
 }
