@@ -42,6 +42,8 @@ pub const GET_REGS = ior(0x81, Regs);
 pub const SET_REGS = iow(0x82, Regs);
 pub const GET_SREGS = ior(0x83, Sregs);
 pub const SET_SREGS = iow(0x84, Sregs);
+pub const GET_MP_STATE = ior(0x98, MpState);
+pub const SET_MP_STATE = iow(0x99, MpState);
 
 pub const CHECK_EXTENSION = io(0x03);
 // kvm_cpuid2 is variable-length; the ioctl number encodes only the 8-byte header.
@@ -61,6 +63,21 @@ pub const CAP_SPLIT_IRQCHIP = 121;
 pub const IOEVENTFD_FLAG_DATAMATCH = 1 << 0;
 pub const IOEVENTFD_FLAG_PIO = 1 << 1;
 pub const IRQFD_FLAG_RESAMPLE = 1 << 1;
+
+// --- vCPU run-state (mp_state) ---------------------------------------------
+//
+// With an in-kernel LAPIC, KVM defaults the BSP to RUNNABLE and every AP to
+// UNINITIALIZED, so an AP parks inside KVM_RUN until the BSP's INIT then SIPI
+// walks it UNINITIALIZED -> INIT_RECEIVED -> RUNNABLE. Reading mp_state back is
+// the decisive SMP diagnostic: an AP still UNINITIALIZED/INIT_RECEIVED long
+// after boot means the SIPI never reached it; RUNNABLE/HALTED means it started.
+pub const MpState = extern struct { mp_state: u32 };
+
+pub const MP_STATE_RUNNABLE = 0;
+pub const MP_STATE_UNINITIALIZED = 1;
+pub const MP_STATE_INIT_RECEIVED = 2;
+pub const MP_STATE_HALTED = 3;
+pub const MP_STATE_SIPI_RECEIVED = 4;
 
 // --- exit reasons ----------------------------------------------------------
 
@@ -271,6 +288,8 @@ test "ioctl numbers match KVM ABI" {
     try std.testing.expectEqual(@as(u32, 0x4090AE82), SET_REGS);
     try std.testing.expectEqual(@as(u32, 0x8138AE83), GET_SREGS);
     try std.testing.expectEqual(@as(u32, 0x4138AE84), SET_SREGS);
+    try std.testing.expectEqual(@as(u32, 0x8004AE98), GET_MP_STATE);
+    try std.testing.expectEqual(@as(u32, 0x4004AE99), SET_MP_STATE);
 }
 
 test "struct sizes match kernel" {

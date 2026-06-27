@@ -419,7 +419,7 @@ fn linuxMain() !void {
     if (num_cpus > 1) {
         var ap: u32 = 1;
         while (ap < num_cpus) : (ap += 1) {
-            if (std.Thread.spawn(.{}, kvmApRun, .{ &vcpus[ap], &bus, &power, &ioapic })) |t| {
+            if (std.Thread.spawn(.{}, kvmApRun, .{ ap, &vcpus[ap], &bus, &power, &ioapic })) |t| {
                 t.detach();
             } else |err| {
                 std.debug.print("[nether] AP {d} thread failed: {s}\n", .{ ap, @errorName(err) });
@@ -438,9 +438,23 @@ fn linuxMain() !void {
 }
 
 /// A secondary (AP) vCPU run loop on the KVM path: just enter KVM_RUN; the guest's
-/// INIT/SIPI (via KVM's LAPIC) starts it. Errors/halts end this thread only.
-fn kvmApRun(vcpu: *nether.Vcpu, bus: *nether.Bus, power: *nether.Power, apic: *nether.IoApic) void {
-    _ = vcpu.run(bus, power, apic) catch {};
+/// INIT/SIPI (via KVM's LAPIC) starts it. Errors/halts end this thread only. The
+/// outcome is logged per-AP: a clean `.halted` is the AP idling after it came up,
+/// while an error (or no log at all, meaning the thread is still parked in KVM_RUN
+/// waiting for a SIPI that never arrived) is the signature of an AP that failed to
+/// boot - the decisive signal for diagnosing SMP bring-up on metal.
+fn kvmApRun(ap_id: u32, vcpu: *nether.Vcpu, bus: *nether.Bus, power: *nether.Power, apic: *nether.IoApic) void {
+    // Read once on this thread before entering KVM_RUN: an AP that parked
+    // correctly reads UNINITIALIZED (1). If it then never logs a stop, the SIPI
+    // never arrived; if it stops/errors, the AP started but failed downstream.
+    if (vcpu.mpState()) |mp| {
+        std.debug.print("[nether] AP {d} pre-run mp_state={d}\n", .{ ap_id, mp });
+    } else |_| {}
+    if (vcpu.run(bus, power, apic)) |reason| {
+        std.debug.print("[nether] AP {d} stopped: {s}\n", .{ ap_id, @tagName(reason) });
+    } else |err| {
+        std.debug.print("[nether] AP {d} error: {s}\n", .{ ap_id, @errorName(err) });
+    }
 }
 
 /// Web console input sink: deliver browser keystrokes to the serial RX (the same

@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Same libc dependency as the exe: root.zig pulls in the slirp/control/host
+    // paths that call the C socket/file APIs. macOS auto-links libc for native
+    // tests, but a Linux host's test link needs it spelled out explicitly.
+    tests.root_module.link_libc = true;
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run ABI/layout tests");
     test_step.dependOn(&run_tests.step);

@@ -141,6 +141,15 @@ pub const Vcpu = struct {
         }
         _ = try kvm.ioctl(fd, kvm.SET_CPUID2, @intFromPtr(&cpuid));
 
+        // APs park until the guest's INIT/SIPI. KVM already defaults APs to
+        // UNINITIALIZED when the LAPIC is in-kernel, but we set it explicitly so
+        // the contract is in the code (and holds regardless of KVM's default):
+        // the AP thread's KVM_RUN then blocks until the BSP walks it to RUNNABLE.
+        if (id != 0) {
+            var mp = kvm.MpState{ .mp_state = kvm.MP_STATE_UNINITIALIZED };
+            _ = try kvm.ioctl(fd, kvm.SET_MP_STATE, @intFromPtr(&mp));
+        }
+
         const size = try kvm.ioctl(kvm_fd, kvm.GET_VCPU_MMAP_SIZE, 0);
         const addr = try sys(linux.mmap(
             null,
@@ -161,6 +170,14 @@ pub const Vcpu = struct {
     pub fn deinit(self: *Vcpu) void {
         _ = linux.munmap(self.run_mem.ptr, self.run_mem.len);
         _ = linux.close(self.fd);
+    }
+
+    /// Read the vCPU's run-state (kvm.MP_STATE_*). Cheap, and only meaningful from
+    /// this vCPU's own thread; used to confirm an AP parked UNINITIALIZED for SIPI.
+    pub fn mpState(self: *Vcpu) Error!u32 {
+        var mp: kvm.MpState = undefined;
+        _ = try kvm.ioctl(self.fd, kvm.GET_MP_STATE, @intFromPtr(&mp));
+        return mp.mp_state;
     }
 
     /// Put the vCPU in 16-bit real mode with execution starting at `ip`. CS base

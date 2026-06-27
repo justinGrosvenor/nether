@@ -4,6 +4,10 @@ zig-out/
 .venv/
 .idea/
 kernels/
+artifacts/
+vmlinux
+initramfs
+disk.img
 nether-trace
 nether-web
 nether-vsock
