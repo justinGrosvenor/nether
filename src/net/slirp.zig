@@ -12,7 +12,7 @@
 //! guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3, /24.
 
 const std = @import("std");
-const Lock = @import("common/lock.zig").Lock;
+const Lock = @import("../common/lock.zig").Lock;
 
 // Host BSD sockets for outbound NAT (no privilege required). Portable libc; the
 // NAT path only runs on the macOS/HVF net path, but the bindings compile anywhere.
@@ -231,7 +231,7 @@ pub const Slirp = struct {
 
     // Unified event journal (the cross-cutting timeline); net flows are mirrored here
     // as NET events alongside their detailed entry in flow_log above.
-    journal: ?*@import("agent/audit.zig").Journal = null,
+    journal: ?*@import("../agent/audit.zig").Journal = null,
 
     /// Record one egress destination + the firewall verdict into the audit ring.
     fn recordFlow(self: *Slirp, proto: FlowProto, ip: *const [4]u8, port: u16, allowed: bool) void {

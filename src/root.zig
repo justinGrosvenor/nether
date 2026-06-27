@@ -60,7 +60,7 @@ pub const console = @import("virtio/virtio_console.zig");
 pub const VirtioConsole = console.Console;
 pub const VirtioGpu = @import("virtio/virtio_gpu.zig").Gpu;
 pub const smp = @import("smp.zig");
-pub const slirp = @import("slirp.zig");
+pub const slirp = @import("net/slirp.zig");
 pub const Slirp = slirp.Slirp;
 pub const vsock = @import("virtio/virtio_vsock.zig");
 pub const Vsock = vsock.Vsock;
@@ -95,7 +95,7 @@ test {
     _ = @import("virtio/virtio_console.zig");
     _ = @import("virtio/virtio_gpu.zig");
     _ = @import("smp.zig");
-    _ = @import("slirp.zig");
+    _ = @import("net/slirp.zig");
     _ = @import("agent/control.zig");
     _ = @import("agent/audit.zig");
     _ = @import("agent/snapshot.zig"); // snapshot file-format validation (mac path)
