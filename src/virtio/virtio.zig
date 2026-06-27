@@ -260,10 +260,23 @@ pub const Device = struct {
                 const e = self.msix_table[vec];
                 trace.log("msi q={d} vec={d} addr=0x{x} data=0x{x}", .{ q, vec, e.addr, e.data });
                 if (self.msi_fn) |f| f(self.msi_ptr.?, e.addr, e.data);
+            } else {
+                // MSI-X on, but this queue has no usable vector (unassigned or
+                // masked): the interrupt is lost. A driver that enabled MSI-X but
+                // didn't program this queue's vector will hang waiting on it - the
+                // "device enumerates but never works" signature. Trace the drop.
+                trace.log("msi DROP q={d} vec={d} masked={}", .{ q, vec, vec < num_vectors and self.msix_table[vec].ctrl & 1 != 0 });
             }
         } else {
             if (self.irq_fn) |f| f(self.irq_ptr.?);
-            if (self.intx_fn) |f| f(self.intx_ptr.?, true); // INTx level high
+            if (self.intx_fn) |f| {
+                f(self.intx_ptr.?, true); // INTx level high
+            } else {
+                // No INTx wiring (e.g. the KVM path, which has no userspace IOAPIC
+                // GSI routing): a device that fell back from MSI-X to legacy INTx
+                // gets no interrupt at all. Trace the drop so this is not silent.
+                trace.log("intx DROP q={d} (no intx_fn; msix disabled)", .{q});
+            }
         }
     }
 
@@ -302,6 +315,11 @@ pub const Device = struct {
             if (value == 0xFFFFFFFF) self.probe_hi = true else {
                 self.bar1 = value;
                 self.probe_hi = false;
+                // The full 64-bit base the guest programmed. If this differs from
+                // the boot-logged pre-assigned BAR, the bus's captured MMIO range
+                // (mmio() snapshots barBase() once) no longer covers the device and
+                // its config writes go nowhere - a candidate for "net never set up".
+                trace.log("bar64=0x{x}", .{(@as(u64, self.bar1) << 32) | self.bar0});
             }
         } else if (reg == cap_msix + 2) {
             // MSI-X message control: bit 15 enable, bit 14 function mask.
@@ -421,7 +439,10 @@ pub const Device = struct {
                 self.driver_features = (self.driver_features & ~mask) | (@as(u64, value) << shift);
                 trace.log("driver_feature[{d}]=0x{x}", .{ self.driver_feature_select, value });
             },
-            0x10 => self.config_vector = @truncate(value),
+            0x10 => {
+                self.config_vector = @truncate(value);
+                trace.log("config_vector={d}", .{self.config_vector});
+            },
             0x14 => {
                 self.status = @truncate(value);
                 trace.log("status=0x{x}", .{self.status});
@@ -447,6 +468,7 @@ pub const Device = struct {
                 self.irq_lock.lock();
                 self.queue_vector[s] = @truncate(value);
                 self.irq_lock.unlock();
+                trace.log("queue[{d}] vector={d}", .{ s, @as(u16, @truncate(value)) });
             },
             0x1c => {
                 // Refuse to enable a queue whose size isn't valid (defense in depth
@@ -612,6 +634,46 @@ test "MSI-X delivers a queue completion to the programmed vector" {
     dev.barWrite(msix_off + 16 + 12, 4, 1); // mask entry 1
     dev.interruptQueue(0);
     try std.testing.expectEqual(@as(u32, 1), sink.hits);
+}
+
+test "MSI-X enabled but queue without a vector drops the interrupt (sets ISR only)" {
+    // The "device enumerates but never works" signature: a driver enables MSI-X but
+    // the queue has no usable vector, so interruptQueue must NOT fire an MSI (and must
+    // not crash). The completion is lost; only the ISR byte records it.
+    var ram = [_]u8{0} ** 64;
+    const Noop = struct {
+        fn notify(p: *anyopaque, d: *Device, q: u16) void {
+            _ = p;
+            _ = d;
+            _ = q;
+        }
+        fn cfg(p: *anyopaque, o: u16, s: u8) u32 {
+            _ = p;
+            _ = o;
+            _ = s;
+            return 0;
+        }
+    };
+    var dummy: u8 = 0;
+    var dev = Device.init(.{ .ptr = &dummy, .device_id = 1, .num_queues = 2, .device_features = 0, .notify = Noop.notify, .config_read = Noop.cfg }, .{ .bytes = &ram, .base = 0 });
+
+    const Sink = struct {
+        hits: u32 = 0,
+        fn send(p: *anyopaque, addr: u64, data: u32) void {
+            _ = addr;
+            _ = data;
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.hits += 1;
+        }
+    };
+    var sink = Sink{};
+    dev.msi_ptr = &sink;
+    dev.msi_fn = Sink.send;
+
+    dev.cfgWrite(cap_msix + 2, 2, 0x8000); // MSI-X enable, but no queue_msix_vector programmed
+    dev.interruptQueue(0); // queue 0 still at no_vector
+    try std.testing.expectEqual(@as(u32, 0), sink.hits); // dropped, not delivered
+    try std.testing.expectEqual(@as(u32, 1), dev.barRead(isr_off, 4) & 1); // but ISR recorded it
 }
 
 fn irqHammer(dev: *Device, n: usize) void {
