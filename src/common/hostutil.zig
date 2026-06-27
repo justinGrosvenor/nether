@@ -87,9 +87,12 @@ const RuTimeval = if (builtin.os.tag == .macos)
     extern struct { sec: i64 = 0, usec: i32 = 0 }
 else
     extern struct { sec: i64 = 0, usec: i64 = 0 };
+// ru_maxrss is the 3rd field (offset 2*sizeof(timeval) = 32 on both ABIs), a `long`.
+// UNITS DIFFER: bytes on macOS, kilobytes on Linux - converted to MB per-OS below.
 const Rusage = extern struct {
     utime: RuTimeval = .{},
     stime: RuTimeval = .{},
+    maxrss: i64 = 0,
     tail: [256]u8 = [_]u8{0} ** 256,
 };
 extern "c" fn getrusage(who: c_int, usage: *Rusage) c_int;
@@ -105,6 +108,18 @@ pub fn processCpuMs() u64 {
     const s = ru.stime.sec * 1000 + @divTrunc(@as(i64, ru.stime.usec), 1000);
     const total = u + s;
     return if (total < 0) 0 else @intCast(total);
+}
+
+/// Peak resident memory of the whole nether process, in MB. The guest's RAM is a host
+/// mmap, so pages the guest touches fault in and count toward RSS - this is the
+/// sandbox's actual memory high-water mark (vs ram_mb, which is only the cap). ru_maxrss
+/// is bytes on macOS, kilobytes on Linux; both normalized to MB.
+pub fn processMaxRssMb() u64 {
+    var ru: Rusage = .{};
+    if (getrusage(0, &ru) != 0) return 0; // RUSAGE_SELF = 0
+    if (ru.maxrss <= 0) return 0;
+    const rss: u64 = @intCast(ru.maxrss);
+    return if (builtin.os.tag == .macos) rss / (1024 * 1024) else rss / 1024;
 }
 
 /// Write all of `buf` to `fd` (returns false on a short/failed write).
@@ -170,4 +185,13 @@ test "processCpuMs is monotonic and advances under load" {
     const after = processCpuMs();
     try std.testing.expect(after >= before); // never goes backward
     try std.testing.expect(after > 0); // the burn registered some CPU time
+}
+
+test "processMaxRssMb reports a plausible resident footprint" {
+    // The test process is resident, so peak RSS is positive; the per-OS unit
+    // conversion (bytes on macOS, KB on Linux) must land in a sane MB range, not the
+    // raw bytes/KB value (which would be absurdly large if the units were mishandled).
+    const mb = processMaxRssMb();
+    try std.testing.expect(mb > 0);
+    try std.testing.expect(mb < 1024 * 1024); // < 1 TiB: catches a units mistake
 }

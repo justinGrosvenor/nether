@@ -50,6 +50,7 @@ pub const Metering = struct {
             \\uptime_ms={d}
             \\cpu_ms={d}
             \\ram_mb={d}
+            \\mem_peak_mb={d}
             \\cpus={d}
             \\commands={d}
             \\bytes_in={d}
@@ -63,6 +64,7 @@ pub const Metering = struct {
             nowMs() - self.start_ms,
             hostutil.processCpuMs(),
             self.ram_mb,
+            hostutil.processMaxRssMb(),
             self.cpus,
             self.commands.load(.acquire),
             self.bytes_in.load(.acquire),
