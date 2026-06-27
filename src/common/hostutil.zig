@@ -78,6 +78,35 @@ pub fn nowMs() i64 {
     return tv.sec * 1000 + @divTrunc(tv.usec, 1000);
 }
 
+// struct rusage begins with two timevals (ru_utime, ru_stime); the many `long`
+// fields after them we don't read. The timeval's usec is i32 on macOS (suseconds_t)
+// and i64 on Linux, but both pad to 16 bytes, so ru_stime lands at offset 16 on both
+// - the layout matches each ABI. `tail` absorbs the remainder of the kernel's write
+// (struct rusage is ~144 bytes; getrusage fills it whole) so we never overflow.
+const RuTimeval = if (builtin.os.tag == .macos)
+    extern struct { sec: i64 = 0, usec: i32 = 0 }
+else
+    extern struct { sec: i64 = 0, usec: i64 = 0 };
+const Rusage = extern struct {
+    utime: RuTimeval = .{},
+    stime: RuTimeval = .{},
+    tail: [256]u8 = [_]u8{0} ** 256,
+};
+extern "c" fn getrusage(who: c_int, usage: *Rusage) c_int;
+
+/// Total CPU time (user + system) the whole nether process has used, in ms. One
+/// nether process is one sandbox, so this is the sandbox's compute cost - a reliable,
+/// kernel-accounted signal that advances for native compute-bound guests (unlike the
+/// per-vCPU exec-time API, which under-counts). POSIX, so it works on both backends.
+pub fn processCpuMs() u64 {
+    var ru: Rusage = .{};
+    if (getrusage(0, &ru) != 0) return 0; // RUSAGE_SELF = 0
+    const u = ru.utime.sec * 1000 + @divTrunc(@as(i64, ru.utime.usec), 1000);
+    const s = ru.stime.sec * 1000 + @divTrunc(@as(i64, ru.stime.usec), 1000);
+    const total = u + s;
+    return if (total < 0) 0 else @intCast(total);
+}
+
 /// Write all of `buf` to `fd` (returns false on a short/failed write).
 pub fn writeAll(fd: c_int, buf: []const u8) bool {
     var off: usize = 0;
@@ -129,4 +158,16 @@ pub fn cpath(buf: []u8, p: []const u8) ?[*:0]const u8 {
     @memcpy(buf[0..p.len], p);
     buf[p.len] = 0;
     return @ptrCast(buf.ptr);
+}
+
+test "processCpuMs is monotonic and advances under load" {
+    const before = processCpuMs();
+    // Burn measurable CPU in-thread; doNotOptimizeAway keeps the loop from folding.
+    var acc: u64 = 0;
+    var i: u64 = 0;
+    while (i < 80_000_000) : (i += 1) acc +%= i *% 2654435761;
+    std.mem.doNotOptimizeAway(acc);
+    const after = processCpuMs();
+    try std.testing.expect(after >= before); // never goes backward
+    try std.testing.expect(after > 0); // the burn registered some CPU time
 }

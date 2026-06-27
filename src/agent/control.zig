@@ -48,6 +48,7 @@ pub const Metering = struct {
         return (std.fmt.bufPrint(buf,
             \\nether sandbox stats
             \\uptime_ms={d}
+            \\cpu_ms={d}
             \\ram_mb={d}
             \\cpus={d}
             \\commands={d}
@@ -60,6 +61,7 @@ pub const Metering = struct {
             \\
         , .{
             nowMs() - self.start_ms,
+            hostutil.processCpuMs(),
             self.ram_mb,
             self.cpus,
             self.commands.load(.acquire),
