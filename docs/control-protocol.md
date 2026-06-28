@@ -134,3 +134,21 @@ the platform always gets a complete, machine-readable accounting from the proces
 inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap),
 `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb` (sizing). All
 are reported back by `__info__` so a client can verify what it got.
+
+## Snapshot / fork limitation (read before building snapshot-fork)
+
+A **freshly booted** sandbox exposes the full control plane above. A **snapshot-restored
+(forked)** sandbox currently does **not**: the restore path resumes only the captured guest
+devices (console + virtio-blk) and does **not** re-establish the control socket, the
+vsock/agent channel, or any host-side platform state. So a forked sandbox is **not
+driveable over the control protocol** today - it has no control socket to connect to. A
+platform that spawns a restore with `control_socket=` set and waits for the socket would
+wait forever; the restore logs an explicit NOTE saying so.
+
+Three things are needed for snapshot-fork driveability, none yet built: (1) the snapshot
+format must capture vsock (and net) device state, not just console + blk; (2) the restore
+path must wire the control plane (control socket, vsock-in-agent-mode, `Core`, the stop)
+the way the boot path does; (3) the in-guest agent must detect the dead-across-fork vsock
+connection and reconnect to the fresh host listener. Until then, **drive each sandbox from
+a fresh boot** (the e2e's D1 model), not from a fork. Snapshot-fork remains valid as a
+fast guest-resume primitive (HVF, ~90 ms) - it just is not yet wired to the control plane.

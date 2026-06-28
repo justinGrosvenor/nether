@@ -13,6 +13,7 @@
 const std = @import("std");
 const nether = @import("../root.zig");
 const hostutil = @import("../common/hostutil.zig");
+const conf = @import("../common/conf.zig");
 const armdev = @import("armdev.zig");
 
 const libc = hostutil.libc;
@@ -462,6 +463,19 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| t.detach() else |_| {}
 
     std.debug.print("[nether] RESTORED from {s}: {d} cpus, {d} MiB RAM, gic {d}B. Resuming the forked guest.\n", .{ path, num_cpus, ram_size / (1024 * 1024), gic_size });
+    // KNOWN LIMITATION: a forked guest is console + virtio-blk only. The restore path
+    // does NOT re-establish the platform control plane (no control socket, no vsock/agent
+    // channel), and the snapshot format does not yet capture vsock/net device state. So a
+    // platform that set `control_socket` and waits for it would wait forever - say so,
+    // rather than leave the missing socket a silent mystery. Full snapshot-fork
+    // driveability (capture vsock/net state + wire the control plane here + guest-agent
+    // reconnect) is tracked in docs/control-protocol.md and SESSION-HANDOFF.md.
+    var sock_buf: [256]u8 = undefined;
+    if (conf.confGet("control_socket", &sock_buf) != null or conf.modeOn("control", "nether-control")) {
+        std.debug.print("[nether] restore: NOTE the control plane is NOT active on a forked guest yet " ++
+            "(console + virtio-blk only; no control socket / vsock / agent). Snapshot-fork " ++
+            "driveability over the control protocol is not implemented.\n", .{});
+    }
     go.store(true, .release); // release secondaries; run cpu0
     const reason = vcpu.runSmp(&bus, &power, null, null) catch |err| {
         std.debug.print("\n[nether] forked guest stopped: {s}\n", .{@errorName(err)});
