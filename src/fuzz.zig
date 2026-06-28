@@ -2,7 +2,9 @@
 //!
 //! Covered: the VT parser + screen grid, the virtqueue descriptor walk, the
 //! virtio-vsock / virtio-net / virtio-gpu device parsers (incl. the gpu control-queue
-//! commands and live framebuffer capture - the richest attacker-controlled input), and
+//! commands and live framebuffer capture - the richest attacker-controlled input), the
+//! snapshot vsock engine-state validator (an operator-supplied base file: validState must
+//! gate every byte pattern so import + drain stays in bounds), and
 //! the I/O access surfaces: PCI config space (ECAM) and the virtio BAR MMIO regions, at
 //! every guest-chosen access width (incl. oversized); the slirp user-mode network stack
 //! (guest frames: Ethernet/ARP/IPv4/ICMP/UDP/DHCP/TCP, with a deny-all firewall so no
@@ -221,6 +223,50 @@ test "vsock engine survives header-shaped fuzz" {
         h.encode(buf[0..vsock.HDR_LEN]);
         rand.bytes(buf[vsock.HDR_LEN..][0..payload]);
         feedVsock(&vs, buf[0 .. vsock.HDR_LEN + payload]);
+    }
+}
+
+// --- vsock snapshot engine state -------------------------------------------
+
+// A restored base snapshot carries the vsock engine State (connection table, listen
+// registry, staging ring) read RAW from an operator-supplied file - a base that is
+// truncated, bit-flipped, or version-drifted on disk. validState gates it before import;
+// the security contract is that validState(s)==true IMPLIES importing it and then
+// draining / operating the engine stays in bounds (the ring indices feed direct out[]
+// access in peekOut/pushOut and each len slices buf[0..len]). So: feed an arbitrary State,
+// a rejected one is a no-op, and an accepted one must import + fully drain + take host
+// actions (which index conns[]/out[]) without a safety trip.
+fn feedVsockState(st: *const vsock.Vsock.State) void {
+    if (!vsock.Vsock.validState(st)) return; // a corrupt base is refused before import
+    var eng = vsock.Vsock{ .guest_cid = 3 };
+    eng.importState(st);
+    var guard: usize = 0;
+    while (eng.peekOut()) |pkt| { // drain the staging ring; must stay in bounds
+        std.mem.doNotOptimizeAway(pkt.len);
+        eng.popOut();
+        guard += 1;
+        if (guard > 4 * 64) break; // out_count <= OUT_RING after validState; backstop
+    }
+    std.mem.doNotOptimizeAway(eng.send(0, "x")); // host actions index conns[]/out[]
+    std.mem.doNotOptimizeAway(eng.pendingOut());
+    eng.close(0);
+}
+
+test "vsock snapshot state import stays in bounds under validState" {
+    // Target the validity-relevant fields directly (the staging ring control words and
+    // packet lengths), spanning valid AND invalid ranges, so both the reject path and
+    // the accept-then-drain path are exercised cheaply (the full State is ~200 KiB; we
+    // don't randomize all of it here - the coverage-guided entry below does that).
+    var prng = std.Random.DefaultPrng.init(0x5A_AF_11_5E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        var st = vsock.Vsock.State{ .guest_cid = 3 };
+        st.out_head = rand.uintLessThan(usize, 128); // 0..127: spans valid (<64) and OOB (>=64)
+        st.out_tail = rand.uintLessThan(usize, 128);
+        st.out_count = rand.uintLessThan(usize, 128);
+        for (&st.out) |*p| p.len = rand.uintLessThan(u32, 8192); // spans valid (<=PKT_CAP) and over
+        feedVsockState(&st);
     }
 }
 
@@ -614,6 +660,18 @@ test "fuzz: vsock engine" {
             var vs = vsock.Vsock{ .guest_cid = 3 };
             _ = vs.listen(1024);
             feedVsock(&vs, buf[0..n]);
+        }
+    }.one, .{});
+}
+
+test "fuzz: vsock snapshot state" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            // Fill the ENTIRE engine State with attacker bytes (the whole on-disk image),
+            // then run it through the validate -> import -> drain contract.
+            var st: vsock.Vsock.State = undefined;
+            smith.bytes(std.mem.asBytes(&st));
+            feedVsockState(&st);
         }
     }.one, .{});
 }
