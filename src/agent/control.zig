@@ -1056,6 +1056,82 @@ test "peerUid returns the owner uid for a local socketpair" {
     try testing.expectEqual(libc.getuid(), peer.?);
 }
 
+// The control protocol is the integration contract (docs/control-protocol.md). This
+// pins the host-intercepted surface a client like swerver builds against: the replies,
+// the proto version, and the primary-vs-observer gate. It drives controlCommand over a
+// socketpair (no live guest needed - none of the tested commands touch the guest path).
+test "control protocol: introspection replies, versioning, observer gating" {
+    var core = Core{};
+    core.init(512, 4, 0); // ram_mb, cpus, max_output; emits the "boot" journal event
+    var dummy_vsdev: nether.VsockDev = undefined; // host-intercepted cmds never deref it
+
+    const Spy = struct {
+        stopped: bool = false,
+        fn stop(p: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.stopped = true;
+        }
+    };
+    var spy = Spy{};
+    var ctx = ControlCtx{
+        .vsdev = &dummy_vsdev,
+        .agent = &core.agent,
+        .meter = &core.meter,
+        .path = "/tmp/nether-test-unused.sock",
+        .pipe_r = -1,
+        .allocator = testing.allocator,
+        .stop = .{ .ctx = &spy, .func = Spy.stop },
+        .journal = &core.journal,
+        .info = .{ .cpus = 4, .ram_mb = 512 },
+    };
+
+    var fds: [2]c_int = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    const w = fds[1];
+    var rbuf: [8192]u8 = undefined;
+    // controlCommand writes the whole (small) reply synchronously before we read, so a
+    // single read returns it all.
+    const drain = struct {
+        fn d(fd: c_int, b: []u8) []const u8 {
+            const n = libc.read(fd, b.ptr, b.len);
+            return if (n > 0) b[0..@intCast(n)] else b[0..0];
+        }
+    }.d;
+
+    // __info__: versioned capabilities.
+    controlCommand(&ctx, w, "__info__\n", true);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "proto_version=1") != null);
+
+    // __help__: discoverable command list with the version banner.
+    controlCommand(&ctx, w, "__help__\n", true);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "control protocol v1") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "__shutdown__") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "__put__") != null);
+    }
+
+    // __stats__: the metered dimensions.
+    controlCommand(&ctx, w, "__stats__\n", true);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "cpu_ms=") != null);
+
+    // __events__: the journal's boot lifecycle event is visible.
+    controlCommand(&ctx, w, "__events__\n", true);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "LIFE boot") != null);
+
+    // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire.
+    controlCommand(&ctx, w, "__shutdown__\n", false);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "ERR read-only observer") != null);
+    try testing.expect(!spy.stopped);
+
+    // Primary may: acked, and the injected stop fires exactly once here.
+    controlCommand(&ctx, w, "__shutdown__\n", true);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "OK shutting down") != null);
+    try testing.expect(spy.stopped);
+}
+
 test "output cap suppresses body past the limit but always forwards the trailer" {
     var fds: [2]c_int = undefined;
     try testing.expect(libc.pipe(&fds) == 0);
