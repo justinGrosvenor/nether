@@ -56,6 +56,12 @@ pub const SnapCtx = struct {
     vs_dev: ?*nether.virtio.Device = null,
     vsock: ?*nether.Vsock = null,
     agent: ?*control.AgentCtx = null,
+    // virtio-net transport state, present when the snapshotted sandbox ran with net=1.
+    // Only the DEVICE (virtqueue) state is captured so the guest's NIC driver resumes
+    // coherently; the slirp NAT engine starts fresh on restore (it holds real host
+    // sockets a fork cannot inherit, so the guest re-establishes its flows at the TCP
+    // level). Null => the fork has no NIC.
+    net_dev: ?*nether.virtio.Device = null,
 };
 
 fn countDiff(a: []const u8, b: []const u8) u64 {
@@ -193,13 +199,15 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
     const vs_dev_snap: ?nether.virtio.Device.DeviceState = if (has_ctl) ctx.vs_dev.?.exportState() else null;
     const vsock_snap: ?nether.Vsock.State = if (has_ctl) ctx.vsock.?.exportState() else null;
     const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
+    // virtio-net transport (device-only; the slirp engine restarts fresh on the fork).
+    const net_dev_snap: ?nether.virtio.Device.DeviceState = if (ctx.net_dev) |nd| nd.exportState() else null;
     sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
     std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), giclen, n });
 
     // --- SAVE-TO-FILE mode: serialize the fork source and keep running. -----
     if (ctx.save) {
-        const ok = writeSnapshotFile("nether.snap", ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], disk_snap, vs_dev_snap, vsock_snap, conn_id_snap);
-        std.debug.print("[nether] snapshot {s} to nether.snap ({d} MiB + state, control-plane={s}); guest continues. Run `nether restore` to fork it.\n", .{ if (ok) "written" else "FAILED writing", ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent" });
+        const ok = writeSnapshotFile("nether.snap", ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], disk_snap, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
+        std.debug.print("[nether] snapshot {s} to nether.snap ({d} MiB + state, control-plane={s}, net={s}); guest continues. Run `nether restore` to fork it.\n", .{ if (ok) "written" else "FAILED writing", ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
         ctx.allocator.free(ram_snap);
         ctx.allocator.free(disk_snap);
         return;
@@ -278,6 +286,7 @@ fn writeSnapshotFile(
     vs_dev: ?nether.virtio.Device.DeviceState, // vsock transport state (null => no control plane)
     vsock: ?nether.Vsock.State, // vsock engine state
     conn_id: i32, // surviving agent connection id (-1 if none)
+    net_dev: ?nether.virtio.Device.DeviceState, // virtio-net transport state (null => no NIC)
 ) bool {
     const O_WRONLY = 0x0001;
     const O_CREAT = 0x0200;
@@ -287,7 +296,10 @@ fn writeSnapshotFile(
     defer _ = libc.close(fd);
 
     const ctl = vs_dev != null and vsock != null;
-    const ctl_bytes: usize = if (ctl) @sizeOf(nether.virtio.Device.DeviceState) + @sizeOf(nether.Vsock.State) else 0;
+    const net = net_dev != null;
+    const dev_sz: usize = @sizeOf(nether.virtio.Device.DeviceState);
+    const eng_sz: usize = @sizeOf(nether.Vsock.State);
+    const ctl_bytes: usize = (if (ctl) dev_sz + eng_sz else 0) + (if (net) dev_sz else 0);
 
     // The metadata precedes a page-aligned RAM region (so RAM can be mmap'd COW).
     const meta = HDR_SIZE + cpus.len * @sizeOf(@TypeOf(cpus[0])) + @sizeOf(@TypeOf(con)) +
@@ -314,6 +326,9 @@ fn writeSnapshotFile(
     std.mem.writeInt(u32, hdr[64..68], if (ctl) @as(u32, 1) else 0, .little);
     std.mem.writeInt(u32, hdr[68..72], @sizeOf(nether.Vsock.State), .little);
     std.mem.writeInt(i32, hdr[72..76], conn_id, .little);
+    // virtio-net transport present: a flag; the device-state reuses the dev_sz
+    // fingerprint (same virtio.Device.DeviceState type as con/blk/vsock).
+    std.mem.writeInt(u32, hdr[76..80], if (net) @as(u32, 1) else 0, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -324,6 +339,9 @@ fn writeSnapshotFile(
     if (ctl) {
         if (!writeAll(fd, std.mem.asBytes(&vs_dev.?))) return false;
         if (!writeAll(fd, std.mem.asBytes(&vsock.?))) return false;
+    }
+    if (net) {
+        if (!writeAll(fd, std.mem.asBytes(&net_dev.?))) return false;
     }
     // Pad to the page-aligned RAM offset, then write RAM.
     var pad = [_]u8{0} ** HOST_PAGE;
@@ -414,6 +432,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
     const ctl_present = std.mem.readInt(u32, hdr[64..68], .little) == 1;
     const saved_conn_id = std.mem.readInt(i32, hdr[72..76], .little);
+    const net_present = std.mem.readInt(u32, hdr[76..80], .little) == 1;
 
     // The RAM region is mapped copy-on-write by offset (not read), so a file that is
     // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
@@ -461,6 +480,10 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (ctl_present) {
         if (!readExact(fd, std.mem.asBytes(&vs_dev_state))) return error.BadSnapshot;
         if (!readExact(fd, std.mem.asBytes(&vsock_state))) return error.BadSnapshot;
+    }
+    var net_dev_state: nether.virtio.Device.DeviceState = undefined;
+    if (net_present) {
+        if (!readExact(fd, std.mem.asBytes(&net_dev_state))) return error.BadSnapshot;
     }
     // No up-front I-cache invalidation: the RAM pages are demand-paged COW from
     // the file (already at the point of unification) and a freshly created vCPU's
@@ -553,7 +576,35 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         vsdev.attach(&vs_dev);
     }
 
-    var dev_buf: [3]*nether.virtio.Device = undefined;
+    // Function 0:4.0 - virtio-net, recreated when the base ran with net=1. Only the
+    // device (virtqueue) transport is restored so the guest's NIC driver resumes; the
+    // slirp NAT engine starts FRESH (it holds host sockets a fork can't inherit, so the
+    // guest re-establishes its TCP flows). Firewall/rate come from the fork's nether.conf.
+    var net_be: nether.VirtioNet = undefined;
+    var net_dev: nether.virtio.Device = undefined;
+    var net_intx: IntxLine = undefined;
+    var slirp_stack: nether.Slirp = undefined;
+    if (net_present) {
+        net_be = .{};
+        net_dev = nether.virtio.Device.init(net_be.backend(), gmem);
+        net_intx = .{ .intid = armPciIntxIntid(4) };
+        net_dev.intx_ptr = &net_intx;
+        net_dev.intx_fn = IntxLine.set;
+        net_dev.msi_ptr = &net_dev;
+        net_dev.msi_fn = armSendMsi;
+        net_dev.importState(&net_dev_state); // restore the virtqueue transport state
+        try pci_host.addFunction(net_dev.function(4, 0));
+        net_be.attach(&net_dev);
+        slirp_stack = .{};
+        armdev.applyNetFirewall(&slirp_stack); // per-fork egress firewall from nether.conf
+        slirp_stack.out_fn = armdev.slirpToNet;
+        slirp_stack.out_ctx = &net_be;
+        net_be.on_tx = armdev.netToSlirp;
+        net_be.on_tx_ctx = &slirp_stack;
+        if (std.Thread.spawn(.{}, armdev.slirpPollLoop, .{&slirp_stack})) |t| t.detach() else |_| {}
+    }
+
+    var dev_buf: [4]*nether.virtio.Device = undefined;
     var ndev: usize = 0;
     dev_buf[ndev] = &con_dev;
     ndev += 1;
@@ -561,6 +612,10 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     ndev += 1;
     if (ctl_present) {
         dev_buf[ndev] = &vs_dev;
+        ndev += 1;
+    }
+    if (net_present) {
+        dev_buf[ndev] = &net_dev;
         ndev += 1;
     }
     var bar_win = PciBarWindow{ .devs = dev_buf[0..ndev] };
@@ -571,7 +626,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     defer if (saved_termios) |t| armRestoreTermios(t);
     if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| t.detach() else |_| {}
 
-    std.debug.print("[nether] RESTORED from {s}: {d} cpus, {d} MiB RAM, gic {d}B, control-plane={s}. Resuming the forked guest.\n", .{ path, num_cpus, ram_size / (1024 * 1024), gic_size, if (ctl_present) "on" else "off" });
+    std.debug.print("[nether] RESTORED from {s}: {d} cpus, {d} MiB RAM, gic {d}B, control-plane={s}, net={s}. Resuming the forked guest.\n", .{ path, num_cpus, ram_size / (1024 * 1024), gic_size, if (ctl_present) "on" else "off", if (net_present) "on (slirp engine fresh)" else "off" });
 
     // Narrowed NOTE: a base snapshot taken from a NON-control sandbox carries no vsock/
     // agent state, so this fork is console + virtio-blk only even if the operator set a
@@ -614,10 +669,17 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         _ = vsdev.hostListen(5000); // idempotent (restored listen set already has it); enables future reconnects
         core.agent.conn_id.store(saved_conn_id, .release); // the surviving connection drives immediately
 
+        // Wire the (fresh) NAT engine into the meter + journal so __stats__ reports
+        // egress bytes and __netlog__ records flows for this fork session.
+        if (net_present) {
+            core.meter.net = &slirp_stack;
+            slirp_stack.journal = &core.journal;
+        }
+
         var sock_path_buf: [256]u8 = undefined;
         const have_sock_conf = conf.confGet("control_socket", &sock_path_buf) != null;
         const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
-        const net_on = conf.modeOn("net", "nether-net");
+        const net_on = net_present; // the device's presence, not the fork conf (the guest NIC is bound)
         control.startControl(&ctl_ctx, .{
             .vsdev = &vsdev,
             .agent = &core.agent,

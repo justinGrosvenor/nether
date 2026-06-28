@@ -61,6 +61,10 @@ const PciBarWindow = armdev.PciBarWindow;
 const armStdinPump = armdev.armStdinPump;
 const armEnableRawMode = armdev.armEnableRawMode;
 const armRestoreTermios = armdev.armRestoreTermios;
+const netToSlirp = armdev.netToSlirp;
+const slirpToNet = armdev.slirpToNet;
+const slirpPollLoop = armdev.slirpPollLoop;
+const applyNetFirewall = armdev.applyNetFirewall;
 
 // Snapshot/restore host orchestration lives in snapshot.zig.
 const snapshot = @import("agent/snapshot.zig");
@@ -485,47 +489,6 @@ fn markerPresent(path: [*:0]const u8) bool {
 /// device lock is held, so it replies via the engine directly (not the locking
 /// host* API) per the VsockDev re-entrancy contract; the kick that delivered the
 /// data flushes the echo to the guest before returning.
-/// virtio-net <-> slirp glue: guest-transmitted frames go to the user-mode stack,
-/// and frames the stack produces are pushed back to the guest's RX queue.
-fn netToSlirp(ctx: *anyopaque, frame: []const u8) void {
-    const s: *nether.Slirp = @ptrCast(@alignCast(ctx));
-    s.onGuestFrame(frame);
-}
-fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
-    const net: *nether.VirtioNet = @ptrCast(@alignCast(ctx));
-    _ = net.pushRx(frame);
-}
-fn slirpPollLoop(s: *nether.Slirp) void {
-    while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
-}
-
-/// Apply the egress-firewall config (govern) to a slirp stack from nether.conf,
-/// shared by both host paths: default-deny private/loopback/link-local/metadata,
-/// `net_open` to disable, `net_allow`/`net_block` CIDR exceptions, and a
-/// `net_rate_kbps` download cap. Default-deny is the default, so a stack left
-/// unconfigured is already firewalled.
-fn applyNetFirewall(s: *nether.Slirp) void {
-    if (confBool("net_open")) s.fw_enabled = false;
-    var fw_allow: [1024]u8 = undefined;
-    if (confGet("net_allow", &fw_allow)) |v| {
-        var it = std.mem.splitScalar(u8, v, ',');
-        while (it.next()) |c| {
-            const t = std.mem.trim(u8, c, " \t");
-            if (t.len > 0 and !s.addAllow(t)) std.debug.print("[nether] net_allow: bad/full rule '{s}'\n", .{t});
-        }
-    }
-    var fw_block: [1024]u8 = undefined;
-    if (confGet("net_block", &fw_block)) |v| {
-        var it = std.mem.splitScalar(u8, v, ',');
-        while (it.next()) |c| {
-            const t = std.mem.trim(u8, c, " \t");
-            if (t.len > 0 and !s.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
-        }
-    }
-    const rate_kbps = confGetInt("net_rate_kbps", 0);
-    if (rate_kbps > 0) s.setRateKbps(rate_kbps);
-}
-
 fn vsockEcho(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const vs: *nether.Vsock = @ptrCast(@alignCast(ctx));
     switch (ev) {
@@ -1076,6 +1039,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .vs_dev = if (control_on) &vs_dev else null,
         .vsock = if (control_on) vs_engine else null,
         .agent = if (control_on) &core.agent else null,
+        // Capture the virtio-net transport so a fork's guest NIC resumes; the slirp
+        // engine restarts fresh on restore (it holds host sockets a fork can't inherit).
+        .net_dev = if (net_on) &net_dev else null,
     };
     if (modeOn("snapshot", "nether-snapshot") or snap_ctx.save) {
         if (std.Thread.spawn(.{}, macSnapshotter, .{&snap_ctx})) |t| t.detach() else |_| {}

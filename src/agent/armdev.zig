@@ -7,6 +7,7 @@
 const std = @import("std");
 const nether = @import("../root.zig");
 const libc = @import("../common/hostutil.zig").libc;
+const conf = @import("../common/conf.zig");
 
 // Standard arm64 "virt" memory map: RAM at 1 GiB, PL011 UART at 0x0900_0000.
 pub const ARM_RAM_BASE: u64 = 0x4000_0000;
@@ -162,4 +163,54 @@ pub fn armEnableRawMode() ?std.posix.termios {
 
 pub fn armRestoreTermios(saved: std.posix.termios) void {
     std.posix.tcsetattr(0, .NOW, saved) catch {};
+}
+
+// --- virtio-net <-> slirp glue (shared by boot + restore) ------------------
+// The user-mode network stack wiring, factored here so the restore path can stand
+// up net the same way the boot path does (snapshot-fork driveability P4) without
+// importing main. The slirp ENGINE always starts fresh on a fork - it holds real
+// host sockets a forked process cannot inherit - so only these thunks + the
+// per-sandbox firewall config are shared; flow state is never carried across.
+
+/// Guest-transmitted frames go to the user-mode stack.
+pub fn netToSlirp(ctx: *anyopaque, frame: []const u8) void {
+    const s: *nether.Slirp = @ptrCast(@alignCast(ctx));
+    s.onGuestFrame(frame);
+}
+
+/// Frames the stack produces are pushed back to the guest's RX queue.
+pub fn slirpToNet(ctx: *anyopaque, frame: []const u8) void {
+    const net: *nether.VirtioNet = @ptrCast(@alignCast(ctx));
+    _ = net.pushRx(frame);
+}
+
+/// Host thread: poll the NAT sockets and inject replies into the guest.
+pub fn slirpPollLoop(s: *nether.Slirp) void {
+    while (true) s.pollOnce(200); // blocks up to 200ms in poll(); not a busy spin
+}
+
+/// Apply the egress-firewall config (govern) to a slirp stack from nether.conf:
+/// default-deny private/loopback/link-local/metadata, `net_open` to disable,
+/// `net_allow`/`net_block` CIDR exceptions, and a `net_rate_kbps` download cap.
+/// Default-deny is the default, so an unconfigured stack is already firewalled.
+pub fn applyNetFirewall(s: *nether.Slirp) void {
+    if (conf.confBool("net_open")) s.fw_enabled = false;
+    var fw_allow: [1024]u8 = undefined;
+    if (conf.confGet("net_allow", &fw_allow)) |v| {
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |c| {
+            const t = std.mem.trim(u8, c, " \t");
+            if (t.len > 0 and !s.addAllow(t)) std.debug.print("[nether] net_allow: bad/full rule '{s}'\n", .{t});
+        }
+    }
+    var fw_block: [1024]u8 = undefined;
+    if (conf.confGet("net_block", &fw_block)) |v| {
+        var it = std.mem.splitScalar(u8, v, ',');
+        while (it.next()) |c| {
+            const t = std.mem.trim(u8, c, " \t");
+            if (t.len > 0 and !s.addBlock(t)) std.debug.print("[nether] net_block: bad/full rule '{s}'\n", .{t});
+        }
+    }
+    const rate_kbps = conf.confGetInt("net_rate_kbps", 0);
+    if (rate_kbps > 0) s.setRateKbps(rate_kbps);
 }

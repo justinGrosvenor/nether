@@ -152,11 +152,15 @@ So a driving command (a shell line, `__put__`/`__get__`) **round-trips immediate
 reconnect** - there is no reconnect barrier for a client to wait on. A client drives a fork
 exactly as it drives a fresh boot: connect → `__info__` → send commands.
 
-What carries across: RAM (COW), per-vCPU state, GIC, console + virtio-blk, the disk, and -
-when the base was control-mode - the vsock device + engine + agent connection. What does
-**not**: virtio-net (slirp holds real host sockets a forked process can't inherit, so
-outbound flows reset and the guest re-establishes them at the TCP level; net device-state
-capture is a planned follow-on), and gpu scanout state. A base snapshot taken from a
-**non-control** sandbox has no vsock/agent state, so its forks are console + virtio-blk only
-even if `control_socket=` is set; the restore logs an explicit NOTE saying so. Snapshot-fork
-is HVF/aarch64 only (KVM snapshot is unimplemented). Fork latency is ~90 ms (COW RAM map).
+What carries across: RAM (COW), per-vCPU state, GIC, console + virtio-blk, the disk;
+when the base was control-mode, the vsock device + engine + agent connection; and when the
+base ran with `net=1`, the virtio-net **device** (so the guest's NIC driver resumes
+coherently). The slirp **NAT engine** does **not** carry across - it holds real host
+sockets a forked process can't inherit, so the engine restarts fresh: in-flight outbound
+flows reset and the guest re-establishes them at the TCP level (normal for a fork). The
+fork's egress firewall / rate cap come from its own `nether.conf`, and `__stats__`/
+`__netlog__` report the fork session's own egress. Gpu scanout state is not captured. A base
+snapshot taken from a **non-control** sandbox has no vsock/agent state, so its forks are
+console + virtio-blk only even if `control_socket=` is set; the restore logs an explicit
+NOTE saying so. Snapshot-fork is HVF/aarch64 only (KVM snapshot is unimplemented). Fork
+latency is ~90 ms (COW RAM map).
