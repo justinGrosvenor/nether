@@ -424,8 +424,24 @@ pub const Vsock = struct {
         };
     }
 
+    /// Validate engine state read from an operator-supplied snapshot file BEFORE it is
+    /// imported, so a truncated / bit-flipped / version-drifted base cannot drive the
+    /// host out of bounds. The staging ring indices feed direct `out[...]` array access
+    /// in peekOut/pushOut, and each `len` slices `buf[0..len]`, so an out-of-range value
+    /// would be a host OOB read/write. The connection table is bounded by construction
+    /// (a fixed `[MAX_CONNS]Conn`, byte-copied), and `Conn.state` is a u2-backed enum, so
+    /// no entry there can point out of bounds; only the ring needs checking.
+    pub fn validState(s: *const State) bool {
+        if (s.out_head >= OUT_RING or s.out_tail >= OUT_RING or s.out_count > OUT_RING) return false;
+        for (s.out) |pkt| {
+            if (pkt.len > PKT_CAP) return false;
+        }
+        return true;
+    }
+
     /// Reload engine state from a snapshot. Callbacks are NOT touched - the caller
-    /// re-wires `on_event`/`on_event_ctx` to the new process's handlers.
+    /// re-wires `on_event`/`on_event_ctx` to the new process's handlers. The caller must
+    /// have accepted `validState` first (a corrupt ring would otherwise OOB at drain).
     pub fn importState(self: *Vsock, s: *const State) void {
         self.guest_cid = s.guest_cid;
         self.conns = s.conns;
@@ -967,6 +983,35 @@ test "engine state round-trips so a forked connection survives" {
     try testing.expectEqual(Op.RW, hdrs[n - 1].op);
     // And the connection accepts a fresh host send post-import.
     try testing.expectEqual(@as(usize, 4), vs2.send(id, "pong"));
+}
+
+test "validState rejects a corrupt staging ring (no OOB on import)" {
+    var s = Vsock.State{ .guest_cid = 3 };
+    try testing.expect(Vsock.validState(&s)); // a zeroed/empty ring is valid
+
+    var bad = s;
+    bad.out_head = OUT_RING; // index would OOB out[] in peekOut
+    try testing.expect(!Vsock.validState(&bad));
+
+    bad = s;
+    bad.out_tail = OUT_RING + 5; // index would OOB out[] in pushOut
+    try testing.expect(!Vsock.validState(&bad));
+
+    bad = s;
+    bad.out_count = OUT_RING + 1; // more staged than the ring can hold
+    try testing.expect(!Vsock.validState(&bad));
+
+    bad = s;
+    bad.out_head = std.math.maxInt(usize); // garbage usize from a bit-flipped file
+    try testing.expect(!Vsock.validState(&bad));
+
+    bad = s;
+    bad.out[3].len = PKT_CAP + 1; // a len that would slice buf[0..len] out of bounds
+    try testing.expect(!Vsock.validState(&bad));
+
+    bad = s;
+    bad.out[0].len = PKT_CAP; // exactly the buffer size is fine
+    try testing.expect(Vsock.validState(&bad));
 }
 
 // --- device-glue tests (full virtqueue path) -------------------------------

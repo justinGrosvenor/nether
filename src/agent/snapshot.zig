@@ -518,6 +518,18 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (ctl_present) {
         if (!readExact(fd, std.mem.asBytes(&vs_dev_state))) return error.BadSnapshot;
         if (!readExact(fd, std.mem.asBytes(&vsock_state))) return error.BadSnapshot;
+        // Validate the engine ring indices BEFORE importing: a corrupt/bit-flipped base
+        // could otherwise drive a host OOB on the staging ring at first drain.
+        if (!nether.Vsock.validState(&vsock_state)) {
+            std.debug.print("[nether] restore: vsock engine state is corrupt (ring out of bounds); refusing\n", .{});
+            return error.BadSnapshot;
+        }
+        // The surviving agent conn id must index the connection table; reject a bogus
+        // one (the relay would @intCast it to u16 and hostSend with it).
+        if (saved_conn_id >= @as(i32, nether.vsock.MAX_CONNS)) {
+            std.debug.print("[nether] restore: saved agent conn id {d} out of range; refusing\n", .{saved_conn_id});
+            return error.BadSnapshot;
+        }
     }
     var net_dev_state: nether.virtio.Device.DeviceState = undefined;
     if (net_present) {
