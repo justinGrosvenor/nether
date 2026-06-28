@@ -62,7 +62,54 @@ pub const SnapCtx = struct {
     // sockets a fork cannot inherit, so the guest re-establishes its flows at the TCP
     // level). Null => the fork has no NIC.
     net_dev: ?*nether.virtio.Device = null,
+    // Serializes captures: the demo timer and the __snapshot__ control command both
+    // drive captureToFile, and two captures must not quiesce at once.
+    capturing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
+
+/// Capture full machine state at a consistent SMP safe point and write a fork-source
+/// snapshot to `path`, then resume the guest. Host-side orchestration only: the vCPU
+/// threads self-park via SnapCtl, so this is safe to call from any thread (the demo
+/// timer or the `__snapshot__` control command). The guest stays quiesced for the whole
+/// write so the RAM image is consistent (unlike a live copy, which could tear). An
+/// in-progress guard rejects a concurrent capture. Returns true on success.
+pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
+    const hvfb = @import("../hv/hvf_backend.zig");
+    if (ctx.capturing.swap(true, .acq_rel)) {
+        std.debug.print("[nether] snapshot: a capture is already in progress\n", .{});
+        return false;
+    }
+    defer ctx.capturing.store(false, .release);
+    const sn: *hvfb.SnapCtl = @ptrCast(@alignCast(ctx.snap));
+    const n = ctx.num_cpus;
+
+    const safe = quiesceSafe(sn, ctx.ram, ctx.handles, n, 200);
+    std.debug.print("[nether] snapshot quiesce: {s}\n", .{if (safe) "all vCPUs idle at WFI (consistent)" else "best-effort (some vCPU not idle)"});
+    const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
+    var gicbuf: [128 * 1024]u8 = undefined;
+    const giclen = hvfb.gicCaptureState(&gicbuf);
+    const con_snap = ctx.con_dev.exportState();
+    const blk_snap = ctx.blk_dev.exportState();
+    const uart_snap = ctx.uart.exportState();
+    // Control plane + net device state, when present, so a fork resumes a driveable
+    // control plane and a coherent NIC (see writeSnapshotFile / macRestore).
+    const has_ctl = ctx.vs_dev != null and ctx.vsock != null and ctx.agent != null;
+    const vs_dev_snap: ?nether.virtio.Device.DeviceState = if (has_ctl) ctx.vs_dev.?.exportState() else null;
+    const vsock_snap: ?nether.Vsock.State = if (has_ctl) ctx.vsock.?.exportState() else null;
+    const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
+    const net_dev_snap: ?nether.virtio.Device.DeviceState = if (ctx.net_dev) |nd| nd.exportState() else null;
+    // Write while still quiesced (consistent image), then resume.
+    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
+    sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+    std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
+    return ok;
+}
+
+/// `platform.Snapshotter` adapter: cast the opaque ctx back to a SnapCtx and capture.
+pub fn snapshotCall(p: *anyopaque, path: [*:0]const u8) bool {
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    return captureToFile(ctx, path);
+}
 
 fn countDiff(a: []const u8, b: []const u8) u64 {
     var n: u64 = 0;
@@ -175,7 +222,16 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
     var t: u32 = 0;
     while (t < 200) : (t += 1) _ = usleep(100_000); // ~20s: let the guest reach the shell
 
-    // --- CAPTURE -----------------------------------------------------------
+    // --- SAVE-TO-FILE mode: serialize a fork source and keep running. The platform's
+    // production path uses the on-demand `__snapshot__` control command (captureToFile)
+    // instead of this fixed timer; both share the same capture.
+    if (ctx.save) {
+        _ = captureToFile(ctx, "nether.snap");
+        std.debug.print("[nether] run `nether restore` to fork nether.snap.\n", .{});
+        return;
+    }
+
+    // --- REWIND mode: capture, let the guest run, then restore in place. -----
     // Quiesce at a consistent SMP point (all vCPUs caught at their idle WFI) so the
     // captured hrtimer rbtree etc. isn't frozen mid-update (which oopses on restore).
     const safe = quiesceSafe(sn, ctx.ram, ctx.handles, n, 200);
@@ -193,27 +249,9 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
     const uart_snap = ctx.uart.exportState();
     const disk_snap = ctx.allocator.alloc(u8, ctx.blk_disk.len) catch return;
     @memcpy(disk_snap, ctx.blk_disk);
-    // Control plane: capture the vsock transport (virtio.Device) + engine state and
-    // the agent's conn id, so the forked guest's agent connection survives the fork.
-    const has_ctl = ctx.vs_dev != null and ctx.vsock != null and ctx.agent != null;
-    const vs_dev_snap: ?nether.virtio.Device.DeviceState = if (has_ctl) ctx.vs_dev.?.exportState() else null;
-    const vsock_snap: ?nether.Vsock.State = if (has_ctl) ctx.vsock.?.exportState() else null;
-    const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
-    // virtio-net transport (device-only; the slirp engine restarts fresh on the fork).
-    const net_dev_snap: ?nether.virtio.Device.DeviceState = if (ctx.net_dev) |nd| nd.exportState() else null;
     sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
     std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), giclen, n });
 
-    // --- SAVE-TO-FILE mode: serialize the fork source and keep running. -----
-    if (ctx.save) {
-        const ok = writeSnapshotFile("nether.snap", ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], disk_snap, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
-        std.debug.print("[nether] snapshot {s} to nether.snap ({d} MiB + state, control-plane={s}, net={s}); guest continues. Run `nether restore` to fork it.\n", .{ if (ok) "written" else "FAILED writing", ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
-        ctx.allocator.free(ram_snap);
-        ctx.allocator.free(disk_snap);
-        return;
-    }
-
-    // --- REWIND mode: let the guest run, then restore in place. -------------
     t = 0;
     while (t < 40) : (t += 1) _ = usleep(100_000); // ~4s: let the guest run and mutate state
     const advanced = countDiff(ctx.ram, ram_snap);

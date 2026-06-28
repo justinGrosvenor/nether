@@ -977,6 +977,30 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // threads hold &hvf_stop for the VM's lifetime.
     var hvf_stop = HvfStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
 
+    // Snapshot context (declared before the control plane so __snapshot__ can drive an
+    // on-demand base capture). The demo orchestrator thread, armed below, shares it.
+    var snap_ctx = SnapCtx{
+        .allocator = allocator,
+        .ram = ram,
+        .handles = handles[0..num_cpus],
+        .num_cpus = num_cpus,
+        .snap = &snapctl,
+        .con_dev = &con_dev,
+        .blk_dev = &blk_dev,
+        .blk_disk = blk.disk,
+        .uart = &uart,
+        .save = modeOn("snapshot_save", "nether-snapshot-save"),
+        // Control plane: capture vsock transport + engine + agent conn id so a forked
+        // guest resumes a driveable control plane (the agent connection survives). Only
+        // in control mode (control_on implies vsock_on, so vs_dev/vs_engine are live).
+        .vs_dev = if (control_on) &vs_dev else null,
+        .vsock = if (control_on) vs_engine else null,
+        .agent = if (control_on) &core.agent else null,
+        // Capture the virtio-net transport so a fork's guest NIC resumes; the slirp
+        // engine restarts fresh on restore (it holds host sockets a fork can't inherit).
+        .net_dev = if (net_on) &net_dev else null,
+    };
+
     // Control plane: in nether-control mode a Unix-domain socket drives the agent
     // (the platform attaches without owning this process's stdio). Shared setup -
     // the same call the KVM path will make once its platform layer lands.
@@ -989,6 +1013,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             .journal = &core.journal,
             .gpu = if (gpu_on) &gpu_be else null,
             .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
+            .snapshot = .{ .ctx = &snap_ctx, .func = snapshot.snapshotCall },
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
@@ -1021,28 +1046,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     }
 
     // Snapshot/restore demo (opt-in via a `nether-snapshot` marker): orchestrator
-    // thread captures and later restores the whole machine while the guest runs.
-    var snap_ctx = SnapCtx{
-        .allocator = allocator,
-        .ram = ram,
-        .handles = handles[0..num_cpus],
-        .num_cpus = num_cpus,
-        .snap = &snapctl,
-        .con_dev = &con_dev,
-        .blk_dev = &blk_dev,
-        .blk_disk = blk.disk,
-        .uart = &uart,
-        .save = modeOn("snapshot_save", "nether-snapshot-save"),
-        // Control plane: capture vsock transport + engine + agent conn id so a forked
-        // guest resumes a driveable control plane (the agent connection survives). Only
-        // in control mode (control_on implies vsock_on, so vs_dev/vs_engine are live).
-        .vs_dev = if (control_on) &vs_dev else null,
-        .vsock = if (control_on) vs_engine else null,
-        .agent = if (control_on) &core.agent else null,
-        // Capture the virtio-net transport so a fork's guest NIC resumes; the slirp
-        // engine restarts fresh on restore (it holds host sockets a fork can't inherit).
-        .net_dev = if (net_on) &net_dev else null,
-    };
+    // thread captures and later restores the whole machine while the guest runs. The
+    // on-demand __snapshot__ control command shares the same snap_ctx (declared above).
     if (modeOn("snapshot", "nether-snapshot") or snap_ctx.save) {
         if (std.Thread.spawn(.{}, macSnapshotter, .{&snap_ctx})) |t| t.detach() else |_| {}
         std.debug.print("[nether] snapshot {s} armed\n", .{if (snap_ctx.save) "save-to-file" else "rewind demo"});

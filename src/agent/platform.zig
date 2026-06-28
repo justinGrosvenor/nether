@@ -27,6 +27,20 @@ pub const Stop = struct {
     }
 };
 
+/// A backend-agnostic on-demand snapshot: quiesce the guest, capture full machine
+/// state, and write a fork-source base file to `path`, then resume - so the platform
+/// can pre-bake base images by driving a sandbox to a ready state and issuing
+/// `__snapshot__`. Returns true on success. The `ctx` outlives the caller, so it must
+/// point at stable storage (the boot frame's SnapCtx). HVF only; the KVM path leaves
+/// this null until KVM snapshot lands.
+pub const Snapshotter = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, path: [*:0]const u8) bool,
+    pub fn call(self: Snapshotter, path: [*:0]const u8) bool {
+        return self.func(self.ctx, path);
+    }
+};
+
 /// Lifecycle watchdogs (govern): the runtime budget (a hard wall-clock cap) and the
 /// idle timeout (reclaim a sandbox with no control-plane activity). Both stop the
 /// guest via the injected `Stop`, so the module is identical on both backends.

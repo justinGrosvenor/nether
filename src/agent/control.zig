@@ -495,6 +495,7 @@ pub const ControlCtx = struct {
     pipe_r: i32,
     allocator: std.mem.Allocator,
     stop: platform.Stop, // backend-agnostic guest stop, for the __shutdown__ command
+    snapshot: ?platform.Snapshotter = null, // on-demand base capture, for __snapshot__
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     info: SandboxInfo = .{}, // static capabilities/limits, for __info__
@@ -703,6 +704,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
             "__help__         this list\n" ++
             "# primary client only (drive the sandbox):\n" ++
             "__shutdown__     clean teardown\n" ++
+            "__snapshot__ [p] capture a fork-source base snapshot (default nether.snap; HVF)\n" ++
             "__put__ <h> <g>  push host file -> guest path\n" ++
             "__get__ <g> <h>  pull guest file -> host path\n" ++
             "<other>          run as a shell command in the guest (framed reply + [exit N])\n" ++
@@ -827,6 +829,27 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         ctx.stop.call();
         return;
     }
+    // Lifecycle: on-demand base-snapshot capture (the platform pre-bakes a fork source
+    // by driving a sandbox to a ready state, then issuing this). Host-intercepted: it
+    // quiesces the guest, writes the snapshot, and resumes - the sandbox keeps running.
+    // The path is confined to the transfer jail (same as __put__/__get__); default
+    // `nether.snap`. Reply blocks until the capture completes (it is bounded - a quiesce
+    // plus a RAM write), so the platform knows the base is on disk before it forks it.
+    if (std.mem.eql(u8, line, "__snapshot__\n") or std.mem.eql(u8, line, "__snapshot__") or std.mem.startsWith(u8, line, "__snapshot__ ")) {
+        const snapr = ctx.snapshot orelse return reply(c, "ERR snapshot not supported on this backend\n");
+        const arg = if (std.mem.startsWith(u8, line, "__snapshot__ ")) std.mem.trim(u8, line["__snapshot__ ".len..], " \r\n") else "";
+        const req = if (arg.len == 0) "nether.snap" else arg;
+        var pbuf: [1024]u8 = undefined;
+        const jailed = jailedPath(&pbuf, ctx.xferRoot(), req, true) orelse return reply(c, "ERR snapshot path outside the transfer jail\n");
+        if (ctx.journal) |j| j.emit(.life, "snapshot requested");
+        const ok = snapr.call(jailed);
+        if (ok) {
+            if (ctx.journal) |j| j.emit(.life, "snapshot written");
+            reply(c, "OK snapshot written\n");
+        } else reply(c, "ERR snapshot capture failed\n");
+        _ = ctx.meter.commands.fetchAdd(1, .release);
+        return;
+    }
     // Reserved namespace: `__name__` is Nether's control-command space. A line that
     // looks like one but matched none above (a typo, or a client mistaking a guest
     // verb for a control command) is a protocol error - reject it loudly instead of
@@ -879,6 +902,7 @@ pub const ControlOpts = struct {
     journal: *nether.Journal,
     gpu: ?*nether.VirtioGpu = null,
     stop: platform.Stop, // backend-agnostic guest stop for __shutdown__
+    snapshot: ?platform.Snapshotter = null, // on-demand base capture for __snapshot__ (HVF)
     info: SandboxInfo,
     path: [*:0]const u8,
     allocator: std.mem.Allocator,
@@ -903,6 +927,7 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
         .pipe_r = pipe[0],
         .allocator = o.allocator,
         .stop = o.stop,
+        .snapshot = o.snapshot,
         .gpu = o.gpu,
         .journal = o.journal,
         .info = o.info,

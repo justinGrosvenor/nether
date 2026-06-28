@@ -111,6 +111,7 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 | Command | Reply | Purpose |
 |---|---|---|
 | `__shutdown__` | `OK shutting down\n` | Clean teardown: the guest stops via its power-off path and the process exits (emitting the final usage bill). |
+| `__snapshot__ [path]` | `OK`/`ERR` | Capture a fork-source base snapshot on demand (HVF only): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply blocks until the file is on disk, so the platform knows the base is ready to fork. `ERR snapshot not supported on this backend` on KVM. |
 | `__put__ <hostpath> <guestpath>` | `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
 | `__get__ <guestpath> <hostpath>` | `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
 | *(anything else)* | framed | Run the line as a shell command in the guest; output streams back, then `0x1e<exit>\n`. Metered as a command. |
@@ -136,6 +137,13 @@ inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command out
 are reported back by `__info__` so a client can verify what it got.
 
 ## Snapshot / fork (HVF)
+
+**Baking a base.** The platform pre-bakes a fork source by driving a control-mode sandbox
+to a ready state (install deps, warm caches) and issuing **`__snapshot__ <path>`** - an
+on-demand capture that quiesces the guest, writes the base, and resumes, all while the
+sandbox stays driveable. This is the production path; the fixed-timer `snapshot_save=1`
+mode is a demo. Because the base is captured *after* the sandbox is driven, its forks
+inherit that warmed state (and, since it was control-mode, a live agent connection).
 
 A **snapshot-restored (forked)** sandbox is **driveable over the full control protocol**,
 the same as a fresh boot - provided the **base snapshot was taken from a control-mode
