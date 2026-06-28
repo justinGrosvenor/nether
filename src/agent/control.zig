@@ -649,10 +649,10 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
 
     var pb: [1024]u8 = undefined;
     const hp = jailedPath(&pb, ctx.xferRoot(), hostpath, true) orelse return reply(c, "ERR host path outside transfer dir\n");
-    const O_WRONLY = 0x0001;
-    const O_CREAT = 0x0200;
-    const O_TRUNC = 0x0400;
-    const fd = libc.open(hp, O_WRONLY | O_CREAT | O_TRUNC, @as(c_int, 0o644));
+    // O_NOFOLLOW: jailedPath confirmed the path is inside the jail, but it only resolved
+    // the parent dir - refuse a pre-existing symlink at the basename that would redirect
+    // the write outside the jail (a defense-in-depth escape on the create-write path).
+    const fd = hostutil.createTruncNoFollow(hp);
     if (fd < 0) return reply(c, "ERR cannot write host file\n");
     defer _ = libc.close(fd);
     if (!writeAll(fd, body)) return reply(c, "ERR write failed\n");
@@ -1346,6 +1346,60 @@ test "transfer jail (jailedPath) confines real paths, incl symlink escapes" {
     try testing.expect(jailedPath(&out, root, jail ++ "/../escape.txt", true) == null);
     // Create into a non-existent subdir -> rejected (parent realpath fails).
     try testing.expect(jailedPath(&out, root, jail ++ "/nope/x.txt", true) == null);
+}
+
+test "create-write refuses a symlink at the basename (no jail escape via O_NOFOLLOW)" {
+    // jailedPath confines the path STRING (and resolves the parent), but a pre-existing
+    // symlink AT the basename pointing outside the jail would let a create-write follow it
+    // and truncate the target. createTruncNoFollow (used by __get__ and __snapshot__)
+    // refuses that symlink at open time. This proves the hole is closed.
+    const c = struct {
+        extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+        extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
+        extern "c" fn rmdir(path: [*:0]const u8) c_int;
+    };
+    const jail = "/tmp/nether-nofollow-test";
+    const target = "/tmp/nether-nofollow-target.txt"; // the OUTSIDE file an escape would hit
+    const evil = jail ++ "/evil"; // a symlink inside the jail -> the outside target
+    const good = jail ++ "/good.txt"; // a normal new file inside the jail
+    _ = libc.unlink(evil);
+    _ = libc.unlink(good);
+    _ = libc.unlink(target);
+    _ = c.rmdir(jail);
+    if (c.mkdir(jail, 0o700) != 0) return error.SkipZigTest;
+    defer {
+        _ = libc.unlink(evil);
+        _ = libc.unlink(good);
+        _ = libc.unlink(target);
+        _ = c.rmdir(jail);
+    }
+    // Seed the outside target with content we can check was NOT truncated.
+    const tfd = libc.open(target, 0x0001 | 0x0200, @as(c_int, 0o600)); // O_WRONLY|O_CREAT
+    if (tfd < 0) return error.SkipZigTest;
+    try testing.expect(writeAll(tfd, "PRECIOUS"));
+    _ = libc.close(tfd);
+    if (c.symlink(target, evil) != 0) return error.SkipZigTest;
+
+    var root: [1024]u8 = undefined;
+    const root_c = libc.realpath(jail, &root) orelse return error.SkipZigTest;
+    var out: [1024]u8 = undefined;
+    // jailedPath ACCEPTS the path string (basename is a plain name inside the jail)...
+    const hp = jailedPath(&out, std.mem.span(root_c), evil, true) orelse return error.SkipZigTest;
+    // ...but the create-write open refuses to follow the symlink (ELOOP -> fd < 0).
+    const fd = hostutil.createTruncNoFollow(hp);
+    try testing.expect(fd < 0);
+    if (fd >= 0) _ = libc.close(fd);
+    // And the outside target is intact (was never truncated).
+    const data = try readFileMac(testing.allocator, target);
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("PRECIOUS", data);
+
+    // A normal create inside the jail still works through the same helper.
+    var gout: [1024]u8 = undefined;
+    const gp = jailedPath(&gout, std.mem.span(root_c), good, true) orelse return error.SkipZigTest;
+    const gfd = hostutil.createTruncNoFollow(gp);
+    try testing.expect(gfd >= 0);
+    if (gfd >= 0) _ = libc.close(gfd);
 }
 
 test "command audit log records commands with exit codes oldest-first" {

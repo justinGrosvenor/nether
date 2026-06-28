@@ -167,6 +167,21 @@ pub fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
     return buf;
 }
 
+/// Open a path for create + truncate WRITE, refusing to follow a symlink at the final
+/// component (O_NOFOLLOW). Used for host-mediated writes confined to the transfer jail
+/// (`__get__`, `__snapshot__`): jailedPath confirms the path string is inside the jail but
+/// only realpath's the PARENT dir, so a pre-existing symlink AT the basename could still
+/// redirect the write outside the jail. O_NOFOLLOW closes that hole race-free - the final
+/// open itself refuses a symlink (ELOOP) rather than an lstat check that could TOCTOU.
+/// BSD/macOS oflag values, matching the rest of this codebase. Returns the fd, or -1.
+pub fn createTruncNoFollow(path: [*:0]const u8) c_int {
+    const O_WRONLY = 0x0001;
+    const O_CREAT = 0x0200;
+    const O_TRUNC = 0x0400;
+    const O_NOFOLLOW = 0x0100; // BSD/macOS value (Linux differs; the platform path is HVF)
+    return libc.open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, @as(c_int, 0o644));
+}
+
 /// Copy a path slice into `buf` as a NUL-terminated C string for libc calls.
 pub fn cpath(buf: []u8, p: []const u8) ?[*:0]const u8 {
     if (p.len + 1 > buf.len) return null;

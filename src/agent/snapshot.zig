@@ -326,10 +326,11 @@ fn writeSnapshotFile(
     conn_id: i32, // surviving agent connection id (-1 if none)
     net_dev: ?nether.virtio.Device.DeviceState, // virtio-net transport state (null => no NIC)
 ) bool {
-    const O_WRONLY = 0x0001;
-    const O_CREAT = 0x0200;
-    const O_TRUNC = 0x0400;
-    const fd = libc.open(path, O_WRONLY | O_CREAT | O_TRUNC, @as(c_int, 0o644));
+    // O_NOFOLLOW: when the path comes from __snapshot__ it is jailed (parent resolved),
+    // so refuse a pre-existing symlink at the basename that would redirect the write
+    // outside the jail. For the demo's plain "nether.snap" this just refuses to clobber
+    // a symlink in cwd, which is the safe behavior anyway.
+    const fd = hostutil.createTruncNoFollow(path);
     if (fd < 0) return false;
     defer _ = libc.close(fd);
 
