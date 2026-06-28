@@ -34,6 +34,23 @@ not drive the sandbox. Send one command per line (`\n`-terminated).
   then a `0x1e<exit-code>\n` trailer.
 - **Errors** are a single `ERR <reason>\n` line.
 
+### Reserved namespace
+
+`__name__` is reserved for control commands. A line that starts with `__` but isn't a
+recognized command (a typo, or a Tier-2 verb mistaken for a control command) is rejected
+with `ERR unknown command ...` rather than forwarded to the guest. So a workload/agent
+verb sent over this socket **must not** be `__`-prefixed: send a plain shell command (for
+the stock guest agent) or your agent's own non-`__` verb. `__put__`/`__get__` are the only
+`__` commands that take arguments.
+
+### Concurrency on the primary socket
+
+The primary socket carries both host-intercepted query replies and the streamed reply of
+a relayed command, written from different threads. Issue **one command at a time**: send a
+query (`__stats__`, etc.) only between commands, not while a command's reply is still
+streaming, or the byte streams interleave. The serial request/response model (send a
+line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
+
 ## Commands
 
 ### Read-only (any client)

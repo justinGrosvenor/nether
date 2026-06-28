@@ -823,6 +823,17 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         ctx.stop.call();
         return;
     }
+    // Reserved namespace: `__name__` is Nether's control-command space. A line that
+    // looks like one but matched none above (a typo, or a client mistaking a guest
+    // verb for a control command) is a protocol error - reject it loudly instead of
+    // forwarding "__whatever__" to the guest, where it would run as a shell command
+    // and fail confusingly (exit 127). __put__/__get__ are valid and handled below.
+    if (std.mem.startsWith(u8, line, "__") and
+        !std.mem.startsWith(u8, line, "__put__ ") and
+        !std.mem.startsWith(u8, line, "__get__ "))
+    {
+        return reply(c, "ERR unknown command (see __help__); __ is reserved for control commands\n");
+    }
     var id = ctx.agent.conn_id.load(.acquire);
     while (id < 0) {
         _ = usleep(50_000);
@@ -1120,6 +1131,11 @@ test "control protocol: introspection replies, versioning, observer gating" {
     // __events__: the journal's boot lifecycle event is visible.
     controlCommand(&ctx, w, "__events__\n", true);
     try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "LIFE boot") != null);
+
+    // Reserved namespace: an unknown __verb__ is rejected loudly (not forwarded to the
+    // guest shell). Tested as primary so it passes the gate and reaches the check.
+    controlCommand(&ctx, w, "__bogus__\n", true);
+    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "ERR unknown command") != null);
 
     // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire.
     controlCommand(&ctx, w, "__shutdown__\n", false);
