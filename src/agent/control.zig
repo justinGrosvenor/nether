@@ -100,6 +100,12 @@ pub const Metering = struct {
     }
 };
 
+/// Control-protocol version, surfaced in `__info__` (`proto_version=`). Bump on any
+/// breaking change to the command set or wire format so an integrating client (swerver)
+/// can check compatibility before driving the sandbox. The command list itself is
+/// discoverable at runtime via `__help__` and documented in docs/control-protocol.md.
+pub const PROTO_VERSION = 1;
+
 /// Static, per-sandbox capabilities and limits, set once at launch from the
 /// resolved nether.conf and reported by the `__info__` control command. Where
 /// `__stats__` answers "how much has this sandbox used?", `__info__` answers "what
@@ -123,6 +129,7 @@ pub const SandboxInfo = struct {
         const backend = if (builtin.os.tag == .macos) "hvf" else "kvm";
         return (std.fmt.bufPrint(buf,
             \\nether sandbox info
+            \\proto_version={d}
             \\backend={s}
             \\arch={s}
             \\cpus={d}
@@ -138,6 +145,7 @@ pub const SandboxInfo = struct {
             \\{c}0
             \\
         , .{
+            PROTO_VERSION,
             backend,
             @tagName(builtin.cpu.arch),
             self.cpus,
@@ -672,6 +680,33 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         return;
     }
+    // Introspection: the command set itself, so a client can discover the protocol at
+    // runtime (paired with __info__'s proto_version and docs/control-protocol.md).
+    // Read-only; available to observers. Ends with the 0x1e exit frame like __info__.
+    if (std.mem.eql(u8, line, "__help__\n") or std.mem.eql(u8, line, "__help__")) {
+        const help =
+            "nether control protocol v" ++ std.fmt.comptimePrint("{d}", .{PROTO_VERSION}) ++ "\n" ++
+            "# read-only (any client):\n" ++
+            "__info__         sandbox capabilities + limits (incl. proto_version)\n" ++
+            "__stats__        usage counters: cpu_ms, mem_peak_mb, commands, bytes, net\n" ++
+            "__events__ [seq] unified event timeline (cmd/net/lifecycle); cursor-polled\n" ++
+            "__cmdlog__       command audit log (per-command exit + cpu_ms)\n" ++
+            "__netlog__       egress audit log (dest + firewall verdict)\n" ++
+            "__screen__       terminal snapshot (scrollback + live)\n" ++
+            "__screendiff__   terminal changed rows since last call (primary-only)\n" ++
+            "__frame__        framebuffer as a binary PPM\n" ++
+            "__framediff__    framebuffer changed tiles since last call (primary-only)\n" ++
+            "__help__         this list\n" ++
+            "# primary client only (drive the sandbox):\n" ++
+            "__shutdown__     clean teardown\n" ++
+            "__put__ <h> <g>  push host file -> guest path\n" ++
+            "__get__ <g> <h>  pull guest file -> host path\n" ++
+            "<other>          run as a shell command in the guest (framed reply + [exit N])\n" ++
+            "\x1e0\n";
+        _ = writeAll(c, help);
+        _ = ctx.meter.bytes_out.fetchAdd(help.len, .release);
+        return;
+    }
     // Observe: the egress audit log - every destination the sandbox tried to reach
     // (new TCP connections / UDP flows) with the firewall's verdict. Host-intercepted.
     if (std.mem.eql(u8, line, "__netlog__\n") or std.mem.eql(u8, line, "__netlog__")) {
@@ -1064,6 +1099,7 @@ test "sandbox info report renders capabilities and limits with the exit frame" {
     };
     var buf: [512]u8 = undefined;
     const out = buf[0..info.report(&buf)];
+    try testing.expect(std.mem.indexOf(u8, out, "proto_version=") != null); // versioned protocol
     try testing.expect(std.mem.indexOf(u8, out, "cpus=4\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "ram_mb=512\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "net=on\n") != null);
