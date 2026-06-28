@@ -61,6 +61,17 @@ reference client `tools/nether-ctl.c` (`read_reply` + `bare_status_line`) implem
 exactly this; mirror it. (The logs/binary replies are unframed too, but a client reads
 those in a mode that knows their shape; the hazard is specifically the unexpected `ERR`.)
 
+### Readiness
+
+The socket accepts connections **before the guest finishes booting**. The host-intercepted
+queries (`__info__`, `__stats__`, `__help__`) answer immediately. A *driving* command
+(shell command, `__put__`/`__get__`) needs the in-guest agent, which connects partway
+through boot, so an early command waits for it - bounded (default 30s). A guest that never
+connects (a broken image) makes the command fail with `ERR agent not connected (guest not
+ready)` rather than blocking forever. So a client can either just send its command (it
+parks until the agent is up) or, to distinguish "booting" from "broken", treat that ERR as
+a fast failure (see the framing-invariant guard above).
+
 ### Reserved namespace
 
 `__name__` is reserved for control commands. A line that starts with `__` but isn't a

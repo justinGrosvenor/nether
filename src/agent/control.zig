@@ -498,6 +498,10 @@ pub const ControlCtx = struct {
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     info: SandboxInfo = .{}, // static capabilities/limits, for __info__
+    // How long a driving command waits for the in-guest agent to connect before failing
+    // with an ERR (rather than blocking this control thread forever). Generous enough for
+    // a microVM boot; a guest that never connects (broken image) then fails cleanly.
+    agent_wait_ms: u32 = 30_000,
     // The primary control client (fd) - the one connection that drives the sandbox
     // and receives the agent relay stream. Additional connections are read-only
     // observers (host-intercepted queries only); -1 = no primary.
@@ -834,9 +838,19 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
     {
         return reply(c, "ERR unknown command (see __help__); __ is reserved for control commands\n");
     }
+    // Wait (bounded) for the in-guest agent to connect over vsock. The control socket
+    // accepts before the guest finishes booting, so an early command must wait - but only
+    // up to agent_wait_ms, so a never-connecting guest fails with an ERR instead of
+    // blocking this thread (and its primary slot) forever. The bare ERR line is the
+    // fast-fail signal documented for driving clients (control-protocol.md).
     var id = ctx.agent.conn_id.load(.acquire);
+    var waited_ms: u32 = 0;
     while (id < 0) {
+        if (waited_ms >= ctx.agent_wait_ms) {
+            return reply(c, "ERR agent not connected (guest not ready)\n");
+        }
         _ = usleep(50_000);
+        waited_ms += 50;
         id = ctx.agent.conn_id.load(.acquire);
     }
     // File transfer (host-mediated): the bytes move over vsock with length framing,
@@ -1146,6 +1160,36 @@ test "control protocol: introspection replies, versioning, observer gating" {
     controlCommand(&ctx, w, "__shutdown__\n", true);
     try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "OK shutting down") != null);
     try testing.expect(spy.stopped);
+}
+
+test "control: a command to a never-connecting guest agent fails fast (bounded wait)" {
+    // A driving command waits for the in-guest agent (conn_id), but only up to
+    // agent_wait_ms - a broken/absent guest must not block the control thread forever.
+    var core = Core{};
+    core.init(256, 1, 0); // conn_id stays -1 (no agent connected)
+    var dummy_vsdev: nether.VsockDev = undefined; // never reached: we time out first
+    const NoopStop = struct {
+        fn stop(_: *anyopaque) void {}
+    };
+    var ctx = ControlCtx{
+        .vsdev = &dummy_vsdev,
+        .agent = &core.agent,
+        .meter = &core.meter,
+        .path = "/tmp/nether-test-unused.sock",
+        .pipe_r = -1,
+        .allocator = testing.allocator,
+        .stop = .{ .ctx = &core, .func = NoopStop.stop },
+        .agent_wait_ms = 60, // tiny so the test is fast
+    };
+    var fds: [2]c_int = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    controlCommand(&ctx, fds[1], "echo hi\n", true); // a shell command -> hits the wait
+    var rbuf: [256]u8 = undefined;
+    const n = libc.read(fds[0], rbuf[0..].ptr, rbuf.len);
+    try testing.expect(n > 0);
+    try testing.expect(std.mem.indexOf(u8, rbuf[0..@intCast(n)], "ERR agent not connected") != null);
 }
 
 test "output cap suppresses body past the limit but always forwards the trailer" {
