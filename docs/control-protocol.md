@@ -39,7 +39,27 @@ reply (it propagates the guest command's exit code). Build it on the host with
   tile records); the report tells you the length.
 - **Shell commands** (anything not starting with `__`) stream the command's stdout/stderr
   then a `0x1e<exit-code>\n` trailer.
-- **Errors** are a single `ERR <reason>\n` line.
+- **Errors / acks** are a single `ERR <reason>\n` (or `OK <reason>\n` for `__shutdown__`/
+  `__put__`/`__get__`) line. These are **unframed** - no `0x1e`.
+
+### Framing invariant (read this if you read until `0x1e`)
+
+The reply shapes are NOT uniform, and the trap is that an **`ERR <reason>\n` is unframed
+and can come back for a command you expected to be framed**: an unknown/typo'd `__verb__`,
+`ERR read-only observer` (you're not the primary), or `ERR too many control clients`. A
+client that blocks until `0x1e<exit>\n` would then **hang** waiting for a frame that never
+arrives (until its own timeout).
+
+So the invariant a driving client must encode: a reply to a command is *either* framed
+(ends `0x1e<exit>\n`) *or* a single bare `ERR `/`OK ` line. **Guard for it:** while
+reading toward the `0x1e`, if the buffer is a complete line starting with `ERR ` (or
+`OK `) and no `0x1e` has appeared, treat it as a terminal reply and fail fast (non-zero) -
+do not keep waiting. To avoid mistaking a command whose *output* begins with `ERR ` for a
+control error, settle briefly first: a real command's `0x1e` trailer follows its output
+immediately, so a short grace (the reference client uses 500 ms) disambiguates. The
+reference client `tools/nether-ctl.c` (`read_reply` + `bare_status_line`) implements
+exactly this; mirror it. (The logs/binary replies are unframed too, but a client reads
+those in a mode that knows their shape; the hazard is specifically the unexpected `ERR`.)
 
 ### Reserved namespace
 

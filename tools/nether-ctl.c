@@ -30,7 +30,21 @@
 #define RS 0x1e           /* the reply frame separator: body ends at 0x1e, then <exit>\n */
 #define HANG_MS 60000     /* framed reply: give up only after this long with NO progress */
 #define IDLE_MS 2000      /* unframed reply: a gap this long after data means it's done */
+#define SETTLE_MS 500     /* a leading ERR/OK line with no 0x1e this long is a bare reply */
 #define BUFCAP (1 << 20)  /* 1 MiB reply ceiling (a full screen/frame fits) */
+
+/* The GUARD against the unframed-reply hang: an `ERR <reason>\n` (and the `OK ...\n`
+ * from __shutdown__/__put__/__get__) is a bare single line with NO 0x1e frame, and can
+ * come back for a command a client expected to be framed (e.g. a stray __verb__, or
+ * "ERR read-only observer" / "ERR too many control clients"). A reader blocking until
+ * 0x1e would hang. So in the framed path, once the buffer is a complete ERR/OK line with
+ * no 0x1e, we only wait SETTLE_MS more (a real command's 0x1e<exit> trailer follows its
+ * output immediately) before treating it as a terminal unframed reply and failing fast. */
+static int bare_status_line(const char *buf, size_t len) {
+    if (memchr(buf, RS, len)) return 0;             /* a 0x1e means it is (becoming) framed */
+    if (memchr(buf, '\n', len) == NULL) return 0;   /* not a complete line yet */
+    return (len >= 4 && memcmp(buf, "ERR ", 4) == 0) || (len >= 3 && memcmp(buf, "OK ", 3) == 0);
+}
 
 /* Does this command's reply end with the 0x1e<exit>\n frame? Shell commands do, as
  * do the report queries (__info__/__stats__/__help__). The logs (__events__/__cmdlog__
@@ -77,9 +91,12 @@ static ssize_t read_reply(int fd, char *buf, size_t cap, int *exit_code, int fra
     *exit_code = -1;
     size_t len = 0;
     for (;;) {
+        /* framed normally blocks (HANG_MS) until the 0x1e frame; but once the buffer is
+         * a bare ERR/OK line, settle quickly so a stray unframed reply fails fast. */
+        int timeout = !framed ? IDLE_MS : (bare_status_line(buf, len) ? SETTLE_MS : HANG_MS);
         struct pollfd p = { .fd = fd, .events = POLLIN };
-        int r = poll(&p, 1, framed ? HANG_MS : IDLE_MS);
-        if (r <= 0) break;  /* framed: HANG_MS with no data => dead guest. unframed: idle => done. */
+        int r = poll(&p, 1, timeout);
+        if (r <= 0) break;  /* timeout: dead guest (framed) / idle done (unframed) / ERR settled */
         ssize_t n = read(fd, buf + len, cap - len);
         if (n <= 0) break;  /* EOF / error */
         len += (size_t)n;
@@ -93,6 +110,9 @@ static ssize_t read_reply(int fd, char *buf, size_t cap, int *exit_code, int fra
         }
         if (len == cap) break;  /* full: stop (truncated, but safe) */
     }
+    /* No 0x1e frame arrived. A bare `ERR ...` line is a failure -> non-zero exit so a
+     * framed caller does not mistake it for success. */
+    if (len >= 4 && memcmp(buf, "ERR ", 4) == 0) *exit_code = 1;
     return (ssize_t)len;
 }
 
