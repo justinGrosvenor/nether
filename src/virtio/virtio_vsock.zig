@@ -394,6 +394,48 @@ pub const Vsock = struct {
         };
     }
 
+    // --- snapshot (pointer-free engine state) ------------------------------
+
+    /// The serializable engine state: every field EXCEPT the callback pointers
+    /// (`on_event`/`on_event_ctx`), which are re-wired by the caller after import.
+    /// The fixed-pool design (no heap, no per-connection allocation) makes this a
+    /// plain value copy, so a snapshot-forked sandbox can resume an in-flight agent
+    /// connection rather than tear it down and reconnect.
+    pub const State = struct {
+        guest_cid: u64 = 0,
+        conns: [MAX_CONNS]Conn = [_]Conn{.{}} ** MAX_CONNS,
+        listen_ports: [MAX_LISTEN]u32 = [_]u32{0} ** MAX_LISTEN,
+        out: [OUT_RING]OutPkt = [_]OutPkt{.{}} ** OUT_RING,
+        out_head: usize = 0,
+        out_tail: usize = 0,
+        out_count: usize = 0,
+    };
+
+    /// Capture the engine state for a snapshot (callbacks excluded).
+    pub fn exportState(self: *const Vsock) State {
+        return .{
+            .guest_cid = self.guest_cid,
+            .conns = self.conns,
+            .listen_ports = self.listen_ports,
+            .out = self.out,
+            .out_head = self.out_head,
+            .out_tail = self.out_tail,
+            .out_count = self.out_count,
+        };
+    }
+
+    /// Reload engine state from a snapshot. Callbacks are NOT touched - the caller
+    /// re-wires `on_event`/`on_event_ctx` to the new process's handlers.
+    pub fn importState(self: *Vsock, s: *const State) void {
+        self.guest_cid = s.guest_cid;
+        self.conns = s.conns;
+        self.listen_ports = s.listen_ports;
+        self.out = s.out;
+        self.out_head = s.out_head;
+        self.out_tail = s.out_tail;
+        self.out_count = s.out_count;
+    }
+
     // --- internals ---------------------------------------------------------
 
     fn hdrFor(self: *Vsock, c: *const Conn, op: u16, len: u32) Hdr {
@@ -887,6 +929,44 @@ test "a lying length field cannot over-read the packet buffer" {
     var dbuf: [HDR_LEN + 4]u8 = undefined;
     vs.rx(guestPkt(&dbuf, .{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 50, .dst_port = 7, .op = Op.RW, .len = 1000 }, "data"));
     try testing.expectEqual(@as(usize, 4), rec.last_recv_len); // clamped to what arrived
+}
+
+test "engine state round-trips so a forked connection survives" {
+    var vs = Vsock{ .guest_cid = 3 };
+    var rec = Recorder{};
+    defer rec.deinit();
+    vs.on_event = Recorder.sink;
+    vs.on_event_ctx = &rec;
+    _ = vs.listen(5000);
+    var pbuf: [HDR_LEN]u8 = undefined;
+    // Establish a connection and stage an outbound packet, as at a snapshot point.
+    vs.rx(guestPkt(&pbuf, .{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 50, .dst_port = 5000, .op = Op.REQUEST, .buf_alloc = 65536 }, &.{}));
+    const id = vs.findConn(5000, 50).?;
+    try testing.expectEqual(@as(usize, 4), vs.send(id, "ping"));
+
+    // Export, then import into a fresh engine in a "new process" (callbacks re-wired).
+    const saved = vs.exportState();
+    var vs2 = Vsock{ .guest_cid = 0 };
+    var rec2 = Recorder{};
+    defer rec2.deinit();
+    vs2.importState(&saved);
+    vs2.on_event = Recorder.sink;
+    vs2.on_event_ctx = &rec2;
+
+    // The surviving connection is established and driveable: ports, listen registry,
+    // and staged output all came across, and a host send works immediately.
+    try testing.expectEqual(@as(u64, 3), vs2.guest_cid);
+    try testing.expect(vs2.isListening(5000));
+    try testing.expectEqual(Conn.State.established, vs2.conns[id].state);
+    try testing.expectEqual(@as(u32, 5000), vs2.conns[id].host_port);
+    try testing.expectEqual(@as(u32, 50), vs2.conns[id].guest_port);
+    // The pre-snapshot staged RW packet is still queued (RESPONSE drained, then "ping").
+    var hdrs: [4]Hdr = undefined;
+    const n = drainHdrs(&vs2, &hdrs);
+    try testing.expect(n >= 1);
+    try testing.expectEqual(Op.RW, hdrs[n - 1].op);
+    // And the connection accepts a fresh host send post-import.
+    try testing.expectEqual(@as(usize, 4), vs2.send(id, "pong"));
 }
 
 // --- device-glue tests (full virtqueue path) -------------------------------

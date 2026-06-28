@@ -1070,6 +1070,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .blk_disk = blk.disk,
         .uart = &uart,
         .save = modeOn("snapshot_save", "nether-snapshot-save"),
+        // Control plane: capture vsock transport + engine + agent conn id so a forked
+        // guest resumes a driveable control plane (the agent connection survives). Only
+        // in control mode (control_on implies vsock_on, so vs_dev/vs_engine are live).
+        .vs_dev = if (control_on) &vs_dev else null,
+        .vsock = if (control_on) vs_engine else null,
+        .agent = if (control_on) &core.agent else null,
     };
     if (modeOn("snapshot", "nether-snapshot") or snap_ctx.save) {
         if (std.Thread.spawn(.{}, macSnapshotter, .{&snap_ctx})) |t| t.detach() else |_| {}

@@ -15,6 +15,8 @@ const nether = @import("../root.zig");
 const hostutil = @import("../common/hostutil.zig");
 const conf = @import("../common/conf.zig");
 const armdev = @import("armdev.zig");
+const control = @import("control.zig");
+const platform = @import("platform.zig");
 
 const libc = hostutil.libc;
 const usleep = hostutil.usleep;
@@ -46,6 +48,14 @@ pub const SnapCtx = struct {
     blk_disk: []u8,
     uart: *nether.Pl011,
     save: bool = false, // true: serialize to nether.snap (fork source); false: in-place rewind
+    // Control plane, present only when the snapshotted sandbox ran in control/vsock
+    // mode. When set, the snapshot also captures the vsock transport + engine state
+    // and the agent's connection id, so a forked sandbox resumes a DRIVEABLE control
+    // plane (the agent vsock connection survives the fork - no reconnect). All null
+    // => a bare console+blk snapshot that restores as before.
+    vs_dev: ?*nether.virtio.Device = null,
+    vsock: ?*nether.Vsock = null,
+    agent: ?*control.AgentCtx = null,
 };
 
 fn countDiff(a: []const u8, b: []const u8) u64 {
@@ -177,13 +187,19 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
     const uart_snap = ctx.uart.exportState();
     const disk_snap = ctx.allocator.alloc(u8, ctx.blk_disk.len) catch return;
     @memcpy(disk_snap, ctx.blk_disk);
+    // Control plane: capture the vsock transport (virtio.Device) + engine state and
+    // the agent's conn id, so the forked guest's agent connection survives the fork.
+    const has_ctl = ctx.vs_dev != null and ctx.vsock != null and ctx.agent != null;
+    const vs_dev_snap: ?nether.virtio.Device.DeviceState = if (has_ctl) ctx.vs_dev.?.exportState() else null;
+    const vsock_snap: ?nether.Vsock.State = if (has_ctl) ctx.vsock.?.exportState() else null;
+    const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
     sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
     std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), giclen, n });
 
     // --- SAVE-TO-FILE mode: serialize the fork source and keep running. -----
     if (ctx.save) {
-        const ok = writeSnapshotFile("nether.snap", ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], disk_snap);
-        std.debug.print("[nether] snapshot {s} to nether.snap ({d} MiB + state); guest continues. Run `nether restore` to fork it.\n", .{ if (ok) "written" else "FAILED writing", ctx.ram.len / (1024 * 1024) });
+        const ok = writeSnapshotFile("nether.snap", ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], disk_snap, vs_dev_snap, vsock_snap, conn_id_snap);
+        std.debug.print("[nether] snapshot {s} to nether.snap ({d} MiB + state, control-plane={s}); guest continues. Run `nether restore` to fork it.\n", .{ if (ok) "written" else "FAILED writing", ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent" });
         ctx.allocator.free(ram_snap);
         ctx.allocator.free(disk_snap);
         return;
@@ -217,7 +233,8 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
 // shares the file's pages and only copies what it writes. Same-host/same-build
 // only (raw struct layout, native endian).
 const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
-const SNAP_VERSION: u32 = 3; // bumped: header now carries a struct-layout fingerprint
+const SNAP_VERSION: u32 = 4; // bumped: header carries a control-plane flag + vsock state
+const HDR_SIZE: usize = 128; // header bytes (grew from 64 for the control-plane fields)
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
 const GIC_STATE_MAX: u64 = 16 * 1024 * 1024; // sane cap for the GIC blob (~126 KiB in practice)
 
@@ -232,7 +249,7 @@ pub const SnapError = error{ BadSnapshot, SnapshotVersionMismatch, SnapshotLayou
 /// which catches silent layout drift even when the version was not bumped; a zero
 /// or too-large vCPU count; a zero RAM size; and disk/GIC sizes that would overrun
 /// the fixed disk buffer or request an absurd allocation.
-fn validateHeader(hdr: *const [64]u8, max_cpus: u32, disk_cap: u64, gic_cap: u64, cpu_sz: u32, dev_sz: u32, uart_sz: u32) SnapError!void {
+fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_cap: u64, cpu_sz: u32, dev_sz: u32, uart_sz: u32, vsock_sz: u32) SnapError!void {
     if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return error.BadSnapshot;
     if (std.mem.readInt(u32, hdr[4..8], .little) != SNAP_VERSION) return error.SnapshotVersionMismatch;
     const num_cpus = std.mem.readInt(u32, hdr[8..12], .little);
@@ -243,6 +260,10 @@ fn validateHeader(hdr: *const [64]u8, max_cpus: u32, disk_cap: u64, gic_cap: u64
     if (std.mem.readInt(u32, hdr[12..16], .little) != cpu_sz or
         std.mem.readInt(u32, hdr[56..60], .little) != dev_sz or
         std.mem.readInt(u32, hdr[60..64], .little) != uart_sz) return error.SnapshotLayoutMismatch;
+    // Control-plane section (vsock device + engine state): when present, its engine
+    // struct must match this build's layout, same as the cpu/dev/uart fingerprints.
+    if (std.mem.readInt(u32, hdr[64..68], .little) == 1 and
+        std.mem.readInt(u32, hdr[68..72], .little) != vsock_sz) return error.SnapshotLayoutMismatch;
 }
 
 fn writeSnapshotFile(
@@ -254,6 +275,9 @@ fn writeSnapshotFile(
     uart: anytype, // Pl011.State
     gic: []const u8,
     disk: []const u8,
+    vs_dev: ?nether.virtio.Device.DeviceState, // vsock transport state (null => no control plane)
+    vsock: ?nether.Vsock.State, // vsock engine state
+    conn_id: i32, // surviving agent connection id (-1 if none)
 ) bool {
     const O_WRONLY = 0x0001;
     const O_CREAT = 0x0200;
@@ -262,12 +286,15 @@ fn writeSnapshotFile(
     if (fd < 0) return false;
     defer _ = libc.close(fd);
 
+    const ctl = vs_dev != null and vsock != null;
+    const ctl_bytes: usize = if (ctl) @sizeOf(nether.virtio.Device.DeviceState) + @sizeOf(nether.Vsock.State) else 0;
+
     // The metadata precedes a page-aligned RAM region (so RAM can be mmap'd COW).
-    const meta = 64 + cpus.len * @sizeOf(@TypeOf(cpus[0])) + @sizeOf(@TypeOf(con)) +
-        @sizeOf(@TypeOf(blk)) + @sizeOf(@TypeOf(uart)) + gic.len + disk.len;
+    const meta = HDR_SIZE + cpus.len * @sizeOf(@TypeOf(cpus[0])) + @sizeOf(@TypeOf(con)) +
+        @sizeOf(@TypeOf(blk)) + @sizeOf(@TypeOf(uart)) + gic.len + disk.len + ctl_bytes;
     const ram_off = std.mem.alignForward(usize, meta, HOST_PAGE);
 
-    var hdr = [_]u8{0} ** 64;
+    var hdr = [_]u8{0} ** HDR_SIZE;
     std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
     std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION, .little);
     std.mem.writeInt(u32, hdr[8..12], @intCast(cpus.len), .little);
@@ -281,6 +308,12 @@ fn writeSnapshotFile(
     std.mem.writeInt(u64, hdr[48..56], ram_off, .little);
     std.mem.writeInt(u32, hdr[56..60], @sizeOf(@TypeOf(con)), .little);
     std.mem.writeInt(u32, hdr[60..64], @sizeOf(@TypeOf(uart)), .little);
+    // Control-plane section: a flag, the engine-state size (layout fingerprint), and
+    // the surviving agent conn id. The vsock device-state reuses the dev_sz fingerprint
+    // (same virtio.Device.DeviceState type as con/blk).
+    std.mem.writeInt(u32, hdr[64..68], if (ctl) @as(u32, 1) else 0, .little);
+    std.mem.writeInt(u32, hdr[68..72], @sizeOf(nether.Vsock.State), .little);
+    std.mem.writeInt(i32, hdr[72..76], conn_id, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -288,6 +321,10 @@ fn writeSnapshotFile(
     if (!writeAll(fd, std.mem.asBytes(&uart))) return false;
     if (!writeAll(fd, gic)) return false;
     if (!writeAll(fd, disk)) return false;
+    if (ctl) {
+        if (!writeAll(fd, std.mem.asBytes(&vs_dev.?))) return false;
+        if (!writeAll(fd, std.mem.asBytes(&vsock.?))) return false;
+    }
     // Pad to the page-aligned RAM offset, then write RAM.
     var pad = [_]u8{0} ** HOST_PAGE;
     if (ram_off > meta and !writeAll(fd, pad[0 .. ram_off - meta])) return false;
@@ -306,6 +343,7 @@ const RestoreCtx = struct {
     state: *const anyopaque, // *hvf_backend.CpuState
     ready: *std.atomic.Value(u32),
     go: *std.atomic.Value(bool),
+    handles: [*]u64, // each secondary records its vCPU handle for the control-plane stop
 };
 
 fn macRestoreCpu(ctx: *RestoreCtx) void {
@@ -317,10 +355,32 @@ fn macRestoreCpu(ctx: *RestoreCtx) void {
     defer vcpu.deinit();
     const st: *const hvfb.CpuState = @ptrCast(@alignCast(ctx.state));
     vcpu.restore(st);
+    ctx.handles[ctx.id] = vcpu.handle; // for hv_vcpus_exit via the restore Stop
     _ = ctx.ready.fetchAdd(1, .release);
     while (!ctx.go.load(.acquire)) _ = usleep(200);
     _ = vcpu.runSmp(ctx.bus, ctx.power, null, null) catch {};
 }
+
+/// The HVF guest stop for the restore path, adapted to `platform.Stop`: request a
+/// PSCI poweroff then force the vCPUs out of `hv_vcpu_run` so the run loop returns
+/// `.shutdown`. The restore analog of main.zig's HvfStop (kept local to avoid a
+/// snapshot->main import cycle). Lives in the macRestore frame; the detached control
+/// and watchdog threads hold &it for the forked guest's lifetime.
+const RestoreStop = struct {
+    power: *nether.Power,
+    handles: []const u64,
+    num_cpus: u32,
+    fn call(p: *anyopaque) void {
+        const self: *RestoreStop = @ptrCast(@alignCast(p));
+        const hvf = @import("../hv/hvf.zig");
+        self.power.request(.shutdown);
+        var tries: u32 = 0;
+        while (tries < 50) : (tries += 1) {
+            _ = hvf.hv_vcpus_exit(self.handles.ptr, self.num_cpus);
+            _ = usleep(20_000);
+        }
+    }
+};
 
 /// Restore a guest from a snapshot file (a cross-process fork): rebuild the VM,
 /// map and fill RAM, recreate each vCPU with its captured register context,
@@ -337,9 +397,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     }
     defer _ = libc.close(fd);
 
-    var hdr = [_]u8{0} ** 64;
+    var hdr = [_]u8{0} ** HDR_SIZE;
     if (!readExact(fd, &hdr)) return error.BadSnapshot;
-    validateHeader(&hdr, hvfb.MAX_SNAP_CPUS, armdev.blk_disk_storage.len, GIC_STATE_MAX, @sizeOf(hvfb.CpuState), @sizeOf(nether.virtio.Device.DeviceState), @sizeOf(nether.Pl011.State)) catch |e| {
+    validateHeader(&hdr, hvfb.MAX_SNAP_CPUS, armdev.blk_disk_storage.len, GIC_STATE_MAX, @sizeOf(hvfb.CpuState), @sizeOf(nether.virtio.Device.DeviceState), @sizeOf(nether.Pl011.State), @sizeOf(nether.Vsock.State)) catch |e| {
         switch (e) {
             error.SnapshotVersionMismatch => std.debug.print("[nether] restore: snapshot is not format v{d} (written by a different build); re-snapshot with this nether\n", .{SNAP_VERSION}),
             error.SnapshotLayoutMismatch => std.debug.print("[nether] restore: snapshot struct layout differs from this build; re-snapshot with this nether\n", .{}),
@@ -352,13 +412,15 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const gic_size = std.mem.readInt(u64, hdr[32..40], .little);
     const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
     const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
+    const ctl_present = std.mem.readInt(u32, hdr[64..68], .little) == 1;
+    const saved_conn_id = std.mem.readInt(i32, hdr[72..76], .little);
 
     // The RAM region is mapped copy-on-write by offset (not read), so a file that is
     // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
     // the guest on the first access to the missing tail. Verify the file actually
     // holds the RAM region up front (overflow-safe), then rewind to the metadata.
     const fsize = libc.lseek(fd, 0, 2); // SEEK_END
-    _ = libc.lseek(fd, 64, 0); // SEEK_SET back to just after the header
+    _ = libc.lseek(fd, @intCast(HDR_SIZE), 0); // SEEK_SET back to just after the header
     if (fsize < 0) return error.BadSnapshot;
     const file_size: u64 = @intCast(fsize);
     if (ram_off > file_size or ram_size > file_size - ram_off) {
@@ -391,6 +453,15 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (disk_size > 0) {
         if (!readExact(fd, armdev.blk_disk_storage[0..@intCast(disk_size)])) return error.BadSnapshot;
     }
+    // Control-plane state (vsock transport + engine), present iff the base snapshot
+    // was taken from a control-mode sandbox. Read right after the disk, matching the
+    // write order in writeSnapshotFile.
+    var vs_dev_state: nether.virtio.Device.DeviceState = undefined;
+    var vsock_state: nether.Vsock.State = undefined;
+    if (ctl_present) {
+        if (!readExact(fd, std.mem.asBytes(&vs_dev_state))) return error.BadSnapshot;
+        if (!readExact(fd, std.mem.asBytes(&vsock_state))) return error.BadSnapshot;
+    }
     // No up-front I-cache invalidation: the RAM pages are demand-paged COW from
     // the file (already at the point of unification) and a freshly created vCPU's
     // I-cache is empty, so there is nothing stale to flush - unlike the boot path,
@@ -406,15 +477,17 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
 
     var power = nether.Power{};
     var bus = nether.Bus{};
+    var handles: [hvfb.MAX_SNAP_CPUS]u64 = undefined; // vCPU handles for the control-plane stop
+    handles[0] = vcpu.handle;
     var ready = std.atomic.Value(u32).init(0);
     var go = std.atomic.Value(bool).init(false);
     var rc: [hvfb.MAX_SNAP_CPUS]RestoreCtx = undefined;
     var s: u32 = 1;
     while (s < num_cpus) : (s += 1) {
-        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go };
+        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go, .handles = &handles };
         (std.Thread.spawn(.{}, macRestoreCpu, .{&rc[s]}) catch return).detach();
     }
-    while (ready.load(.acquire) < num_cpus - 1) _ = usleep(200); // all redistributors exist
+    while (ready.load(.acquire) < num_cpus - 1) _ = usleep(200); // all redistributors exist (+ handles recorded)
 
     // Reinstall global state while every vCPU is parked before `go`.
     if (gic_size > 0 and !hvfb.gicRestoreState(gic)) std.debug.print("[nether] restore: gic_set_state failed\n", .{});
@@ -453,8 +526,44 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     blk_dev.importState(&blk_state);
     try pci_host.addFunction(blk_dev.function(2, 0));
 
-    var dev_list = [_]*nether.virtio.Device{ &con_dev, &blk_dev };
-    var bar_win = PciBarWindow{ .devs = &dev_list };
+    // Function 0:3.0 - virtio-vsock, recreated only when the base snapshot carried the
+    // control plane. The engine is heap-allocated (large connection state); importState
+    // restores its connection table + listen registry + staging ring, so the agent's
+    // pre-fork connection resumes mid-stream (the load-bearing "survive, not reconnect"
+    // decision). Callbacks are re-wired to THIS process's handlers.
+    var vs_engine: ?*nether.Vsock = null;
+    defer if (vs_engine) |v| allocator.destroy(v);
+    var vsdev: nether.VsockDev = undefined;
+    var vs_dev: nether.virtio.Device = undefined;
+    var vs_intx: IntxLine = undefined;
+    if (ctl_present) {
+        const vs = try allocator.create(nether.Vsock);
+        vs.* = .{ .guest_cid = 3 };
+        vs.importState(&vsock_state); // restore the connection table, listens, staging ring
+        vs_engine = vs;
+        vsdev = .{ .engine = vs };
+        vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
+        vs_intx = .{ .intid = armPciIntxIntid(3) };
+        vs_dev.intx_ptr = &vs_intx;
+        vs_dev.intx_fn = IntxLine.set;
+        vs_dev.msi_ptr = &vs_dev;
+        vs_dev.msi_fn = armSendMsi;
+        vs_dev.importState(&vs_dev_state); // restore the virtqueue transport state
+        try pci_host.addFunction(vs_dev.function(3, 0));
+        vsdev.attach(&vs_dev);
+    }
+
+    var dev_buf: [3]*nether.virtio.Device = undefined;
+    var ndev: usize = 0;
+    dev_buf[ndev] = &con_dev;
+    ndev += 1;
+    dev_buf[ndev] = &blk_dev;
+    ndev += 1;
+    if (ctl_present) {
+        dev_buf[ndev] = &vs_dev;
+        ndev += 1;
+    }
+    var bar_win = PciBarWindow{ .devs = dev_buf[0..ndev] };
     try bus.addMmio(bar_win.device());
     try bus.addMmio(pci_host.mmioDevice());
 
@@ -462,26 +571,94 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     defer if (saved_termios) |t| armRestoreTermios(t);
     if (std.Thread.spawn(.{}, armStdinPump, .{&uart})) |t| t.detach() else |_| {}
 
-    std.debug.print("[nether] RESTORED from {s}: {d} cpus, {d} MiB RAM, gic {d}B. Resuming the forked guest.\n", .{ path, num_cpus, ram_size / (1024 * 1024), gic_size });
-    // KNOWN LIMITATION: a forked guest is console + virtio-blk only. The restore path
-    // does NOT re-establish the platform control plane (no control socket, no vsock/agent
-    // channel), and the snapshot format does not yet capture vsock/net device state. So a
-    // platform that set `control_socket` and waits for it would wait forever - say so,
-    // rather than leave the missing socket a silent mystery. Full snapshot-fork
-    // driveability (capture vsock/net state + wire the control plane here + guest-agent
-    // reconnect) is tracked in docs/control-protocol.md and SESSION-HANDOFF.md.
-    var sock_buf: [256]u8 = undefined;
-    if (conf.confGet("control_socket", &sock_buf) != null or conf.modeOn("control", "nether-control")) {
-        std.debug.print("[nether] restore: NOTE the control plane is NOT active on a forked guest yet " ++
-            "(console + virtio-blk only; no control socket / vsock / agent). Snapshot-fork " ++
-            "driveability over the control protocol is not implemented.\n", .{});
+    std.debug.print("[nether] RESTORED from {s}: {d} cpus, {d} MiB RAM, gic {d}B, control-plane={s}. Resuming the forked guest.\n", .{ path, num_cpus, ram_size / (1024 * 1024), gic_size, if (ctl_present) "on" else "off" });
+
+    // Narrowed NOTE: a base snapshot taken from a NON-control sandbox carries no vsock/
+    // agent state, so this fork is console + virtio-blk only even if the operator set a
+    // control_socket. Say so (rather than leave the missing socket a silent mystery);
+    // re-snapshot from a control-mode sandbox for a driveable fork.
+    if (!ctl_present) {
+        var sock_buf: [256]u8 = undefined;
+        if (conf.confGet("control_socket", &sock_buf) != null or conf.modeOn("control", "nether-control")) {
+            std.debug.print("[nether] restore: NOTE this snapshot has no control plane (base was a non-control sandbox); " ++
+                "the forked guest is console + virtio-blk only - no control socket. Re-snapshot from a " ++
+                "control-mode sandbox for a driveable fork.\n", .{});
+        }
     }
+
+    // Control plane: rebuild the observe/meter/run core FRESH (each fork is a new
+    // billable session), re-wire the vsock engine to this process's agent handler,
+    // open the control socket, and arm the govern watchdogs - so a forked sandbox is
+    // driveable over the control protocol exactly like a fresh boot. The agent's
+    // surviving connection id comes across from the snapshot, so a command round-trips
+    // immediately with no reconnect.
+    var core = control.Core{};
+    var render: nether.Render = undefined;
+    var ctl_ctx: control.ControlCtx = undefined;
+    var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
+    var watchdogs: platform.Watchdogs = undefined;
+    if (ctl_present) {
+        core.init(ram_size / (1024 * 1024), num_cpus, @intCast(conf.confGetInt("max_output_bytes", 0)));
+        core.journal.emit(.life, "restored from snapshot fork");
+
+        // Render pillar: tee agent output into a VT screen for __screen__.
+        const rows: u16 = @intCast(std.math.clamp(conf.confGetInt("screen_rows", 24), 1, 200));
+        const cols: u16 = @intCast(std.math.clamp(conf.confGetInt("screen_cols", 80), 1, 400));
+        render = try nether.Render.init(allocator, rows, cols);
+        core.agent.render = &render;
+
+        // Re-wire the engine callbacks to this process and resume the agent connection.
+        const vs = vs_engine.?;
+        vs.on_event = control.agentEvent;
+        vs.on_event_ctx = &core.agent;
+        _ = vsdev.hostListen(5000); // idempotent (restored listen set already has it); enables future reconnects
+        core.agent.conn_id.store(saved_conn_id, .release); // the surviving connection drives immediately
+
+        var sock_path_buf: [256]u8 = undefined;
+        const have_sock_conf = conf.confGet("control_socket", &sock_path_buf) != null;
+        const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
+        const net_on = conf.modeOn("net", "nether-net");
+        control.startControl(&ctl_ctx, .{
+            .vsdev = &vsdev,
+            .agent = &core.agent,
+            .meter = &core.meter,
+            .journal = &core.journal,
+            .gpu = null, // gpu state is not part of the snapshot
+            .stop = .{ .ctx = &hvf_stop, .func = RestoreStop.call },
+            .path = ctl_path,
+            .allocator = allocator,
+            .info = .{
+                .cpus = num_cpus,
+                .ram_mb = ram_size / (1024 * 1024),
+                .net = net_on,
+                .firewall = net_on and !conf.confBool("net_open"),
+                .gpu = false,
+                .max_runtime_s = conf.confGetInt("max_runtime_s", 0),
+                .max_cpu_s = conf.confGetInt("max_cpu_s", 0),
+                .idle_timeout_s = conf.confGetInt("idle_timeout_s", 0),
+                .rate_kbps = conf.confGetInt("net_rate_kbps", 0),
+                .max_output_bytes = conf.confGetInt("max_output_bytes", 0),
+            },
+        });
+
+        watchdogs = .{
+            .stop = .{ .ctx = &hvf_stop, .func = RestoreStop.call },
+            .activity = &core.meter.last_activity_ms,
+            .runtime_ms = @intCast(conf.confGetInt("max_runtime_s", 0) * 1000),
+            .idle_ms = @intCast(conf.confGetInt("idle_timeout_s", 0) * 1000),
+            .cpu_ms = @intCast(conf.confGetInt("max_cpu_s", 0) * 1000),
+        };
+        watchdogs.arm();
+    }
+    defer if (ctl_present) render.deinit();
+
     go.store(true, .release); // release secondaries; run cpu0
     const reason = vcpu.runSmp(&bus, &power, null, null) catch |err| {
         std.debug.print("\n[nether] forked guest stopped: {s}\n", .{@errorName(err)});
         return err;
     };
     std.debug.print("\n[nether] forked guest {s}.\n", .{@tagName(reason)});
+    if (ctl_present) core.finalUsage(@tagName(reason)); // the teardown bill for the fork session
 }
 
 // --- tests -----------------------------------------------------------------
@@ -491,11 +668,12 @@ test "snapshot header validation gates version, layout, and oversized sizes" {
     const CPU: u32 = 100;
     const DEV: u32 = 200;
     const UART: u32 = 50;
+    const VSOCK: u32 = 300;
     const DISK_CAP: u64 = 1024 * 1024;
     const GIC_CAP: u64 = GIC_STATE_MAX;
 
     // A well-formed header for this "build".
-    var hdr = [_]u8{0} ** 64;
+    var hdr = [_]u8{0} ** HDR_SIZE;
     std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
     std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION, .little);
     std.mem.writeInt(u32, hdr[8..12], 4, .little); // num_cpus
@@ -505,32 +683,42 @@ test "snapshot header validation gates version, layout, and oversized sizes" {
     std.mem.writeInt(u64, hdr[40..48], DISK_CAP, .little); // disk_size == cap (ok)
     std.mem.writeInt(u32, hdr[56..60], DEV, .little);
     std.mem.writeInt(u32, hdr[60..64], UART, .little);
-    try validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART); // accepts a good header
+    std.mem.writeInt(u32, hdr[64..68], 1, .little); // control-plane present
+    std.mem.writeInt(u32, hdr[68..72], VSOCK, .little); // vsock engine-state fingerprint
+    try validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK); // accepts a good header
 
     var bad = hdr;
     std.mem.writeInt(u32, bad[0..4], 0xdead_beef, .little); // wrong magic
-    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     bad = hdr;
     std.mem.writeInt(u32, bad[4..8], SNAP_VERSION + 1, .little); // version mismatch
-    try testing.expectError(error.SnapshotVersionMismatch, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.SnapshotVersionMismatch, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     // Layout drift: this build's cpu struct size differs from the file's fingerprint.
-    try testing.expectError(error.SnapshotLayoutMismatch, validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU + 1, DEV, UART));
+    try testing.expectError(error.SnapshotLayoutMismatch, validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU + 1, DEV, UART, VSOCK));
+
+    // Layout drift in the control-plane section: the vsock engine struct size differs.
+    try testing.expectError(error.SnapshotLayoutMismatch, validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK + 1));
+
+    // A non-control snapshot (flag 0) ignores the vsock fingerprint entirely.
+    bad = hdr;
+    std.mem.writeInt(u32, bad[64..68], 0, .little); // control-plane absent
+    try validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK + 1);
 
     bad = hdr;
     std.mem.writeInt(u64, bad[40..48], DISK_CAP + 1, .little); // disk would overrun the buffer
-    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     bad = hdr;
     std.mem.writeInt(u64, bad[32..40], GIC_CAP + 1, .little); // absurd gic size
-    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     bad = hdr;
     std.mem.writeInt(u32, bad[8..12], 9, .little); // too many cpus
-    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     bad = hdr;
     std.mem.writeInt(u64, bad[24..32], 0, .little); // zero ram
-    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART));
+    try testing.expectError(error.BadSnapshot, validateHeader(&bad, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 }

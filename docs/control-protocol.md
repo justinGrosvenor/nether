@@ -135,20 +135,28 @@ inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command out
 `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb` (sizing). All
 are reported back by `__info__` so a client can verify what it got.
 
-## Snapshot / fork limitation (read before building snapshot-fork)
+## Snapshot / fork (HVF)
 
-A **freshly booted** sandbox exposes the full control plane above. A **snapshot-restored
-(forked)** sandbox currently does **not**: the restore path resumes only the captured guest
-devices (console + virtio-blk) and does **not** re-establish the control socket, the
-vsock/agent channel, or any host-side platform state. So a forked sandbox is **not
-driveable over the control protocol** today - it has no control socket to connect to. A
-platform that spawns a restore with `control_socket=` set and waits for the socket would
-wait forever; the restore logs an explicit NOTE saying so.
+A **snapshot-restored (forked)** sandbox is **driveable over the full control protocol**,
+the same as a fresh boot - provided the **base snapshot was taken from a control-mode
+sandbox** (booted with `control_socket=` so the vsock/agent channel exists). The restore
+path then re-exposes the control socket, rebuilds the observe/meter/run `Core` fresh (each
+fork is a new billable session, with its own teardown bill), and re-arms the govern
+watchdogs from the fork's `nether.conf`.
 
-Three things are needed for snapshot-fork driveability, none yet built: (1) the snapshot
-format must capture vsock (and net) device state, not just console + blk; (2) the restore
-path must wire the control plane (control socket, vsock-in-agent-mode, `Core`, the stop)
-the way the boot path does; (3) the in-guest agent must detect the dead-across-fork vsock
-connection and reconnect to the fresh host listener. Until then, **drive each sandbox from
-a fresh boot** (the e2e's D1 model), not from a fork. Snapshot-fork remains valid as a
-fast guest-resume primitive (HVF, ~90 ms) - it just is not yet wired to the control plane.
+The load-bearing property: the agent's vsock connection **survives the fork**. The snapshot
+captures the vsock transport (virtio device) state, the host-side engine state (connection
+table, listen registry, credit, staging ring), and the agent's connection id; the restore
+re-wires the engine's callbacks to the new process and resumes that connection mid-stream.
+So a driving command (a shell line, `__put__`/`__get__`) **round-trips immediately with no
+reconnect** - there is no reconnect barrier for a client to wait on. A client drives a fork
+exactly as it drives a fresh boot: connect → `__info__` → send commands.
+
+What carries across: RAM (COW), per-vCPU state, GIC, console + virtio-blk, the disk, and -
+when the base was control-mode - the vsock device + engine + agent connection. What does
+**not**: virtio-net (slirp holds real host sockets a forked process can't inherit, so
+outbound flows reset and the guest re-establishes them at the TCP level; net device-state
+capture is a planned follow-on), and gpu scanout state. A base snapshot taken from a
+**non-control** sandbox has no vsock/agent state, so its forks are console + virtio-blk only
+even if `control_socket=` is set; the restore logs an explicit NOTE saying so. Snapshot-fork
+is HVF/aarch64 only (KVM snapshot is unimplemented). Fork latency is ~90 ms (COW RAM map).
