@@ -21,6 +21,13 @@ The socket is owner-only (peer-uid checked). The **first** client to connect is 
 clients are read-only *observers*: they may issue the introspection/observe queries but
 not drive the sandbox. Send one command per line (`\n`-terminated).
 
+**Reference client.** `tools/nether-ctl.c` is the canonical implementation of this
+protocol - the proto-version handshake, sending a command, and reassembling the framed
+reply (it propagates the guest command's exit code). Build it on the host with
+`cc -O2 tools/nether-ctl.c -o nether-ctl`, then `nether-ctl <socket> __info__` or
+`nether-ctl <socket> <command...>`. An integrating client (e.g. swerver) can mirror its
+`read_reply` framing logic directly.
+
 ## Reply shapes
 
 - **Reports** (`__info__`, `__stats__`, `__help__`) end with a `0x1e` byte then `0\n`

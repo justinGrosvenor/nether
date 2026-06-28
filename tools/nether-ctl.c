@@ -1,0 +1,145 @@
+/* nether-ctl: a reference client for the Nether control protocol.
+ *
+ * The control socket (docs/control-protocol.md) is the platform's integration
+ * contract. This is the canonical example of speaking it: the proto-version
+ * handshake, sending a command, and reassembling the framed reply. It is also a
+ * handy operator tool (cleaner than raw `nc -U`, which can't parse the framing or
+ * surface the guest exit code) and a live smoke for the contract.
+ *
+ *   nether-ctl <socket-path>              # handshake, print __info__
+ *   nether-ctl <socket-path> <command...> # handshake, run command, print reply
+ *
+ * On connect it sends __info__, reads the report, and verifies proto_version (a
+ * mismatch is a breaking change; we warn and continue). Then it sends the command
+ * line and reads the reply. A shell command and the report-style queries
+ * (__info__/__stats__/__help__) end with the agent frame `0x1e<exit>\n`; we print
+ * the body (everything before 0x1e) and exit with the guest's exit code. The
+ * self-delimiting logs (__events__/__cmdlog__/__netlog__) and binary replies
+ * (__frame__) carry no 0x1e, so we fall back to draining until the socket goes
+ * idle. Build (host): cc -O2 tools/nether-ctl.c -o nether-ctl
+ */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#define RS 0x1e           /* the reply frame separator: body ends at 0x1e, then <exit>\n */
+#define HANG_MS 60000     /* framed reply: give up only after this long with NO progress */
+#define IDLE_MS 2000      /* unframed reply: a gap this long after data means it's done */
+#define BUFCAP (1 << 20)  /* 1 MiB reply ceiling (a full screen/frame fits) */
+
+/* Does this command's reply end with the 0x1e<exit>\n frame? Shell commands do, as
+ * do the report queries (__info__/__stats__/__help__). The logs (__events__/__cmdlog__
+ * /__netlog__), render/framebuffer snapshots, and ERR/OK lines do NOT - they are
+ * self-delimiting or binary and end at a line/idle gap. We must know which, because a
+ * framed reply has to be read until its 0x1e (a slow command can pause arbitrarily
+ * before producing it), while an unframed reply has no in-band terminator. */
+static int is_framed(const char *cmd) {
+    if (strncmp(cmd, "__", 2) != 0) return 1; /* a shell command -> agent frame */
+    return strncmp(cmd, "__info__", 8) == 0 ||
+        strncmp(cmd, "__stats__", 9) == 0 ||
+        strncmp(cmd, "__help__", 8) == 0;
+}
+
+static int connect_unix(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(path) + 1 > sizeof(addr.sun_path)) { close(fd); return -1; }
+    strcpy(addr.sun_path, path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+static int write_full(int fd, const char *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* Read one reply into `buf`. For a `framed` reply, block until the 0x1e<exit>\n frame
+ * arrives (a slow command may pause arbitrarily before it; only a HANG_MS gap with no
+ * data at all is treated as a dead guest). For an unframed reply (logs/binary/ERR),
+ * there is no in-band terminator, so return once the stream goes idle after data, or on
+ * EOF. Returns the body byte count (for framed, excludes the frame); *exit_code is the
+ * guest exit on a framed reply, else -1. */
+static ssize_t read_reply(int fd, char *buf, size_t cap, int *exit_code, int framed) {
+    *exit_code = -1;
+    size_t len = 0;
+    for (;;) {
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int r = poll(&p, 1, framed ? HANG_MS : IDLE_MS);
+        if (r <= 0) break;  /* framed: HANG_MS with no data => dead guest. unframed: idle => done. */
+        ssize_t n = read(fd, buf + len, cap - len);
+        if (n <= 0) break;  /* EOF / error */
+        len += (size_t)n;
+        if (framed) {
+            /* body ends at 0x1e, then "<exit>\n" (wait for the newline after it). */
+            char *rs = memchr(buf, RS, len);
+            if (rs && memchr(rs, '\n', len - (size_t)(rs - buf))) {
+                *exit_code = atoi(rs + 1);
+                return rs - buf;
+            }
+        }
+        if (len == cap) break;  /* full: stop (truncated, but safe) */
+    }
+    return (ssize_t)len;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <control-socket> [command...]\n", argv[0]);
+        return 2;
+    }
+    const char *path = argv[1];
+    int fd = connect_unix(path);
+    if (fd < 0) { fprintf(stderr, "nether-ctl: cannot connect to %s\n", path); return 1; }
+
+    static char buf[BUFCAP];
+
+    /* Handshake: __info__ then verify proto_version. */
+    if (write_full(fd, "__info__\n", 9) < 0) { fprintf(stderr, "nether-ctl: write failed\n"); return 1; }
+    int ec;
+    ssize_t n = read_reply(fd, buf, sizeof(buf), &ec, 1); /* __info__ is framed */
+    if (n <= 0) { fprintf(stderr, "nether-ctl: no __info__ reply\n"); return 1; }
+    buf[n < (ssize_t)sizeof(buf) ? n : (ssize_t)sizeof(buf) - 1] = '\0';
+    char *pv = strstr(buf, "proto_version=");
+    if (!pv) {
+        fprintf(stderr, "nether-ctl: warning: no proto_version in __info__ (old nether?)\n");
+    } else if (atoi(pv + strlen("proto_version=")) != 1) {
+        fprintf(stderr, "nether-ctl: warning: proto_version=%d, expected 1 (breaking change)\n",
+                atoi(pv + strlen("proto_version=")));
+    }
+
+    /* No command: the handshake's __info__ report IS the output. */
+    if (argc == 2) { (void)write_full(1, buf, (size_t)n); return 0; }
+
+    /* Join argv[2..] into one space-separated command line. */
+    static char cmd[8192];
+    size_t clen = 0;
+    for (int i = 2; i < argc && clen < sizeof(cmd) - 2; i++) {
+        if (i > 2) cmd[clen++] = ' ';
+        size_t al = strlen(argv[i]);
+        if (clen + al >= sizeof(cmd) - 2) break;
+        memcpy(cmd + clen, argv[i], al);
+        clen += al;
+    }
+    cmd[clen++] = '\n';
+    if (write_full(fd, cmd, clen) < 0) { fprintf(stderr, "nether-ctl: write failed\n"); return 1; }
+
+    n = read_reply(fd, buf, sizeof(buf), &ec, is_framed(argv[2]));
+    if (n < 0) { fprintf(stderr, "nether-ctl: read failed\n"); return 1; }
+    (void)write_full(1, buf, (size_t)n);
+    /* Exit with the guest command's exit code when the reply was framed. */
+    return ec < 0 ? 0 : ec;
+}
