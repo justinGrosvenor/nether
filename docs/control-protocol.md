@@ -188,7 +188,21 @@ appears only in settlement mode). Flip it per sandbox; nothing else about the ru
 `max_runtime_s` (wall-clock cap), `max_cpu_s` (CPU-time cap), `idle_timeout_s` (reclaim on
 inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
 default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb`
-(sizing). All are reported back by `__info__` so a client can verify what it got.
+(sizing), `disk`/`disk_size_mb` (persistent disk; below). All caps are reported back by
+`__info__` so a client can verify what it got.
+
+### Persistent disk
+
+By default a sandbox is ephemeral (RAM-backed initramfs); all writes vanish on stop. For
+stateful / database workloads, set `disk=<host-path>` (and optionally `disk_size_mb`,
+default 64): Nether mmaps that host file (`MAP_SHARED`) as virtio-blk, so the guest's block
+writes flush back to it and **survive sandbox restarts**. The guest's `/init` loads
+`virtio_blk` + `ext4` and auto-mounts `/dev/vda` at `/data` if it carries a filesystem, so a
+workload just uses `/data`. Format it once (in-guest `mkfs.ext4 /dev/vda`, or pre-format the
+host image). The platform owns per-sandbox disk files: two live sandboxes must not share one
+(no cross-mount locking). A file-backed disk is **not** captured in snapshots (the file is
+its own persistence and can exceed the snapshot's disk section); set `disk=` on a fork's
+conf to attach it there too. Verified: a python+sqlite db on `/data` survives a restart.
 
 ### Networking / egress (how to turn it on)
 

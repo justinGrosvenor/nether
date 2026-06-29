@@ -12,6 +12,7 @@ pub const libc = struct {
     pub extern "c" fn close(fd: c_int) c_int;
     pub extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
     pub extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+    pub extern "c" fn ftruncate(fd: c_int, length: i64) c_int; // size a backing file (persistent disk)
     pub extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
     // Unix-domain control socket + a pipe to relay the guest agent's replies.
     pub extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;

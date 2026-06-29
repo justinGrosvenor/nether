@@ -688,7 +688,16 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     con_dev.importState(&con_state);
     try pci_host.addFunction(con_dev.function(1, 0));
 
-    var blk = nether.VirtioBlk{ .disk = armdev.blk_disk_storage[0..] };
+    // virtio-blk backing: a persistent host file if the fork's conf sets `disk=` (same as
+    // the boot path), else the in-memory disk restored from the snapshot. A file-backed
+    // disk persists independently of the snapshot, so the restored disk_size is 0 and the
+    // file is the source of truth.
+    var blk_path_buf: [1024]u8 = undefined;
+    const blk_backing: []u8 = if (conf.confGet("disk", &blk_path_buf)) |_| backing: {
+        const mb: usize = @intCast(@max(conf.confGetInt("disk_size_mb", 64), 1));
+        break :backing armdev.openDiskFile(@ptrCast(&blk_path_buf), mb * 1024 * 1024) orelse armdev.blk_disk_storage[0..];
+    } else armdev.blk_disk_storage[0..];
+    var blk = nether.VirtioBlk{ .disk = blk_backing };
     var blk_dev = nether.virtio.Device.init(blk.backend(), gmem);
     var blk_intx = IntxLine{ .intid = armPciIntxIntid(2) };
     blk_dev.intx_ptr = &blk_intx;

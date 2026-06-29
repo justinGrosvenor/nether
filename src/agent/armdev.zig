@@ -44,6 +44,29 @@ pub fn makeBlkDisk() []u8 {
     return &blk_disk_storage;
 }
 
+/// Open (creating if absent) a host file as a PERSISTENT virtio-blk backing of `size`
+/// bytes, mmap'd MAP_SHARED so the guest's block writes flush back to the file and
+/// survive across sandbox restarts. The fd may be closed after mmap (the mapping
+/// persists). Returns null on any failure so the caller can fall back to the ephemeral
+/// in-memory disk. HVF-side; `disk=<path>` / `disk_size_mb` in nether.conf select it.
+pub fn openDiskFile(path: [*:0]const u8, size: usize) ?[]u8 {
+    const O_RDWR = 0x0002;
+    const O_CREAT = 0x0200;
+    const fd = libc.open(path, O_RDWR | O_CREAT, @as(c_int, 0o644));
+    if (fd < 0) return null;
+    defer _ = libc.close(fd); // the mmap keeps the file mapped after the fd closes
+    if (libc.ftruncate(fd, @intCast(size)) != 0) return null; // fix the disk capacity (sparse)
+    const mem = std.posix.mmap(
+        null,
+        size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED }, // writes go back to the file -> persistence
+        fd,
+        0,
+    ) catch return null;
+    return mem;
+}
+
 /// Legacy PCI INTx line for a virtio function (the fallback when the guest has no
 /// MSI domain). The DTB interrupt-map routes (slot, INTA) to a GIC SPI via the
 /// swizzle pci_intx_spi + ((slot + pin - 1) % 4); each device carries its own

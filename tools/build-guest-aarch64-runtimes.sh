@@ -15,13 +15,63 @@
 # SQLite / JS service classes). Run from the repo root. Requires Docker.
 set -euo pipefail
 
-RUNTIMES="${RUNTIMES:-python3 sqlite nodejs}"
+# Default set: the python / SQLite / JS runtimes, plus e2fsprogs so a workload can
+# mkfs.ext4 a persistent disk (disk=<path>) in-guest. Override via the RUNTIMES env.
+RUNTIMES="${RUNTIMES:-python3 sqlite nodejs e2fsprogs}"
 
 [ -d kernels/rootfs ] || {
   echo "error: kernels/rootfs/ missing -- build the base rootfs first (docs/running-on-hvf.md)" >&2
   exit 1
 }
 command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
+
+# Write the canonical /init (the tracked source of the guest boot logic): load the
+# virtio/vsock/blk + ext4 modules, auto-mount a persistent disk at /data, bring up the
+# slirp network, and start the agent. Regenerated here so it lives in version control
+# (kernels/rootfs/ itself is a gitignored build asset).
+cat > kernels/rootfs/init <<'INIT'
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+
+# virtio-net + the vsock transport (the agent's spine); virtio-blk + ext4 for a
+# persistent disk. Core virtio/virtio_pci/virtio_ring are built into the kernel.
+modprobe virtio_net 2>/dev/null
+modprobe vmw_vsock_virtio_transport 2>/dev/null
+modprobe virtio_blk 2>/dev/null
+modprobe ext4 2>/dev/null
+
+# Persistent disk: when the host set disk=<path>, /dev/vda is a host-file-backed disk;
+# auto-mount it at /data if it carries a filesystem (mkfs.ext4 it once). Harmless if raw.
+if [ -b /dev/vda ]; then
+	mkdir -p /data
+	mount /dev/vda /data 2>/dev/null && echo "[init] persistent disk mounted at /data"
+fi
+
+# Static slirp address plan (guest 10.0.2.15, gw 10.0.2.2, DNS 10.0.2.3); slirp also
+# answers DHCP if preferred.
+for d in /sys/class/net/*; do
+	n=${d##*/}
+	[ "$n" = lo ] && continue
+	ip addr add 10.0.2.15/24 dev "$n" 2>/dev/null
+	ip link set "$n" up 2>/dev/null
+	ip route add default via 10.0.2.2 2>/dev/null
+done
+ip link set lo up 2>/dev/null
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+
+# The persistent guest agent (exec-over-vsock). Exits harmlessly if the host is not in
+# agent/control mode.
+[ -x /agent ] && /agent &
+
+echo
+echo "  Nether - aarch64 Linux on Apple Hypervisor.framework"
+echo "  $(uname -srm)"
+echo
+exec /bin/sh
+INIT
+chmod +x kernels/rootfs/init
 
 echo "[guest-aarch64] baking runtimes into kernels/rootfs: $RUNTIMES"
 docker run --rm --platform linux/arm64 -v "$PWD:/host" alpine:3.21 sh -c '

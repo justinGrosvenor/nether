@@ -849,10 +849,24 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     con_dev.msi_fn = armSendMsi;
     try pci_host.addFunction(con_dev.function(1, 0));
 
-    // Function 0:2.0 - virtio-blk backed by an in-memory disk with a recognizable
-    // signature, exercised by loading virtio_blk.ko in the guest (-> /dev/vda).
-    // Proves a second virtio function on the same bus (own BAR + MSI-X vectors).
-    var blk = nether.VirtioBlk{ .disk = makeBlkDisk() };
+    // Function 0:2.0 - virtio-blk (-> /dev/vda when the guest loads virtio_blk). Backing:
+    // a PERSISTENT host file if `disk=<path>` is set (mmap'd MAP_SHARED, sized by
+    // `disk_size_mb`, default 64; writes survive restarts - the stateful/db story), else
+    // the ephemeral in-memory demo disk. A file-backed disk can be larger than the
+    // snapshot's 1 MiB disk section, and the file IS the persistence, so it is NOT captured
+    // in snapshots (the SnapCtx below passes an empty disk when file-backed).
+    var disk_path_buf: [1024]u8 = undefined;
+    const disk_file_backed = confGet("disk", &disk_path_buf) != null;
+    const blk_backing: []u8 = if (disk_file_backed) backing: {
+        const mb: usize = @intCast(@max(confGetInt("disk_size_mb", 64), 1));
+        if (armdev.openDiskFile(@ptrCast(&disk_path_buf), mb * 1024 * 1024)) |d| {
+            std.debug.print("[nether] virtio-blk: persistent disk '{s}' ({d} MiB, host-file-backed)\n", .{ @as([*:0]const u8, @ptrCast(&disk_path_buf)), mb });
+            break :backing d;
+        }
+        std.debug.print("[nether] virtio-blk: WARNING cannot open disk '{s}'; using an ephemeral in-memory disk\n", .{@as([*:0]const u8, @ptrCast(&disk_path_buf))});
+        break :backing makeBlkDisk();
+    } else makeBlkDisk();
+    var blk = nether.VirtioBlk{ .disk = blk_backing };
     var blk_dev = nether.virtio.Device.init(blk.backend(), gmem);
     var blk_intx = IntxLine{ .intid = armPciIntxIntid(2) };
     blk_dev.intx_ptr = &blk_intx;
@@ -1005,7 +1019,10 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         .snap = &snapctl,
         .con_dev = &con_dev,
         .blk_dev = &blk_dev,
-        .blk_disk = blk.disk,
+        // A file-backed persistent disk is NOT snapshotted (the file is the persistence,
+        // and it can exceed the snapshot's disk section); pass an empty slice so the
+        // capture records no disk. The ephemeral in-memory disk is captured as before.
+        .blk_disk = if (disk_file_backed) blk.disk[0..0] else blk.disk,
         .uart = &uart,
         .save = modeOn("snapshot_save", "nether-snapshot-save"),
         // Control plane: capture vsock transport + engine + agent conn id so a forked
