@@ -29,6 +29,8 @@ pub const libc = struct {
     // so the other never links. See peerUid below.
     pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
     pub extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *u32) c_int;
+    pub extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: u32) c_int;
+    pub extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
     pub extern "c" fn socketpair(domain: c_int, ty: c_int, proto: c_int, fds: *[2]c_int) c_int;
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
     // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
@@ -37,6 +39,26 @@ pub const libc = struct {
     // previous handler, ignored. SIGPIPE=13 / SIG_IGN=1 are the same on macOS and Linux.
     pub extern "c" fn signal(sig: c_int, handler: usize) usize;
 };
+
+/// Bound how long a `write` to `fd` blocks when the peer's receive buffer is full
+/// (SO_SNDTIMEO). Used on control-client sockets so a wedged consumer that stops reading
+/// cannot make the relay's write block forever - and thereby stall the pipe -> agent ->
+/// vCPU chain that would freeze the guest. A timed-out write returns short/EAGAIN, which
+/// the relay treats as "drop this client". BSD/macOS socket-option values; on Linux this
+/// is a graceful no-op (wrong constants -> setsockopt errors, ignored) until the port.
+pub fn setSendTimeout(fd: c_int, ms: u32) void {
+    const SOL_SOCKET: c_int = if (builtin.os.tag == .macos) 0xffff else 1;
+    const SO_SNDTIMEO: c_int = if (builtin.os.tag == .macos) 0x1005 else 21;
+    const tv = timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    _ = libc.setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, @sizeOf(timeval));
+}
+
+/// Half-close both directions of a socket so a peer/owner thread blocked in `read`
+/// wakes (returns 0) and cleans up. Unlike close(), it does not free the fd number, so
+/// it is safe to call on a socket another thread still owns (no fd-reuse race).
+pub fn shutdownRdwr(fd: c_int) void {
+    _ = libc.shutdown(fd, 2); // SHUT_RDWR (2 on macOS and Linux)
+}
 
 /// Ignore SIGPIPE process-wide so a `write` to a control client that disconnected
 /// mid-stream returns EPIPE (handled by `writeAll` returning false) instead of the

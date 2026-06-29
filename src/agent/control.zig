@@ -947,6 +947,13 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
 /// bounds an accidental fan-out, not an attacker.
 const MAX_CLIENTS: u32 = 8;
 
+/// How long a write to a control client may block on a full socket buffer before the
+/// client is judged wedged and dropped. The control socket is local IPC, so a healthy
+/// client drains in microseconds; only a consumer that stops reading for this long (and
+/// would otherwise stall the relay -> pipe -> agent -> vCPU chain, freezing the guest)
+/// trips it. Generous, since the cost of a false positive is just a forced reconnect.
+const RELAY_STALL_TIMEOUT_MS: u32 = 5_000;
+
 pub fn controlListener(ctx: *ControlCtx) void {
     const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -1016,6 +1023,9 @@ pub fn controlListener(ctx: *ControlCtx) void {
 fn clientThread(ctx: *ControlCtx, c: c_int) void {
     defer _ = libc.close(c);
     defer _ = ctx.active_clients.fetchSub(1, .release);
+    // Bound writes to this client so a consumer that stops reading cannot wedge the relay
+    // (and thereby stall the guest); a timed-out write makes the relay drop the client.
+    hostutil.setSendTimeout(c, RELAY_STALL_TIMEOUT_MS);
     // Claim the primary slot if it is free; otherwise serve as an observer.
     const is_primary = ctx.client.cmpxchgStrong(-1, c, .acq_rel, .acquire) == null;
     defer if (is_primary) ctx.client.store(-1, .release);
@@ -1075,8 +1085,22 @@ pub fn controlRelay(ctx: *ControlCtx) void {
         if (n <= 0) return;
         const c = ctx.client.load(.acquire);
         if (c >= 0) {
-            _ = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
-            _ = ctx.meter.bytes_out.fetchAdd(@intCast(n), .release);
+            const w = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
+            if (w == n) {
+                _ = ctx.meter.bytes_out.fetchAdd(@intCast(n), .release);
+            } else {
+                // The primary is not draining: the SO_SNDTIMEO-bounded write returned
+                // short or failed, meaning the client has not read for RELAY_STALL_TIMEOUT_MS.
+                // Drop it so the relay keeps draining the pipe and the GUEST does not stall
+                // behind a wedged consumer. Clear the slot only if it is still this client
+                // (cmpxchg avoids clobbering a newly reconnected primary), and shutdown -
+                // not close - so its owner clientThread wakes, frees the fd, and the slot
+                // reopens for a fresh primary.
+                if (w > 0) _ = ctx.meter.bytes_out.fetchAdd(@intCast(w), .release);
+                _ = ctx.client.cmpxchgStrong(c, -1, .acq_rel, .acquire);
+                hostutil.shutdownRdwr(c);
+                std.debug.print("[control] primary client wedged (no read in {d}ms); dropped to keep the guest live\n", .{RELAY_STALL_TIMEOUT_MS});
+            }
         }
     }
 }
@@ -1524,6 +1548,31 @@ test "a control-client disconnect mid-write does not kill the process (SIGPIPE i
     }
     _ = libc.close(fds[0]);
     try testing.expect(failed); // EPIPE surfaced as a false, and the process is still alive
+}
+
+test "setSendTimeout bounds a write to a non-draining client (relay can't be wedged forever)" {
+    // The relay writes the agent's reply to the primary client. If the client stops
+    // reading, that write must not block forever (it would stall pipe -> agent -> vCPU and
+    // freeze the guest). With SO_SNDTIMEO the write returns once the buffer is full and the
+    // timeout elapses. The peer (fds[1]) stays OPEN but unread, so this is a stall, not a
+    // disconnect. The test reaching its end at all proves the write didn't hang forever.
+    var fds: [2]c_int = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    hostutil.setSendTimeout(fds[0], 200); // 200ms cap (vs the 5s production value)
+    var blob: [65536]u8 = undefined;
+    @memset(&blob, 'x');
+    var bounded = false;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) { // bounded so a broken timeout shows as a hang, not a spin
+        const w = libc.write(fds[0], &blob, blob.len);
+        if (w < @as(isize, @intCast(blob.len))) { // buffer full + timeout -> short/EAGAIN
+            bounded = true;
+            break;
+        }
+    }
+    try testing.expect(bounded);
 }
 
 test "agent reply relay survives hostile guest streams (exit-scan + output cap)" {

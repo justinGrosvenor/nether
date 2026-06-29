@@ -28,6 +28,14 @@ primary and can resume driving. So the platform can crash, restart, and reattach
 live sandbox. A sandbox with no client is reclaimed only by `idle_timeout_s` (govern) or
 an explicit `__shutdown__`; it is never torn down merely because the controller left.
 
+**A wedged reader cannot freeze the guest.** Because the relay writes a command's output
+to the primary socket, a primary that connects but *stops reading* would otherwise back up
+the relay -> agent -> vCPU chain and stall the guest. So a write that blocks on a full
+socket buffer for more than ~5s declares that client wedged and drops it (the slot reopens
+for a fresh primary). A normally-reading client never hits this - the control socket is
+local IPC, drained in microseconds - so read the streamed reply promptly (the serial
+request/response model already requires it) and a slow consumer self-heals by reconnecting.
+
 **Reference client.** `tools/nether-ctl.c` is the canonical implementation of this
 protocol - the proto-version handshake, sending a command, and reassembling the framed
 reply (it propagates the guest command's exit code). Build it on the host with
