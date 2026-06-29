@@ -16,6 +16,17 @@ const nowMs = hostutil.nowMs;
 const usleep = hostutil.usleep;
 const processCpuMs = hostutil.processCpuMs;
 
+/// Set by the SIGTERM handler (async-signal-safe: an atomic store only), polled by
+/// `Watchdogs.sigLoop` which performs the real stop. One nether process serves one
+/// sandbox, so a single process-global flag is correct.
+var term_requested = std.atomic.Value(bool).init(false);
+
+/// SIGTERM handler. Does nothing but record the request - formatting/printing/stopping
+/// are not async-signal-safe, so they happen in `sigLoop`.
+fn onTerminate(_: c_int) callconv(.c) void {
+    term_requested.store(true, .release);
+}
+
 /// A backend-agnostic guest stop: force the guest down its PSCI-poweroff path so the
 /// run loop returns `.shutdown` and the process exits cleanly. The `ctx` outlives the
 /// caller (the watchdog threads are detached), so it must point at stable storage.
@@ -59,6 +70,13 @@ pub const Watchdogs = struct {
     /// budget does not), so a bare VMM can arm just the runtime cap.
     pub fn arm(self: *Watchdogs) void {
         self.start_ms = nowMs();
+        // A process-manager / platform SIGTERM (forced reclaim) must drain through the
+        // normal teardown - power the guest off so the run loop returns and the final
+        // usage bill is emitted - not kill the process silently with no settlement record.
+        // The handler only sets an atomic flag (async-signal-safe); sigLoop does the stop
+        // in normal context. Always armed (unlike the budgets), even on a bare VMM.
+        _ = hostutil.libc.signal(15, @intFromPtr(&onTerminate)); // SIGTERM = 15 (macOS + Linux)
+        if (std.Thread.spawn(.{}, sigLoop, .{self})) |t| t.detach() else |_| {}
         if (self.runtime_ms > 0) {
             if (std.Thread.spawn(.{}, runtimeLoop, .{self})) |t| t.detach() else |_| {}
             std.debug.print("[nether] runtime budget armed: {d}s\n", .{@divTrunc(self.runtime_ms, 1000)});
@@ -92,6 +110,17 @@ pub const Watchdogs = struct {
         self.stop.call();
     }
 
+    /// Stop the sandbox when a SIGTERM has been requested. The signal handler only flips
+    /// an atomic flag (the only async-signal-safe option); this loop, in normal context,
+    /// performs the real stop via the injected Stop - so a forced reclaim still powers the
+    /// guest off cleanly and the caller emits the final usage bill, instead of the process
+    /// dying with no settlement record.
+    fn sigLoop(self: *Watchdogs) void {
+        while (!term_requested.load(.acquire)) _ = usleep(100_000); // ~10 Hz
+        std.debug.print("\n[nether] SIGTERM received; stopping sandbox (final usage bill follows)\n", .{});
+        self.stop.call();
+    }
+
     /// Stop once the sandbox's total CPU time exceeds `cpu_ms`. Unlike the wall-clock
     /// runtime budget, this charges only actual compute (getrusage process CPU), so an
     /// idle sandbox is never billed out while a CPU-pinning one is caught quickly. The
@@ -119,4 +148,15 @@ test "injected Stop dispatches to the backend stop with its context" {
     try testing.expect(!spy.hit);
     s.call();
     try testing.expect(spy.hit); // the watchdog's stop reaches the backend, ctx intact
+}
+
+test "SIGTERM is caught and requests a graceful stop (not a silent death)" {
+    // Installing the handler then raising SIGTERM must NOT terminate this test process
+    // (the default action) - the handler catches it and flips the flag, which sigLoop
+    // would turn into a clean stop + final bill. The test reaching its assertion alive is
+    // itself the proof the signal was handled.
+    _ = hostutil.libc.signal(15, @intFromPtr(&onTerminate));
+    term_requested.store(false, .release);
+    try testing.expect(hostutil.libc.raise(15) == 0);
+    try testing.expect(term_requested.load(.acquire));
 }

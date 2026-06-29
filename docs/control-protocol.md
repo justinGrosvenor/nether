@@ -135,7 +135,9 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 
 Every session ends with a **final usage record** printed to the process's stdout/stderr
 (which the spawning platform captures), regardless of how it stopped (guest shutdown, a
-govern budget, `__shutdown__`, or client disconnect):
+govern budget, `__shutdown__`, or a **`SIGTERM`** from the platform / process manager -
+which is caught and drained through the same clean teardown, so a forced reclaim still
+settles rather than dying silently; only `SIGKILL` skips the bill):
 
 ```
 [nether] final usage (reason=shutdown): uptime_ms=... cpu_ms=... mem_peak_mb=... ram_mb=... cpus=... commands=... bytes_in=... bytes_out=... net_tx=... net_rx=... net_blocked=...

@@ -35,9 +35,10 @@ pub const libc = struct {
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
     // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
     pub extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
-    // Disposition for SIGPIPE (handler passed as an integer: SIG_IGN). Return is the
-    // previous handler, ignored. SIGPIPE=13 / SIG_IGN=1 are the same on macOS and Linux.
+    // Signal disposition: handler passed as an integer (SIG_IGN) or a function address
+    // (@intFromPtr of a C-callconv handler). Return is the previous handler, ignored.
     pub extern "c" fn signal(sig: c_int, handler: usize) usize;
+    pub extern "c" fn raise(sig: c_int) c_int; // deliver a signal to this process (for tests)
 };
 
 /// Bound how long a `write` to `fd` blocks when the peer's receive buffer is full
