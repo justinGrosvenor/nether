@@ -236,10 +236,17 @@ pub const Server = struct {
         if (linux.errno(linux.listen(fd, 16)) != .SUCCESS) return;
         std.debug.print("[web] console: http://127.0.0.1:{d}/?t={s}\n", .{ self.port, self.token });
 
+        // A read timeout for accepted connections: handle() reads the request with a
+        // blocking read and the accept loop is single-threaded, so a client that connects
+        // and sends nothing (or stalls mid-request) would otherwise wedge the WHOLE console
+        // for every other client. SO_RCVTIMEO makes those reads give up so the server moves
+        // on to the next connection. 5s is ample for a local request.
+        const rcv_to = linux.timeval{ .sec = 5, .usec = 0 };
         while (true) {
             const conn_u = linux.accept(fd, null, null);
             if (linux.errno(conn_u) != .SUCCESS) continue;
             const conn: i32 = @intCast(conn_u);
+            _ = linux.setsockopt(conn, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&rcv_to), @sizeOf(linux.timeval));
             self.handle(conn);
             _ = linux.close(conn);
         }
@@ -296,10 +303,21 @@ pub const Server = struct {
 
     /// True if the request query carries the matching `t=<token>`.
     fn authed(self: *const Server, query: []const u8) bool {
-        const tok = tokenParam(query);
-        return tok.len == self.token.len and std.mem.eql(u8, &self.token, tok);
+        return constEq(&self.token, tokenParam(query));
     }
 };
+
+/// Length-checked constant-time equality. The byte loop always runs the full length
+/// (no early-out on the first mismatch), so comparing the access token leaks no timing
+/// signal about how many leading bytes a guess got right. The token length is fixed and
+/// public, so the length check short-circuiting is fine. (The console is loopback +
+/// token-gated, so this is belt-and-suspenders - but a security token deserves it.)
+fn constEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
 
 /// Extract the `t` query parameter value (empty if absent). `query` is the part
 /// after '?', e.g. "t=abc123" or "x=1&t=abc123".
@@ -453,6 +471,19 @@ test "tokenParam and the auth gate accept only the exact token" {
     try testing.expect(!s.authed("t=wrong"));
     try testing.expect(!s.authed("")); // no token => refused
     try testing.expect(!s.authed("t=" ++ tok ++ "x")); // longer
+    // Same length, last byte off, and a 31-char prefix: the constant-time compare must
+    // reject both (the prefix exercises the length guard; the near-miss the byte loop).
+    try testing.expect(!s.authed("t=0123456789abcdef0123456789abcde0"));
+    try testing.expect(!s.authed("t=0123456789abcdef0123456789abcde")); // 31 chars
+}
+
+test "constEq is exact and rejects length and byte mismatches" {
+    try testing.expect(constEq("abcd", "abcd"));
+    try testing.expect(constEq("", ""));
+    try testing.expect(!constEq("abcd", "abce")); // last byte differs
+    try testing.expect(!constEq("xbcd", "abcd")); // first byte differs
+    try testing.expect(!constEq("abc", "abcd")); // shorter
+    try testing.expect(!constEq("abcde", "abcd")); // longer
 }
 
 test "contentLength parses the header case-insensitively" {
