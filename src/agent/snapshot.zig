@@ -86,8 +86,21 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
     const safe = quiesceSafe(sn, ctx.ram, ctx.handles, n, 200);
     std.debug.print("[nether] snapshot quiesce: {s}\n", .{if (safe) "all vCPUs idle at WFI (consistent)" else "best-effort (some vCPU not idle)"});
     const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
-    var gicbuf: [128 * 1024]u8 = undefined;
-    const giclen = hvfb.gicCaptureState(&gicbuf);
+    // Capture the GIC state, sized to the framework's actual state. If this fails (or is
+    // implausibly large), ABORT - a snapshot with no GIC state restores a broken interrupt
+    // controller and hangs the fork. Resume the guest before bailing so it is not left
+    // parked. (Old code silently captured 0 bytes here when the state outgrew a fixed buffer.)
+    const gic = hvfb.gicCaptureAlloc(ctx.allocator) orelse {
+        std.debug.print("[nether] snapshot: GIC state capture failed; aborting (a fork would have no interrupt controller state)\n", .{});
+        sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+        return false;
+    };
+    defer ctx.allocator.free(gic);
+    if (gic.len > GIC_STATE_MAX) {
+        std.debug.print("[nether] snapshot: GIC state {d}B exceeds the {d}B cap; aborting\n", .{ gic.len, GIC_STATE_MAX });
+        sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+        return false;
+    }
     const con_snap = ctx.con_dev.exportState();
     const blk_snap = ctx.blk_dev.exportState();
     const uart_snap = ctx.uart.exportState();
@@ -99,7 +112,7 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
     const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
     const net_dev_snap: ?nether.virtio.Device.DeviceState = if (ctx.net_dev) |nd| nd.exportState() else null;
     // Write while still quiesced (consistent image), then resume.
-    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gicbuf[0..giclen], ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
+    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
     sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
     std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
     return ok;
@@ -242,15 +255,16 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
         return;
     };
     @memcpy(ram_snap, ctx.ram);
-    var gicbuf: [128 * 1024]u8 = undefined;
-    const giclen = hvfb.gicCaptureState(&gicbuf);
+    const gic = hvfb.gicCaptureAlloc(ctx.allocator); // null on failure -> rewind skips GIC restore (logged)
+    defer if (gic) |g| ctx.allocator.free(g);
+    if (gic == null) std.debug.print("[nether] snapshot: WARNING GIC capture failed; the rewind will not restore interrupt state\n", .{});
     const con_snap = ctx.con_dev.exportState(); // pointer-free device state
     const blk_snap = ctx.blk_dev.exportState();
     const uart_snap = ctx.uart.exportState();
     const disk_snap = ctx.allocator.alloc(u8, ctx.blk_disk.len) catch return;
     @memcpy(disk_snap, ctx.blk_disk);
     sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
-    std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), giclen, n });
+    std.debug.print("\n[nether] SNAPSHOT captured: ram={d}MiB gic={d}B cpus={d}\n", .{ ctx.ram.len / (1024 * 1024), if (gic) |g| g.len else 0, n });
 
     t = 0;
     while (t < 40) : (t += 1) _ = usleep(100_000); // ~4s: let the guest run and mutate state
@@ -259,7 +273,7 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
     sn.cpu = cpu_snap; // load the captured contexts for each vCPU to self-restore
     quiesce(sn, ctx.handles, n, @intFromEnum(hvfb.SnapPhase.restoring));
     @memcpy(ctx.ram, ram_snap);
-    if (giclen > 0) _ = hvfb.gicRestoreState(gicbuf[0..giclen]);
+    if (gic) |g| _ = hvfb.gicRestoreState(g);
     ctx.con_dev.importState(&con_snap);
     ctx.blk_dev.importState(&blk_snap);
     ctx.uart.importState(uart_snap);

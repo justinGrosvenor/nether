@@ -199,14 +199,22 @@ pub const SnapCtl = struct {
     cpu: [MAX_SNAP_CPUS]CpuState = [_]CpuState{.{}} ** MAX_SNAP_CPUS,
 };
 
-/// Serialize the live GIC state into `buf`, returning its length (0 on failure).
-/// `buf` must be large enough (the framework's state is a few KiB).
-pub fn gicCaptureState(buf: []u8) usize {
-    const st = hvf.hv_gic_state_create() orelse return 0;
+/// Serialize the live GIC state into a freshly allocated buffer sized EXACTLY to the
+/// framework's reported state (caller frees). Returns null on any failure, so the caller
+/// can ABORT the snapshot rather than write one with no GIC state - which would restore an
+/// interrupt controller in the wrong state and hang the forked guest. This replaces a
+/// fixed-buffer capture whose "state larger than the buffer -> silently return 0" path
+/// could write a broken fork source as the vCPU count (and thus redistributor state) grew.
+pub fn gicCaptureAlloc(allocator: std.mem.Allocator) ?[]u8 {
+    const st = hvf.hv_gic_state_create() orelse return null;
     var size: usize = 0;
-    if (hvf.hv_gic_state_get_size(st, &size) != hvf.HV_SUCCESS or size > buf.len) return 0;
-    if (hvf.hv_gic_state_get_data(st, buf.ptr) != hvf.HV_SUCCESS) return 0;
-    return size;
+    if (hvf.hv_gic_state_get_size(st, &size) != hvf.HV_SUCCESS or size == 0) return null;
+    const buf = allocator.alloc(u8, size) catch return null;
+    if (hvf.hv_gic_state_get_data(st, buf.ptr) != hvf.HV_SUCCESS) {
+        allocator.free(buf);
+        return null;
+    }
+    return buf;
 }
 
 /// Restore GIC state from a buffer captured by gicCaptureState.
