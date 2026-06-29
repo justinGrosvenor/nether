@@ -110,7 +110,7 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 
 | Command | Reply | Purpose |
 |---|---|---|
-| `__info__` | report | Static capabilities + limits: `proto_version`, backend, arch, cpus, ram_mb, net/firewall/gpu, and the govern caps (`max_runtime_s`, `max_cpu_s`, `idle_timeout_s`, `net_rate_kbps`, `max_output_bytes`). |
+| `__info__` | report | Static capabilities + limits: `proto_version`, backend, arch, cpus, ram_mb, net/firewall/gpu, the govern caps (`max_runtime_s`, `max_cpu_s`, `idle_timeout_s`, `net_rate_kbps`, `max_output_bytes`), and `x402` (settlement mode on/off). |
 | `__stats__` | report | Live usage: `uptime_ms`, `cpu_ms`, `mem_peak_mb`, `ram_mb`, `cpus`, `commands`, `bytes_in/out`, `net_tx/rx_bytes`, `net_blocked`. |
 | `__events__ [seq]` | log | Unified event timeline (CMD/NET/LIFE). No arg dumps the retained ring; `__events__ <seq>` returns only events after that sequence number (the cursor from the previous `EVENTS <seq>` header) for incremental polling. |
 | `__cmdlog__` | log | Per-command audit: `<ms> exit=<code> cpu_ms=<n> <command>`, oldest-first. |
@@ -145,6 +145,22 @@ settles rather than dying silently; only `SIGKILL` skips the bill):
 
 So a client never has to poll `__stats__` at exactly the right moment to bill a sandbox:
 the platform always gets a complete, machine-readable accounting from the process output.
+
+### Settlement mode (x402)
+
+Settlement is a **toggle**, `x402` in `nether.conf` (default **off**), because general
+(non-billable) workloads are the common case. It changes only the *framing* of the teardown
+record - the metered fields, `__stats__`, the govern caps, and all observability are
+identical whether it is on or off:
+
+- **`x402=off`** (general workload): the teardown line is `[nether] final usage (reason=...)`
+  - operational telemetry, **not** a billable settlement.
+- **`x402=on`** (billable): the same line becomes `[nether] x402 settlement (reason=...)` -
+  the record the payment layer settles against.
+
+`__info__` advertises the mode (`x402=on|off`) so a client knows up front whether the
+sandbox is billable, and the platform keys billing off the `x402 settlement` prefix (which
+appears only in settlement mode). Flip it per sandbox; nothing else about the run changes.
 
 ## Govern knobs (set per sandbox in `nether.conf`)
 

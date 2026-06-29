@@ -122,6 +122,7 @@ pub const SandboxInfo = struct {
     idle_timeout_s: u64 = 0, // idle reclamation (0 = disabled)
     rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
     max_output_bytes: u64 = 0, // per-command output cap (0 = unlimited)
+    x402: bool = false, // settlement mode: on = billable (teardown emits an x402 settlement); off = general workload
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -142,6 +143,7 @@ pub const SandboxInfo = struct {
             \\idle_timeout_s={d}
             \\net_rate_kbps={d}
             \\max_output_bytes={d}
+            \\x402={s}
             \\{c}0
             \\
         , .{
@@ -158,6 +160,7 @@ pub const SandboxInfo = struct {
             self.idle_timeout_s,
             self.rate_kbps,
             self.max_output_bytes,
+            onOff(self.x402),
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
@@ -176,6 +179,11 @@ pub const Core = struct {
     journal: nether.Journal = .{},
     meter: Metering = .{},
     agent: AgentCtx = .{},
+    /// Settlement mode (x402). OFF by default: a general workload is fully metered and
+    /// governed, but its teardown record is operational telemetry only, not a billable
+    /// settlement. ON: the same record is framed as an x402 settlement (the billable
+    /// signal the payment layer keys off). Metering/stats/caps are unaffected either way.
+    x402: bool = false,
 
     /// Wire the core state in place and emit the boot lifecycle event.
     pub fn init(self: *Core, ram_mb: u64, cpus: u32, max_output: usize) void {
@@ -186,15 +194,24 @@ pub const Core = struct {
         self.journal.emit(.life, "boot");
     }
 
-    /// Emit the final usage record at sandbox teardown: print it (the platform that
-    /// spawned nether reads its stdout/stderr) and mirror it into the journal as a LIFE
-    /// event. Called once when the run loop returns - for ANY reason (guest shutdown,
-    /// runtime/cpu/idle budget, __shutdown__) - so every session ends with a guaranteed,
-    /// machine-readable bill, closing the meter -> settlement loop.
+    /// Emit the teardown usage record: print it (the platform that spawned nether reads
+    /// its stdout/stderr) and mirror it into the journal as a LIFE event. Called once when
+    /// the run loop returns - for ANY reason (guest shutdown, runtime/cpu/idle budget,
+    /// __shutdown__, SIGTERM) - so every session ends with a guaranteed, machine-readable
+    /// record. The prefix is the x402 toggle: `x402 settlement` when settlement mode is on
+    /// (the billable signal), `final usage` when off (general-workload telemetry). The
+    /// metered fields are identical; only the framing differs.
+    /// The teardown record's prefix: the billable `x402 settlement` when settlement mode
+    /// is on, else `final usage` (general-workload telemetry). The platform keys billing
+    /// off the settlement prefix, so the two must never be confused.
+    pub fn recordKind(self: *const Core) []const u8 {
+        return if (self.x402) "x402 settlement" else "final usage";
+    }
+
     pub fn finalUsage(self: *Core, reason: []const u8) void {
         var buf: [256]u8 = undefined;
         const line = self.meter.summary(&buf);
-        std.debug.print("[nether] final usage (reason={s}): {s}\n", .{ reason, line });
+        std.debug.print("[nether] {s} (reason={s}): {s}\n", .{ self.recordKind(), reason, line });
         var jbuf: [320]u8 = undefined;
         const ev = std.fmt.bufPrint(&jbuf, "session ended (reason={s}): {s}", .{ reason, line }) catch return;
         self.journal.emit(.life, ev);
@@ -1300,7 +1317,25 @@ test "sandbox info report renders capabilities and limits with the exit frame" {
     try testing.expect(std.mem.indexOf(u8, out, "max_cpu_s=0\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "idle_timeout_s=8\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "net_rate_kbps=0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x402=off\n") != null); // settlement mode off by default
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) != null); // exit frame
+
+    // With settlement mode on, __info__ advertises it so the client knows the sandbox is billable.
+    const billable = SandboxInfo{ .cpus = 1, .x402 = true };
+    const out2 = buf[0..billable.report(&buf)];
+    try testing.expect(std.mem.indexOf(u8, out2, "x402=on\n") != null);
+}
+
+test "x402 toggle selects the teardown record framing (settlement vs telemetry)" {
+    // The platform keys billing off the record prefix, so the two must never be confused:
+    // off (general workload, the default) is operational telemetry; on is the billable
+    // settlement. The metered fields are identical either way (the meter is unaffected).
+    var c = Core{};
+    c.init(256, 1, 0);
+    try testing.expect(!c.x402); // default off
+    try testing.expectEqualStrings("final usage", c.recordKind());
+    c.x402 = true;
+    try testing.expectEqualStrings("x402 settlement", c.recordKind());
 }
 
 test "metering summary is a one-line bill carrying compute, memory, and I/O" {
