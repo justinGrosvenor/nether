@@ -109,6 +109,26 @@ zig cc -target aarch64-linux-musl -static -O2 tools/vsock_client.c -o rootfs/vso
 ( cd rootfs && find . | cpio -o -H newc --quiet | gzip -9 ) > kernels/initramfs.cpio.gz
 ```
 
+### Baking language runtimes (python3 / node / sqlite3)
+
+The base minirootfs ships only busybox + `apk`; the python / SQLite / JS workload
+classes need runtimes in the image (apk-at-runtime would need egress and a slow first
+run). Bake them in with `tools/build-guest-aarch64-runtimes.sh`, which `apk add`s the
+runtimes into `kernels/rootfs/` via a native `linux/arm64` Alpine container (Docker runs
+arm64 natively on Apple Silicon) and repacks `kernels/initramfs.cpio.gz`:
+
+```
+./tools/build-guest-aarch64-runtimes.sh                 # default: python3 sqlite nodejs
+RUNTIMES="python3 sqlite nodejs go" ./tools/build-guest-aarch64-runtimes.sh   # custom set
+```
+
+Then pair it with a **warm base snapshot** so every fork inherits the runtimes (already
+imported / warmed) instantly: boot a control-mode sandbox, drive it to a ready state, and
+`nether-ctl <sock> __snapshot__ python-base.snap`; fork per sandbox with
+`restore_from=python-base.snap`. Verified: a warm fork runs `python3`/`node`/`sqlite3`
+immediately (see docs/control-protocol.md "Baking a base"). The runtimes roughly double
+the initramfs (~25 MB -> ~60 MB) and the warm snapshot RAM accordingly.
+
 `rootfs/init` then brings the sandbox up automatically on every boot: it
 `modprobe`s `virtio_net` and `vmw_vsock_virtio_transport`, statically configures
 the first non-loopback interface with the slirp plan (`10.0.2.15/24`, gw
