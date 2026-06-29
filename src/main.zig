@@ -788,9 +788,21 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         initrd_end = initrd_start + fs.len;
     }
 
+    // Kernel cmdline. When `run_as=<user>` is set, pass it through as `nether.run_as=` so
+    // the in-guest agent runs commands under that non-root user (defense-in-depth; the VM
+    // is the primary boundary). The cmdline is the host->guest config channel; a fork
+    // inherits the base's run_as (no DTB rebuild on restore).
+    const base_cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000";
+    var cmdline_buf: [256]u8 = undefined;
+    var runas_buf: [64]u8 = undefined;
+    const cmdline: [:0]const u8 = if (confGet("run_as", &runas_buf)) |u|
+        (std.fmt.bufPrintZ(&cmdline_buf, "{s} nether.run_as={s}", .{ base_cmdline, u }) catch base_cmdline)
+    else
+        base_cmdline;
+
     var dtb_buf: [16 * 1024]u8 = undefined;
     const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
-        .cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000",
+        .cmdline = cmdline,
         .mem_base = ARM_RAM_BASE,
         .mem_size = ram_size,
         .gicd_size = vm.hv.gicd_size,

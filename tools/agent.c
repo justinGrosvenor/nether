@@ -25,6 +25,44 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pwd.h>
+#include <grp.h>
+
+/* Optional in-guest privilege drop (defense-in-depth; the VM is the primary boundary).
+ * The host sets `nether.run_as=<user>` on the kernel cmdline when run_as= is in
+ * nether.conf; we resolve it once and run every command under that uid/gid instead of
+ * root, so a guest-kernel escape starts unprivileged. Default: run as root (g_drop=0). */
+static uid_t g_uid = 0;
+static gid_t g_gid = 0;
+static int g_drop = 0;
+
+static void init_runas(void) {
+    FILE *f = fopen("/proc/cmdline", "r");
+    if (!f) return;
+    char line[4096];
+    char *got = fgets(line, sizeof line, f);
+    fclose(f);
+    if (!got) return;
+    char *p = strstr(line, "nether.run_as=");
+    if (!p) return;
+    p += strlen("nether.run_as=");
+    char user[64];
+    int i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\n' && i < (int)sizeof user - 1) { user[i] = p[i]; i++; }
+    user[i] = 0;
+    if (!user[0]) return;
+    struct passwd *pw = getpwnam(user);
+    if (pw && pw->pw_uid != 0) {
+        g_uid = pw->pw_uid;
+        g_gid = pw->pw_gid;
+        g_drop = 1;
+        /* Give dropped commands the user's environment so `~`, $HOME-based tools, and
+         * shells behave (else HOME stays the agent's "/" and writes there are denied). */
+        setenv("HOME", (pw->pw_dir && pw->pw_dir[0]) ? pw->pw_dir : "/home", 1);
+        setenv("USER", user, 1);
+        setenv("LOGNAME", user, 1);
+    }
+}
 
 #ifndef AF_VSOCK
 #define AF_VSOCK 40
@@ -53,16 +91,39 @@ static void write_full(int s, const char *buf, size_t n) {
  * 0x1e<exit-code>\n so the host can tell where the output ends and whether the
  * command succeeded. (0x1e = ASCII record separator, won't appear in text.) */
 static void run(int s, const char *cmd) {
-    char shell[4160];
-    snprintf(shell, sizeof shell, "%s 2>&1", cmd);
-    FILE *p = popen(shell, "r");
+    /* fork + pipe + exec `sh -c <cmd>` (the cmd is a direct argv, so no quoting hazard),
+     * merging stderr into stdout and, when configured, dropping to the run_as uid/gid
+     * before exec. (Replaces popen so the privilege drop is robust and stays in-process.) */
+    int fds[2];
     int code = 127;
-    if (p) {
-        char buf[4096];
-        size_t r;
-        while ((r = fread(buf, 1, sizeof buf, p)) > 0) write_full(s, buf, r);
-        int st = pclose(p);
-        code = WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+    if (pipe(fds) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fds[0]);
+            dup2(fds[1], 1);
+            dup2(fds[1], 2); // stderr -> stdout (the old "2>&1")
+            close(fds[1]);
+            if (g_drop) {
+                /* groups, then gid, then uid - once the uid drops, gid is fixed. */
+                setgroups(1, &g_gid);
+                if (setgid(g_gid) != 0) _exit(126);
+                if (setuid(g_uid) != 0) _exit(126);
+            }
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        } else if (pid > 0) {
+            close(fds[1]);
+            char buf[4096];
+            ssize_t r;
+            while ((r = read(fds[0], buf, sizeof buf)) > 0) write_full(s, buf, (size_t)r);
+            close(fds[0]);
+            int st;
+            waitpid(pid, &st, 0);
+            code = WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+        } else {
+            close(fds[0]);
+            close(fds[1]);
+        }
     }
     char tr[24];
     int m = snprintf(tr, sizeof tr, "\x1e%d\n", code);
@@ -87,6 +148,7 @@ static void do_get(int s, const char *path) {
 }
 
 int main(void) {
+    init_runas(); // pick up nether.run_as=<user> from the kernel cmdline, if set
     int s = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (s < 0) return 1;
     struct sockaddr_vm a;

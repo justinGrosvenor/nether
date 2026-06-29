@@ -25,6 +25,12 @@ RUNTIMES="${RUNTIMES:-python3 sqlite nodejs e2fsprogs}"
 }
 command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
 
+# Rebuild the in-guest agent from tools/agent.c (it carries the run_as privilege-drop), so
+# the baked image always has the current agent. Static aarch64 musl, no libc dep on the rootfs.
+ZIG="${ZIG:-zig}"
+echo "[guest-aarch64] building the agent (aarch64-linux-musl)"
+"$ZIG" cc -target aarch64-linux-musl -static -O2 tools/agent.c -o kernels/rootfs/agent
+
 # Write the canonical /init (the tracked source of the guest boot logic): load the
 # virtio/vsock/blk + ext4 modules, auto-mount a persistent disk at /data, bring up the
 # slirp network, and start the agent. Regenerated here so it lives in version control
@@ -34,6 +40,10 @@ cat > kernels/rootfs/init <<'INIT'
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
+
+# World-writable temp dirs (sticky), so a non-root workload (run_as=<user>) has scratch
+# space - the initramfs ships /tmp as 0755 root-owned otherwise.
+chmod 1777 /tmp /var/tmp 2>/dev/null
 
 # virtio-net + the vsock transport (the agent's spine); virtio-blk + ext4 for a
 # persistent disk. Core virtio/virtio_pci/virtio_ring are built into the kernel.
@@ -46,7 +56,7 @@ modprobe ext4 2>/dev/null
 # auto-mount it at /data if it carries a filesystem (mkfs.ext4 it once). Harmless if raw.
 if [ -b /dev/vda ]; then
 	mkdir -p /data
-	mount /dev/vda /data 2>/dev/null && echo "[init] persistent disk mounted at /data"
+	mount /dev/vda /data 2>/dev/null && { chmod 0777 /data 2>/dev/null; echo "[init] persistent disk mounted at /data"; }
 fi
 
 # Static slirp address plan (guest 10.0.2.15, gw 10.0.2.2, DNS 10.0.2.3); slirp also
@@ -81,6 +91,11 @@ docker run --rm --platform linux/arm64 -v "$PWD:/host" alpine:3.21 sh -c '
   # runtimes (and their deps: icu/libstdc++ for node, etc.) for aarch64 and installs
   # them into /rootfs. --no-cache keeps the image lean.
   apk add --root /rootfs --no-cache '"$RUNTIMES"'
+  # A non-root user for the optional in-guest privilege drop (run_as=nether). The agent
+  # resolves it via getpwnam and drops to it before exec when the host sets nether.run_as.
+  grep -q "^nether:" /rootfs/etc/passwd || echo "nether:x:1000:1000:nether:/home/nether:/bin/sh" >> /rootfs/etc/passwd
+  grep -q "^nether:" /rootfs/etc/group  || echo "nether:x:1000:" >> /rootfs/etc/group
+  mkdir -p /rootfs/home/nether && chown 1000:1000 /rootfs/home/nether
   chmod +x /rootfs/init /rootfs/agent
   cd /rootfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > /host/kernels/initramfs.new.cpio.gz
 '

@@ -191,6 +191,18 @@ default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpu
 (sizing), `disk`/`disk_size_mb` (persistent disk; below). All caps are reported back by
 `__info__` so a client can verify what it got.
 
+### In-guest privilege drop (`run_as`)
+
+By default the guest runs commands as **root** (the VM is the trust boundary, and many
+workloads need root for `apk` / mounts). For untrusted code, defense-in-depth: set
+`run_as=<user>` and the in-guest agent runs every command under that non-root user
+(`fork` + `setgid`/`setuid` before exec, with `HOME`/`USER` set), so a guest-kernel escape
+starts unprivileged. The image ships a `nether` user (uid 1000) with a writable home and
+`/tmp`; a mounted persistent `/data` is world-writable. The policy travels on the kernel
+cmdline (`nether.run_as=`), so a snapshot **fork inherits its base's `run_as`** (no DTB
+rebuild on restore). Opt-in: unset = root, as before. Verified: `run_as=nether` runs as
+uid 1000, can write `/tmp` and `~`, and is refused on `/etc`.
+
 ### Persistent disk
 
 By default a sandbox is ephemeral (RAM-backed initramfs); all writes vanish on stop. For
