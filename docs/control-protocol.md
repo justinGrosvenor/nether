@@ -21,6 +21,13 @@ The socket is owner-only (peer-uid checked). The **first** client to connect is 
 clients are read-only *observers*: they may issue the introspection/observe queries but
 not drive the sandbox. Send one command per line (`\n`-terminated).
 
+**Disconnect is safe.** A client disconnecting - even the primary mid-command - never
+affects the running sandbox: the write to the gone socket is absorbed (SIGPIPE is
+ignored), the primary slot is released, and the next client to connect becomes the new
+primary and can resume driving. So the platform can crash, restart, and reattach to a
+live sandbox. A sandbox with no client is reclaimed only by `idle_timeout_s` (govern) or
+an explicit `__shutdown__`; it is never torn down merely because the controller left.
+
 **Reference client.** `tools/nether-ctl.c` is the canonical implementation of this
 protocol - the proto-version handshake, sending a command, and reassembling the framed
 reply (it propagates the guest command's exit code). Build it on the host with

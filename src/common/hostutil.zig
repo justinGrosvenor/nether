@@ -33,7 +33,20 @@ pub const libc = struct {
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
     // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
     pub extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    // Disposition for SIGPIPE (handler passed as an integer: SIG_IGN). Return is the
+    // previous handler, ignored. SIGPIPE=13 / SIG_IGN=1 are the same on macOS and Linux.
+    pub extern "c" fn signal(sig: c_int, handler: usize) usize;
 };
+
+/// Ignore SIGPIPE process-wide so a `write` to a control client that disconnected
+/// mid-stream returns EPIPE (handled by `writeAll` returning false) instead of the
+/// default action - terminating the whole sandbox process. A control-client disconnect
+/// must never kill the guest. Called once when the control plane starts; idempotent.
+pub fn ignoreSigpipe() void {
+    const SIGPIPE: c_int = 13;
+    const SIG_IGN: usize = 1;
+    _ = libc.signal(SIGPIPE, SIG_IGN);
+}
 pub extern "c" fn usleep(usec: c_uint) c_int;
 
 pub const AF_UNIX: c_int = 1; // same on macOS and Linux

@@ -913,6 +913,12 @@ pub const ControlOpts = struct {
 /// caller's frame (the boot frame). The agent's reply pipe is created here and wired
 /// into both the agent (pipe_w) and the relay (pipe_r). Shared by both boot paths.
 pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
+    // A control client can disconnect mid-stream (crash, kill, network blip) while the
+    // relay or a reply is writing to its socket. Without this, that write raises SIGPIPE
+    // and the default action kills the sandbox process - a client disconnect must never
+    // take down the guest. Ignore it process-wide; the write then returns EPIPE and the
+    // relay/command handler stops writing gracefully.
+    hostutil.ignoreSigpipe();
     var pipe: [2]c_int = undefined;
     if (libc.pipe(&pipe) != 0) {
         std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
@@ -1497,6 +1503,27 @@ test "Capture.feed survives hostile agent replies (GET + PUT, split chunks)" {
             std.mem.doNotOptimizeAway(cap.buf[cap.body_off..cap.expect]);
         }
     }
+}
+
+test "a control-client disconnect mid-write does not kill the process (SIGPIPE ignored)" {
+    // Models the primary platform client vanishing while the relay writes its command
+    // output: the write hits a broken socket. Without ignoreSigpipe the default SIGPIPE
+    // action would terminate THIS test process, so the test reaching its assertion alive
+    // is the proof - writeAll instead surfaces the broken pipe as a clean false.
+    hostutil.ignoreSigpipe();
+    var fds: [2]c_int = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    _ = libc.close(fds[1]); // the "client" disconnects
+    var failed = false;
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) { // bounded: the broken pipe surfaces within a few writes
+        if (!writeAll(fds[0], "x" ** 4096)) {
+            failed = true;
+            break;
+        }
+    }
+    _ = libc.close(fds[0]);
+    try testing.expect(failed); // EPIPE surfaced as a false, and the process is still alive
 }
 
 test "agent reply relay survives hostile guest streams (exit-scan + output cap)" {
