@@ -671,6 +671,21 @@ fn macMain() !void {
 
     nether.trace.init();
 
+    // `validate_snapshot=<path>` vets a pre-baked base file against THIS build and exits,
+    // without booting anything - so the platform can detect on-disk corruption, a partial
+    // write, or version/layout drift after a Nether upgrade cheaply (no VM), and mark a
+    // stale base for re-baking. Exits non-zero (a propagated error) if the file is invalid.
+    {
+        var vpath_buf: [1024]u8 = undefined;
+        if (confGet("validate_snapshot", &vpath_buf)) |p| {
+            // Exit cleanly with a non-zero code on failure (the function already printed a
+            // specific message) - this is a programmatic tool, so skip the error-return
+            // trace dump that `try` would emit.
+            snapshot.validateSnapshotFile(@ptrCast(p.ptr)) catch std.process.exit(1);
+            return;
+        }
+    }
+
     // A `nether-restore` marker forks a guest from a snapshot instead of booting.
     // `restore_from=<path>` in nether.conf selects the base image (defaults to
     // nether.snap), so the platform can pre-bake several base snapshots

@@ -453,6 +453,90 @@ const RestoreStop = struct {
     }
 };
 
+/// Validate a snapshot file against THIS build WITHOUT booting it: the header and its
+/// struct-layout fingerprints, the section sizes' internal consistency and fit within the
+/// file, and the vsock engine state's invariants. Lets the platform vet a pre-baked base
+/// (on-disk corruption, a partial write, or version/layout drift after a Nether upgrade)
+/// cheaply - no VM, no RAM map. Prints a one-line summary on success; returns an error
+/// (with a specific message) on any problem, so the caller exits non-zero. Pure file
+/// parsing: it makes no hv_* calls, so it runs without the hypervisor.
+pub fn validateSnapshotFile(path: [*:0]const u8) !void {
+    const hvfb = @import("../hv/hvf_backend.zig");
+    const cpu_sz: u64 = @sizeOf(hvfb.CpuState);
+    const dev_sz: u64 = @sizeOf(nether.virtio.Device.DeviceState);
+    const uart_sz: u64 = @sizeOf(nether.Pl011.State);
+    const eng_sz: u64 = @sizeOf(nether.Vsock.State);
+
+    const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
+    if (fd < 0) {
+        std.debug.print("[nether] validate: cannot open {s}\n", .{path});
+        return error.OpenFailed;
+    }
+    defer _ = libc.close(fd);
+
+    var hdr = [_]u8{0} ** HDR_SIZE;
+    if (!readExact(fd, &hdr)) {
+        std.debug.print("[nether] validate: file too short for a {d}-byte header\n", .{HDR_SIZE});
+        return error.BadSnapshot;
+    }
+    validateHeader(&hdr, hvfb.MAX_SNAP_CPUS, armdev.blk_disk_storage.len, GIC_STATE_MAX, @intCast(cpu_sz), @intCast(dev_sz), @intCast(uart_sz), @intCast(eng_sz)) catch |e| {
+        switch (e) {
+            error.SnapshotVersionMismatch => std.debug.print("[nether] validate: not format v{d} (baked by a different Nether build); re-bake\n", .{SNAP_VERSION}),
+            error.SnapshotLayoutMismatch => std.debug.print("[nether] validate: struct layout differs from this build; re-bake\n", .{}),
+            error.BadSnapshot => std.debug.print("[nether] validate: header invalid, corrupt, or truncated\n", .{}),
+        }
+        return e;
+    };
+
+    const num_cpus: u64 = std.mem.readInt(u32, hdr[8..12], .little);
+    const ram_size = std.mem.readInt(u64, hdr[24..32], .little);
+    const gic_size = std.mem.readInt(u64, hdr[32..40], .little);
+    const disk_size = std.mem.readInt(u64, hdr[40..48], .little);
+    const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
+    const ctl = std.mem.readInt(u32, hdr[64..68], .little) == 1;
+    const conn_id = std.mem.readInt(i32, hdr[72..76], .little);
+    const net = std.mem.readInt(u32, hdr[76..80], .little) == 1;
+
+    const fsize = libc.lseek(fd, 0, 2); // SEEK_END
+    if (fsize < 0) return error.BadSnapshot;
+    const file_size: u64 = @intCast(fsize);
+
+    // The metadata sections (header .. just before RAM) must be internally consistent:
+    // their sizes sum to `meta`, which writeSnapshotFile page-aligns UP to ram_off. So
+    // meta <= ram_off and the gap is less than one page; otherwise the sizes are bogus.
+    const ctl_bytes: u64 = if (ctl) dev_sz + eng_sz else 0;
+    const net_bytes: u64 = if (net) dev_sz else 0;
+    const meta = HDR_SIZE + num_cpus * cpu_sz + 2 * dev_sz + uart_sz + gic_size + disk_size + ctl_bytes + net_bytes;
+    if (meta > ram_off or ram_off - meta >= HOST_PAGE) {
+        std.debug.print("[nether] validate: section sizes inconsistent with the RAM offset (meta={d}, ram_off={d})\n", .{ meta, ram_off });
+        return error.BadSnapshot;
+    }
+    // And the file must actually hold the RAM region (overflow-safe).
+    if (ram_off > file_size or ram_size > file_size - ram_off) {
+        std.debug.print("[nether] validate: truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_size, file_size });
+        return error.BadSnapshot;
+    }
+
+    // Validate the vsock engine state in place (the one section with internal invariants;
+    // restore gates on these too, so a base failing here would not fork driveably).
+    if (ctl) {
+        const eng_off: i64 = @intCast(HDR_SIZE + num_cpus * cpu_sz + 2 * dev_sz + uart_sz + gic_size + disk_size + dev_sz);
+        _ = libc.lseek(fd, eng_off, 0);
+        var st: nether.Vsock.State = undefined;
+        if (!readExact(fd, std.mem.asBytes(&st))) return error.BadSnapshot;
+        if (!nether.Vsock.validState(&st)) {
+            std.debug.print("[nether] validate: vsock engine state corrupt (staging ring out of bounds)\n", .{});
+            return error.BadSnapshot;
+        }
+        if (conn_id >= @as(i32, nether.vsock.MAX_CONNS)) {
+            std.debug.print("[nether] validate: saved agent conn id {d} out of range\n", .{conn_id});
+            return error.BadSnapshot;
+        }
+    }
+
+    std.debug.print("[nether] validate: OK - format v{d}, {d} cpus, {d} MiB RAM, gic {d}B, disk {d}B, control-plane={s}, net={s}\n", .{ SNAP_VERSION, num_cpus, ram_size / (1024 * 1024), gic_size, disk_size, if (ctl) "on" else "off", if (net) "on" else "off" });
+}
+
 /// Restore a guest from a snapshot file (a cross-process fork): rebuild the VM,
 /// map and fill RAM, recreate each vCPU with its captured register context,
 /// reinstall the framework GIC state and the virtio device state, and resume.

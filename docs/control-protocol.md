@@ -160,6 +160,14 @@ sandbox stays driveable. This is the production path; the fixed-timer `snapshot_
 mode is a demo. Because the base is captured *after* the sandbox is driven, its forks
 inherit that warmed state (and, since it was control-mode, a live agent connection).
 
+**Vetting a base.** Before relying on a stored base, run `nether` with
+`validate_snapshot=<path>` in `nether.conf`: it checks the file against the current build
+(format version, struct-layout fingerprints, section sizes vs the file length, and the
+vsock engine state) and exits `0` with a one-line summary, or non-zero with a specific
+message - **without booting anything**. So the platform can catch on-disk corruption, a
+partial write, or version/layout drift after a Nether upgrade cheaply and mark a stale base
+for re-baking, instead of discovering it on a failed restore.
+
 A **snapshot-restored (forked)** sandbox is **driveable over the full control protocol**,
 the same as a fresh boot - provided the **base snapshot was taken from a control-mode
 sandbox** (booted with `control_socket=` so the vsock/agent channel exists). The restore
