@@ -106,6 +106,17 @@ pub const Metering = struct {
 /// discoverable at runtime via `__help__` and documented in docs/control-protocol.md.
 pub const PROTO_VERSION = 1;
 
+/// Default per-command output cap (govern) when `max_output_bytes` is unset. A command's
+/// stdout/stderr is bounded to this many bytes; the rest is dropped with a one-time
+/// `[output capped]` notice, and the `0x1e<exit>` trailer is ALWAYS still sent (so the
+/// reply stays a complete frame and the exit code always arrives). Bounded by default so a
+/// runaway/hostile command cannot flood the control channel or the billed bytes_out; large
+/// payloads should move over `__get__` (file transfer), not command stdout. 0 in conf =
+/// explicitly unlimited. This is the nether end of the control-protocol output-bound
+/// contract (see docs/control-protocol.md); the trailer guarantee lets a client drain to
+/// the frame boundary regardless of its own read cap.
+pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1 << 20; // 1 MiB
+
 /// Static, per-sandbox capabilities and limits, set once at launch from the
 /// resolved nether.conf and reported by the `__info__` control command. Where
 /// `__stats__` answers "how much has this sandbox used?", `__info__` answers "what

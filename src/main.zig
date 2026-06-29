@@ -193,7 +193,7 @@ fn linuxMain() !void {
     // Core platform state (observe/meter/run): the journal, usage meter, and agent,
     // cross-wired in place - the same shared bundle the HVF path uses.
     var core = control.Core{};
-    core.init(GUEST_RAM_SIZE / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", 0)));
+    core.init(GUEST_RAM_SIZE / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES)));
     core.x402 = confBool("x402"); // settlement mode (default off): general workloads are billed only as telemetry
 
     // Per-sandbox modes from nether.conf (markers kept as a fallback). A configured
@@ -406,7 +406,7 @@ fn linuxMain() !void {
                 .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
-                .max_output_bytes = confGetInt("max_output_bytes", 0),
+                .max_output_bytes = confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
             },
         });
@@ -733,7 +733,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // Core platform state (observe/meter/run): the journal, usage meter, and agent,
     // cross-wired in place. Shared bundle; linuxMain constructs it the same way.
     var core = control.Core{};
-    core.init(ram_size / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", 0)));
+    core.init(ram_size / (1024 * 1024), num_cpus, @intCast(confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES)));
     core.x402 = confBool("x402"); // settlement mode (default off): general workloads are billed only as telemetry
 
     var vm = try nether.Vm.init(allocator);
@@ -1044,7 +1044,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
-                .max_output_bytes = confGetInt("max_output_bytes", 0),
+                .max_output_bytes = confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
             },
         });

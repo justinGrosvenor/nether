@@ -96,6 +96,27 @@ verb sent over this socket **must not** be `__`-prefixed: send a plain shell com
 the stock guest agent) or your agent's own non-`__` verb. `__put__`/`__get__` are the only
 `__` commands that take arguments.
 
+### Output bound (a command's reply is frame-safe even when truncated)
+
+A relayed command's stdout/stderr is capped at **`max_output_bytes`** (default **1 MiB**;
+`0` in `nether.conf` = unlimited). When a command exceeds it, the body is truncated, a
+one-time `\n...[output capped]\n` marker is inserted, and **the `0x1e<exit>\n` trailer is
+still sent** - so the reply is *always a complete frame* and the exit code *always* arrives,
+even for a runaway or hostile command. Large payloads should move over `__get__` (file
+transfer), not command stdout.
+
+This is one end of a two-sided contract (the other is the driving client's read buffer):
+
+- **Nether truncates at a frame boundary.** It bounds the *body*, never the trailer. So a
+  client can always read to `0x1e<exit>\n` and get a well-formed reply + exit code.
+- **The client should drain to the frame boundary**, not to its own read cap. Because the
+  trailer always arrives, a client whose buffer is smaller than `max_output_bytes` must keep
+  reading (discarding overflow) until `0x1e<exit>\n` rather than stopping mid-body - else it
+  clips the frame and corrupts the next reply. Sizing the client cap `>= max_output_bytes`
+  avoids any discard; either way the frame stays intact.
+
+`__info__` reports the effective `max_output_bytes` so a client can size its buffer to match.
+
 ### Concurrency on the primary socket
 
 The primary socket carries both host-intercepted query replies and the streamed reply of
@@ -165,9 +186,31 @@ appears only in settlement mode). Flip it per sandbox; nothing else about the ru
 ## Govern knobs (set per sandbox in `nether.conf`)
 
 `max_runtime_s` (wall-clock cap), `max_cpu_s` (CPU-time cap), `idle_timeout_s` (reclaim on
-inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap),
-`net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb` (sizing). All
-are reported back by `__info__` so a client can verify what it got.
+inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
+default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb`
+(sizing). All are reported back by `__info__` so a client can verify what it got.
+
+### Networking / egress (how to turn it on)
+
+Networking is **off** unless `net=1`. With it on, the guest gets a configured `eth0`
+(`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`) behind an in-VMM user-mode NAT
+(slirp) - no host tap/bridge/root. Egress goes through a **default-deny-private** firewall:
+public destinations are allowed; RFC-1918 private ranges, loopback, link-local, and the
+`169.254.169.254` metadata address are blocked (SSRF-safe by default). Every new flow is
+recorded in `__netlog__` with its `ALLOW`/`BLOCK` verdict.
+
+```
+net = 1                         # enable eth0 + slirp NAT (required)
+# firewall is on by default (default-deny-private). To adjust:
+net_open = 1                    # disable the firewall entirely (allow private too)
+net_allow = 10.0.0.0/8, 192.168.0.0/16   # CIDR exceptions to the default-deny
+net_block = 1.2.3.0/24          # additionally block these (e.g. a public range)
+net_rate_kbps = 2000            # download bandwidth cap (0 = unlimited)
+```
+
+Verified live on HVF: with `net=1` (firewall on) a public host connects (`ALLOW`) while
+`169.254.169.254` and `192.168.x.x` are refused (`BLOCK`); with `net_open=1` the firewall
+is off and private destinations connect. `__info__` reports `net=` and `firewall=`.
 
 ## Snapshot / fork (HVF)
 

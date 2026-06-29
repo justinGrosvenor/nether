@@ -802,7 +802,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
     if (ctl_present) {
-        core.init(ram_size / (1024 * 1024), num_cpus, @intCast(conf.confGetInt("max_output_bytes", 0)));
+        core.init(ram_size / (1024 * 1024), num_cpus, @intCast(conf.confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES)));
         core.x402 = conf.confBool("x402"); // settlement mode (from the fork's nether.conf; default off)
         core.journal.emit(.life, "restored from snapshot fork");
 
@@ -849,7 +849,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 .max_cpu_s = conf.confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = conf.confGetInt("idle_timeout_s", 0),
                 .rate_kbps = conf.confGetInt("net_rate_kbps", 0),
-                .max_output_bytes = conf.confGetInt("max_output_bytes", 0),
+                .max_output_bytes = conf.confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
             },
         });
