@@ -1498,3 +1498,69 @@ test "Capture.feed survives hostile agent replies (GET + PUT, split chunks)" {
         }
     }
 }
+
+test "agent reply relay survives hostile guest streams (exit-scan + output cap)" {
+    // The in-guest agent's reply bytes are attacker-controlled: raw command output then a
+    // 0x1e<exit>\n trailer. The host SCANS that stream for the trailer to record exit codes
+    // (auditRecv -> the command audit log) and RELAYS it under a per-command output cap
+    // (relayCapped), both byte-at-a-time across arbitrary chunk boundaries. Drive random and
+    // trailer-shaped streams in random splits, interleaved with command "forwards", and
+    // assert no safety trip: the fixed exit-scan buffer never overflows and the audit ring
+    // head stays valid for any byte pattern.
+    const devnull = libc.open("/dev/null", 0x0001, @as(c_int, 0)); // O_WRONLY; relay sink
+    if (devnull < 0) return error.SkipZigTest;
+    defer _ = libc.close(devnull);
+
+    var a = AgentCtx{ .pipe_w = devnull, .max_output = 64 };
+    var prng = std.Random.DefaultPrng.init(0xA9E2_C0DE);
+    const rand = prng.random();
+    var round: usize = 0;
+    while (round < 30000) : (round += 1) {
+        // Sometimes "open" a command so a trailer has a pending slot to commit against.
+        if (rand.boolean()) {
+            var nb: [40]u8 = undefined;
+            a.auditForward(std.fmt.bufPrint(&nb, "cmd{d}", .{round}) catch unreachable);
+        }
+        // Build a hostile reply: often trailer-shaped (body + 0x1e + digits + \n, where the
+        // digits are sometimes overlong/garbage/negative), sometimes pure random bytes.
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        if (rand.boolean()) {
+            len = rand.uintLessThan(usize, 200);
+            rand.bytes(buf[0..len]);
+            if (len < buf.len) {
+                buf[len] = 0x1e;
+                len += 1;
+            }
+            const digits = rand.uintLessThan(usize, 40); // > the 16-byte exit buffer
+            var d: usize = 0;
+            while (d < digits and len < buf.len) : (d += 1) {
+                buf[len] = "0123456789-+xX\r"[rand.uintLessThan(usize, 15)];
+                len += 1;
+            }
+            if (len < buf.len) {
+                buf[len] = '\n';
+                len += 1;
+            }
+        } else {
+            len = rand.uintLessThan(usize, buf.len);
+            rand.bytes(buf[0..len]);
+        }
+        // Feed in random chunks through BOTH observers, mirroring agentEvent's .recv order.
+        var off: usize = 0;
+        while (off < len) {
+            const chunk = 1 + rand.uintLessThan(usize, 17);
+            const end = @min(off + chunk, len);
+            a.auditRecv(buf[off..end]);
+            a.relayCapped(buf[off..end]);
+            off = end;
+        }
+        // Invariants that must hold for ANY byte pattern: the exit-scan accumulator stays
+        // within its fixed buffer, and the audit ring head is always a valid index.
+        try testing.expect(a.audit_exit_len <= a.audit_exit.len);
+        try testing.expect(a.cmd_head < CMD_LOG_CAP);
+    }
+    // The audit log still serializes cleanly after the assault.
+    var out: [16384]u8 = undefined;
+    std.mem.doNotOptimizeAway(a.cmdLog(&out));
+}
