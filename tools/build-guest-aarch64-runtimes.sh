@@ -56,7 +56,16 @@ modprobe ext4 2>/dev/null
 # auto-mount it at /data if it carries a filesystem (mkfs.ext4 it once). Harmless if raw.
 if [ -b /dev/vda ]; then
 	mkdir -p /data
-	mount /dev/vda /data 2>/dev/null && { chmod 0777 /data 2>/dev/null; echo "[init] persistent disk mounted at /data"; }
+	# A freshly created persistent disk (host signalled nether.disk_fresh=1) has no
+	# filesystem; format it once so even a non-root (run_as) workload gets a usable /data.
+	# An existing disk is never reformatted - the host only flags a brand-new backing file.
+	grep -q 'nether.disk_fresh=1' /proc/cmdline 2>/dev/null && mkfs.ext4 -q -F /dev/vda 2>/dev/null
+	# Mount -o sync: durable by default - data AND metadata reach the device synchronously,
+	# so a stateful workload (e.g. sqlite, whose rollback journal needs durable directory
+	# ops) survives a __shutdown__/crash. Nether's VIRTIO_BLK_F_FLUSH then msyncs the host
+	# mapping to its file. Trade write speed for durability; a workload that prefers speed can
+	# `mount -o remount,relatime /data` and manage durability via fsync.
+	mount -o sync /dev/vda /data 2>/dev/null && { chmod 0777 /data 2>/dev/null; echo "[init] persistent disk mounted at /data (sync)"; }
 fi
 
 # Static slirp address plan (guest 10.0.2.15, gw 10.0.2.2, DNS 10.0.2.3); slirp also

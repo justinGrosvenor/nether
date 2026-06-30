@@ -13,6 +13,7 @@ pub const libc = struct {
     pub extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
     pub extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
     pub extern "c" fn ftruncate(fd: c_int, length: i64) c_int; // size a backing file (persistent disk)
+    pub extern "c" fn msync(addr: *anyopaque, len: usize, flags: c_int) c_int; // flush a MAP_SHARED mapping to its file
     pub extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
     // Unix-domain control socket + a pipe to relay the guest agent's replies.
     pub extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
@@ -217,6 +218,14 @@ pub fn createTruncNoFollow(path: [*:0]const u8) c_int {
     const O_TRUNC = 0x0400;
     const O_NOFOLLOW = 0x0100; // BSD/macOS value (Linux differs; the platform path is HVF)
     return libc.open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, @as(c_int, 0o644));
+}
+
+/// Flush a MAP_SHARED mapping (a persistent virtio-blk disk) to its backing file, so a
+/// guest fsync -> virtio FLUSH is durable even against a hard guest poweroff. MS_SYNC
+/// differs by OS; the HVF host is macOS.
+pub fn syncMapping(buf: []u8) void {
+    const MS_SYNC: c_int = if (builtin.os.tag == .macos) 0x10 else 4;
+    _ = libc.msync(buf.ptr, buf.len, MS_SYNC);
 }
 
 /// Copy a path slice into `buf` as a NUL-terminated C string for libc calls.

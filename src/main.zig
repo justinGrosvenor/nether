@@ -788,17 +788,40 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         initrd_end = initrd_start + fs.len;
     }
 
-    // Kernel cmdline. When `run_as=<user>` is set, pass it through as `nether.run_as=` so
-    // the in-guest agent runs commands under that non-root user (defense-in-depth; the VM
-    // is the primary boundary). The cmdline is the host->guest config channel; a fork
-    // inherits the base's run_as (no DTB rebuild on restore).
+    // Persistent disk backing (-> /dev/vda). `disk=<path>` mmaps a host file MAP_SHARED
+    // (sized by `disk_size_mb`, default 64) so writes survive restarts; else the ephemeral
+    // in-memory demo disk. Opened HERE (before the cmdline) so a freshly created disk can be
+    // signalled to the guest for one-time formatting. A file-backed disk is NOT captured in
+    // snapshots (the SnapCtx passes an empty disk when file-backed).
+    var disk_path_buf: [1024]u8 = undefined;
+    const disk_file_backed = confGet("disk", &disk_path_buf) != null;
+    var disk_fresh = false;
+    var blk_is_file = false; // true only if the host file actually opened (else ephemeral fallback)
+    const blk_backing: []u8 = if (disk_file_backed) backing: {
+        const mb: usize = @intCast(@max(confGetInt("disk_size_mb", 64), 1));
+        if (armdev.openDiskFile(@ptrCast(&disk_path_buf), mb * 1024 * 1024, &disk_fresh)) |d| {
+            blk_is_file = true;
+            std.debug.print("[nether] virtio-blk: persistent disk '{s}' ({d} MiB, host-file-backed{s})\n", .{ @as([*:0]const u8, @ptrCast(&disk_path_buf)), mb, if (disk_fresh) ", fresh -> guest will format" else "" });
+            break :backing d;
+        }
+        std.debug.print("[nether] virtio-blk: WARNING cannot open disk '{s}'; using an ephemeral in-memory disk\n", .{@as([*:0]const u8, @ptrCast(&disk_path_buf))});
+        break :backing makeBlkDisk();
+    } else makeBlkDisk();
+
+    // Kernel cmdline (the host->guest config channel): `nether.run_as=<user>` for the
+    // optional in-guest privilege drop, and `nether.disk_fresh=1` when the persistent disk
+    // was just created so /init mkfs's it once. A fork inherits the base's cmdline (no DTB
+    // rebuild on restore).
     const base_cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000";
     var cmdline_buf: [256]u8 = undefined;
     var runas_buf: [64]u8 = undefined;
-    const cmdline: [:0]const u8 = if (confGet("run_as", &runas_buf)) |u|
-        (std.fmt.bufPrintZ(&cmdline_buf, "{s} nether.run_as={s}", .{ base_cmdline, u }) catch base_cmdline)
-    else
-        base_cmdline;
+    const runas: []const u8 = confGet("run_as", &runas_buf) orelse "";
+    const cmdline: [:0]const u8 = std.fmt.bufPrintZ(&cmdline_buf, "{s}{s}{s}{s}", .{
+        base_cmdline,
+        if (runas.len > 0) " nether.run_as=" else "",
+        runas,
+        if (disk_fresh) " nether.disk_fresh=1" else "",
+    }) catch base_cmdline;
 
     var dtb_buf: [16 * 1024]u8 = undefined;
     const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
@@ -861,24 +884,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     con_dev.msi_fn = armSendMsi;
     try pci_host.addFunction(con_dev.function(1, 0));
 
-    // Function 0:2.0 - virtio-blk (-> /dev/vda when the guest loads virtio_blk). Backing:
-    // a PERSISTENT host file if `disk=<path>` is set (mmap'd MAP_SHARED, sized by
-    // `disk_size_mb`, default 64; writes survive restarts - the stateful/db story), else
-    // the ephemeral in-memory demo disk. A file-backed disk can be larger than the
-    // snapshot's 1 MiB disk section, and the file IS the persistence, so it is NOT captured
-    // in snapshots (the SnapCtx below passes an empty disk when file-backed).
-    var disk_path_buf: [1024]u8 = undefined;
-    const disk_file_backed = confGet("disk", &disk_path_buf) != null;
-    const blk_backing: []u8 = if (disk_file_backed) backing: {
-        const mb: usize = @intCast(@max(confGetInt("disk_size_mb", 64), 1));
-        if (armdev.openDiskFile(@ptrCast(&disk_path_buf), mb * 1024 * 1024)) |d| {
-            std.debug.print("[nether] virtio-blk: persistent disk '{s}' ({d} MiB, host-file-backed)\n", .{ @as([*:0]const u8, @ptrCast(&disk_path_buf)), mb });
-            break :backing d;
-        }
-        std.debug.print("[nether] virtio-blk: WARNING cannot open disk '{s}'; using an ephemeral in-memory disk\n", .{@as([*:0]const u8, @ptrCast(&disk_path_buf))});
-        break :backing makeBlkDisk();
-    } else makeBlkDisk();
+    // Function 0:2.0 - virtio-blk (-> /dev/vda when the guest loads virtio_blk). The backing
+    // (`blk_backing`: a persistent host file or the ephemeral in-memory disk) was selected
+    // above, before the cmdline, so a freshly created disk could be flagged for formatting.
     var blk = nether.VirtioBlk{ .disk = blk_backing };
+    if (blk_is_file) blk.flush_fn = hostutil.syncMapping; // durable fsync: VIRTIO_BLK_F_FLUSH -> msync the mapping
     var blk_dev = nether.virtio.Device.init(blk.backend(), gmem);
     var blk_intx = IntxLine{ .intid = armPciIntxIntid(2) };
     blk_dev.intx_ptr = &blk_intx;

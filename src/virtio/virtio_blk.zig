@@ -13,6 +13,13 @@ const trace = @import("../common/trace.zig");
 
 pub const Blk = struct {
     disk: []u8,
+    /// When set (a persistent host-file-backed disk), the device advertises
+    /// VIRTIO_BLK_F_FLUSH and calls this on a T_FLUSH so the guest's fsync flushes the
+    /// host mapping to its file (durable against a hard poweroff). Null = an in-memory
+    /// disk (tests, the ephemeral demo disk): no flush feature, T_FLUSH is a no-op.
+    flush_fn: ?*const fn (disk: []u8) void = null,
+
+    const F_FLUSH = 1 << 9; // VIRTIO_BLK_F_FLUSH
 
     const T_IN = 0; // read from disk into guest
     const T_OUT = 1; // write guest into disk
@@ -31,7 +38,7 @@ pub const Blk = struct {
             .ptr = self,
             .device_id = 2, // virtio block
             .num_queues = 1,
-            .device_features = 0,
+            .device_features = if (self.flush_fn != null) F_FLUSH else 0,
             .notify = onNotify,
             .config_read = configRead,
         };
@@ -123,7 +130,7 @@ pub const Blk = struct {
                 if (dst.len > m) @memset(dst[m..], 0);
                 data_written +|= @intCast(@min(dst.len, std.math.maxInt(u32)));
             },
-            T_FLUSH => {}, // backing store is memory; nothing to flush
+            T_FLUSH => if (self.flush_fn) |f| f(self.disk), // persist the host mapping to its file
             else => ok = false,
         }
 
@@ -194,6 +201,40 @@ test "blk write updates the disk" {
 
     try std.testing.expectEqualSlices(u8, ram[0x600..0x800], disk[512..1024]); // sector 1 written
     try std.testing.expectEqual(@as(u8, 0), ram[0x900]);
+}
+
+test "blk advertises FLUSH only with a sink, and calls it on T_FLUSH" {
+    var disk = [_]u8{0} ** 2048;
+    var ram = [_]u8{0} ** 4096;
+    const Sink = struct {
+        var hit: bool = false;
+        fn f(_: []u8) void {
+            hit = true;
+        }
+    };
+    Sink.hit = false;
+
+    // No sink (in-memory disk): the flush feature is NOT advertised.
+    var plain = Blk{ .disk = &disk };
+    try std.testing.expect(plain.backend().device_features & (1 << 9) == 0);
+
+    // With a sink (persistent disk): F_FLUSH is advertised and a T_FLUSH calls it.
+    var blk = Blk{ .disk = &disk, .flush_fn = Sink.f };
+    try std.testing.expect(blk.backend().device_features & (1 << 9) != 0);
+    var dev = virtio.Device.init(blk.backend(), .{ .bytes = &ram, .base = 0 });
+    dev.barWrite(0x16, 2, 0);
+    dev.barWrite(0x18, 2, 8);
+    dev.barWrite(0x28, 4, 0x100);
+    dev.barWrite(0x30, 4, 0x200);
+    dev.barWrite(0x1c, 2, 1);
+    writeDesc(&ram, 0, 0x400, 16, virtq.DESC_F_NEXT, 1); // header (device-readable)
+    writeDesc(&ram, 1, 0x900, 1, virtq.DESC_F_WRITE, 0); // status (device-writable)
+    std.mem.writeInt(u32, ram[0x400..][0..4], 4, .little); // type = T_FLUSH
+    std.mem.writeInt(u16, ram[0x102..][0..2], 1, .little);
+    std.mem.writeInt(u16, ram[0x104..][0..2], 0, .little);
+    dev.barWrite(0x2000, 4, 0);
+    try std.testing.expect(Sink.hit); // the flush reached the backing-sync sink
+    try std.testing.expectEqual(@as(u8, 0), ram[0x900]); // S_OK
 }
 
 fn writeDesc(buf: []u8, idx: usize, addr: u64, len: u32, flags: u16, nxt: u16) void {

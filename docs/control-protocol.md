@@ -208,13 +208,24 @@ uid 1000, can write `/tmp` and `~`, and is refused on `/etc`.
 By default a sandbox is ephemeral (RAM-backed initramfs); all writes vanish on stop. For
 stateful / database workloads, set `disk=<host-path>` (and optionally `disk_size_mb`,
 default 64): Nether mmaps that host file (`MAP_SHARED`) as virtio-blk, so the guest's block
-writes flush back to it and **survive sandbox restarts**. The guest's `/init` loads
-`virtio_blk` + `ext4` and auto-mounts `/dev/vda` at `/data` if it carries a filesystem, so a
-workload just uses `/data`. Format it once (in-guest `mkfs.ext4 /dev/vda`, or pre-format the
-host image). The platform owns per-sandbox disk files: two live sandboxes must not share one
-(no cross-mount locking). A file-backed disk is **not** captured in snapshots (the file is
-its own persistence and can exceed the snapshot's disk section); set `disk=` on a fork's
-conf to attach it there too. Verified: a python+sqlite db on `/data` survives a restart.
+writes flush back to it and **survive sandbox restarts**. It is turnkey: when Nether
+creates a brand-new disk file it tells the guest (`nether.disk_fresh=1` on the cmdline) and
+`/init` runs `mkfs.ext4` once; then on every boot `/init` loads `virtio_blk` + `ext4` and
+auto-mounts `/dev/vda` at `/data`, so a workload (even a non-root `run_as` one - `/data` is
+world-writable) just uses `/data` with no setup. An existing disk is never reformatted.
+
+`/data` is mounted **`-o sync`** for durability by default: data and metadata reach the
+device synchronously and Nether's virtio-blk advertises `VIRTIO_BLK_F_FLUSH`, so a guest
+`fsync` (or a sqlite commit, whose rollback journal needs durable directory ops) `msync`s
+the host mapping to its file - the db survives a `__shutdown__`. A workload that prefers
+write throughput over durability can `mount -o remount,relatime /data` and fsync itself.
+
+The platform owns per-sandbox disk files: two live sandboxes must not share one (no
+cross-mount locking). A file-backed disk is **not** captured in snapshots (the file is its
+own persistence and can exceed the snapshot's disk section); set `disk=` on a fork's conf to
+attach it (a fork does not re-run `/init`, so its disk must be pre-formatted). Verified: a
+fresh `disk=` + `run_as=nether` runs a python+sqlite db on `/data` that survives a restart,
+with no manual formatting or mounting.
 
 ### Networking / egress (how to turn it on)
 

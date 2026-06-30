@@ -49,12 +49,18 @@ pub fn makeBlkDisk() []u8 {
 /// survive across sandbox restarts. The fd may be closed after mmap (the mapping
 /// persists). Returns null on any failure so the caller can fall back to the ephemeral
 /// in-memory disk. HVF-side; `disk=<path>` / `disk_size_mb` in nether.conf select it.
-pub fn openDiskFile(path: [*:0]const u8, size: usize) ?[]u8 {
+pub fn openDiskFile(path: [*:0]const u8, size: usize, fresh: *bool) ?[]u8 {
     const O_RDWR = 0x0002;
     const O_CREAT = 0x0200;
     const fd = libc.open(path, O_RDWR | O_CREAT, @as(c_int, 0o644));
     if (fd < 0) return null;
     defer _ = libc.close(fd); // the mmap keeps the file mapped after the fd closes
+    // A brand-new (or empty) backing file is an unformatted disk: report it so the boot
+    // path can tell the guest to mkfs it once. A pre-existing non-empty file is left as-is
+    // (it already holds a filesystem / data), so auto-format can never clobber real data.
+    const prev = libc.lseek(fd, 0, 2); // SEEK_END = current size before we size it
+    _ = libc.lseek(fd, 0, 0); // SEEK_SET back
+    fresh.* = (prev == 0);
     if (libc.ftruncate(fd, @intCast(size)) != 0) return null; // fix the disk capacity (sparse)
     const mem = std.posix.mmap(
         null,
