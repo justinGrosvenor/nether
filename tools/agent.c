@@ -93,9 +93,39 @@ static void write_full(int s, const char *buf, size_t n) {
     }
 }
 
-/* Run one command and frame the reply: stream stdout+stderr, then a trailer
- * 0x1e<exit-code>\n so the host can tell where the output ends and whether the
- * command succeeded. (0x1e = ASCII record separator, won't appear in text.) */
+/* Frame delimiters for a command reply (must match src/agent/control.zig):
+ *   OUT_DELIM 0x1e  ends the output and begins the exit trailer.
+ *   OUT_ESC   0x1f  escape lead inside the output body.
+ * Untrusted command stdout can contain ANY byte, including 0x1e - so we must NOT
+ * assume "0x1e won't appear in text" (it can, and a hostile workload could forge a
+ * trailer). write_escaped stuffs the two control bytes out of the body: 0x1e/0x1f ->
+ * 0x1f then (byte ^ 0x40) (a printable ^ / _). After this a raw 0x1e appears on the
+ * wire ONLY as the real trailer, so the boundary is unforgeable by body content. The
+ * host un-escapes for display; see docs/control-protocol.md "Output framing". */
+#define OUT_DELIM 0x1e
+#define OUT_ESC 0x1f
+#define OUT_ESC_XOR 0x40
+
+static void write_escaped(int s, const char *buf, size_t n) {
+    char out[8192]; /* 2x a 4096 read at worst (every byte escaped) */
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char b = (unsigned char)buf[i];
+        if (b == OUT_DELIM || b == OUT_ESC) {
+            if (j + 2 > sizeof out) { write_full(s, out, j); j = 0; }
+            out[j++] = OUT_ESC;
+            out[j++] = (char)(b ^ OUT_ESC_XOR);
+        } else {
+            if (j + 1 > sizeof out) { write_full(s, out, j); j = 0; }
+            out[j++] = (char)b;
+        }
+    }
+    if (j) write_full(s, out, j);
+}
+
+/* Run one command and frame the reply: stream stdout+stderr (delimiter-escaped so the
+ * body can never forge a frame boundary), then a raw trailer 0x1e<exit-code>\n so the
+ * host can tell where the output ends and whether the command succeeded. */
 static void run(int s, const char *cmd) {
     /* fork + pipe + exec `sh -c <cmd>` (the cmd is a direct argv, so no quoting hazard),
      * merging stderr into stdout and, when configured, dropping to the run_as uid/gid
@@ -121,7 +151,7 @@ static void run(int s, const char *cmd) {
             close(fds[1]);
             char buf[4096];
             ssize_t r;
-            while ((r = read(fds[0], buf, sizeof buf)) > 0) write_full(s, buf, (size_t)r);
+            while ((r = read(fds[0], buf, sizeof buf)) > 0) write_escaped(s, buf, (size_t)r);
             close(fds[0]);
             int st;
             waitpid(pid, &st, 0);

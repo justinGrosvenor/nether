@@ -293,6 +293,37 @@ const CmdEvent = struct {
     text_len: usize = 0,
 };
 
+/// Command-reply framing (must match tools/agent.c). A reply is the command's output
+/// followed by a trailer `OUT_DELIM <exit> \n`. Untrusted command stdout can contain any
+/// byte, so the agent delimiter-ESCAPES the body: an OUT_DELIM or OUT_ESC in the body is
+/// emitted as `OUT_ESC, (byte ^ OUT_ESC_XOR)`. A raw OUT_DELIM therefore appears on the
+/// wire ONLY as the real trailer - the body cannot forge a frame boundary (R2b). The host
+/// trailer scanners below just look for a raw OUT_DELIM (now unforgeable); un-escaping is
+/// only needed to reconstruct the literal output for display. See docs/control-protocol.md.
+pub const OUT_DELIM: u8 = 0x1e;
+pub const OUT_ESC: u8 = 0x1f;
+const OUT_ESC_XOR: u8 = 0x40;
+
+/// Un-escape command-output body bytes (inverse of agent.c write_escaped). `esc` carries
+/// a mid-escape (a trailing OUT_ESC) across calls so it streams over arbitrary chunking.
+/// Decoded length is always <= in.len (escapes only shrink), so `out` must be >= in.len.
+fn outUnescape(in: []const u8, out: []u8, esc: *bool) usize {
+    var n: usize = 0;
+    for (in) |b| {
+        if (esc.*) {
+            out[n] = b ^ OUT_ESC_XOR;
+            n += 1;
+            esc.* = false;
+        } else if (b == OUT_ESC) {
+            esc.* = true;
+        } else {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    return n;
+}
+
 pub const AgentCtx = struct {
     conn_id: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     /// Control-socket mode: agent replies are written raw to this pipe for the
@@ -308,6 +339,7 @@ pub const AgentCtx = struct {
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
+    repl_esc: bool = false, // REPL display: mid-escape carried across recv buffers
     /// Unified event journal: commands are mirrored here as CMD events.
     journal: ?*nether.Journal = null,
     /// Usage meter, so agent output counts as activity for the idle watchdog.
@@ -459,12 +491,14 @@ pub const AgentCtx = struct {
     /// command's exit code, printed as a `[exit N]` line.
     fn onRecv(a: *AgentCtx, bytes: []const u8) void {
         var i: usize = 0;
+        var dec: [4096]u8 = undefined;
         while (i < bytes.len) {
             if (a.parsing_exit) {
                 if (bytes[i] == '\n') {
                     std.debug.print("[exit {s}]\n", .{a.exit_buf[0..a.exit_len]});
                     a.parsing_exit = false;
                     a.exit_len = 0;
+                    a.repl_esc = false; // reset escape state at the frame boundary
                 } else if (a.exit_len < a.exit_buf.len) {
                     a.exit_buf[a.exit_len] = bytes[i];
                     a.exit_len += 1;
@@ -472,9 +506,17 @@ pub const AgentCtx = struct {
                 i += 1;
             } else {
                 const start = i;
-                while (i < bytes.len and bytes[i] != 0x1e) i += 1;
-                if (i > start) _ = std.c.write(1, bytes[start..].ptr, i - start);
-                if (i < bytes.len) { // hit the 0x1e separator
+                while (i < bytes.len and bytes[i] != OUT_DELIM) i += 1;
+                // Un-escape the body span (in bounded chunks) so the REPL shows the literal
+                // output, not the on-wire escapes. dec.len >= chunk, so it never overflows.
+                var off = start;
+                while (off < i) {
+                    const take = @min(dec.len, i - off);
+                    const m = outUnescape(bytes[off .. off + take], &dec, &a.repl_esc);
+                    if (m > 0) _ = std.c.write(1, dec[0..m].ptr, m);
+                    off += take;
+                }
+                if (i < bytes.len) { // hit the raw OUT_DELIM trailer
                     a.parsing_exit = true;
                     i += 1;
                 }
@@ -1689,4 +1731,75 @@ test "agent reply relay survives hostile guest streams (exit-scan + output cap)"
     // The audit log still serializes cleanly after the assault.
     var out: [16384]u8 = undefined;
     std.mem.doNotOptimizeAway(a.cmdLog(&out));
+}
+
+// Mirror of tools/agent.c write_escaped, for the R2b framing tests below.
+fn escapeBody(in: []const u8, out: []u8) usize {
+    var n: usize = 0;
+    for (in) |b| {
+        if (b == OUT_DELIM or b == OUT_ESC) {
+            out[n] = OUT_ESC;
+            out[n + 1] = b ^ OUT_ESC_XOR;
+            n += 2;
+        } else {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "R2b: an escaped body cannot forge the exit trailer (audit records the real exit)" {
+    // Command stdout literally contains a trailer-shaped sequence (0x1e '0' \n). Because the
+    // agent delimiter-escapes the body, that 0x1e goes on the wire as 0x1f 0x5e - so only the
+    // REAL trailer (0x1e '7' \n) carries a raw 0x1e. The host trailer scanner must record 7.
+    var wire: [64]u8 = undefined;
+    var n = escapeBody("hi\x1e0\n", wire[0..]); // a forged trailer buried in the output
+    const tail = "\x1e7\n"; // the real, raw trailer
+    @memcpy(wire[n .. n + tail.len], tail);
+    n += tail.len;
+    try testing.expect(std.mem.indexOfScalar(u8, wire[0 .. n - tail.len], OUT_DELIM) == null); // body carries no raw delim
+
+    var a = AgentCtx{};
+    a.auditForward("run");
+    for (wire[0..n]) |b| a.auditRecv(&[_]u8{b}); // byte-at-a-time: exercise the streaming scanner
+    const got = a.cmd_log[(a.cmd_head + CMD_LOG_CAP - 1) % CMD_LOG_CAP];
+    try testing.expectEqual(@as(i32, 7), got.exit);
+
+    // Contrast: the same bytes UNescaped (i.e. the pre-R2b wire) desync to the forged exit 0 -
+    // this is exactly the bug the escape closes.
+    var b2 = AgentCtx{};
+    b2.auditForward("run");
+    b2.auditRecv("hi\x1e0\n\x1e7\n");
+    const bad = b2.cmd_log[(b2.cmd_head + CMD_LOG_CAP - 1) % CMD_LOG_CAP];
+    try testing.expectEqual(@as(i32, 0), bad.exit);
+}
+
+test "outUnescape round-trips and streams across a split escape lead" {
+    const orig = "a\x1eb\x1fc\x1e\x1f";
+    var esc: [32]u8 = undefined;
+    const en = escapeBody(orig, esc[0..]);
+    try testing.expect(std.mem.indexOfScalar(u8, esc[0..en], OUT_DELIM) == null); // no raw delim survives
+
+    var out: [32]u8 = undefined;
+    var e = false;
+    const m = outUnescape(esc[0..en], out[0..], &e);
+    try testing.expect(!e);
+    try testing.expectEqualSlices(u8, orig, out[0..m]);
+
+    // Split the wire right after an escape lead so `esc` must carry the mid-escape across calls.
+    var split: usize = 1;
+    for (esc[0..en], 0..) |b, idx| {
+        if (b == OUT_ESC) {
+            split = idx + 1;
+            break;
+        }
+    }
+    var out2: [32]u8 = undefined;
+    var e2 = false;
+    var m2 = outUnescape(esc[0..split], out2[0..], &e2);
+    try testing.expect(e2); // mid-escape carried to the next call
+    m2 += outUnescape(esc[split..en], out2[m2..], &e2);
+    try testing.expect(!e2);
+    try testing.expectEqualSlices(u8, orig, out2[0..m2]);
 }

@@ -117,6 +117,35 @@ This is one end of a two-sided contract (the other is the driving client's read 
 
 `__info__` reports the effective `max_output_bytes` so a client can size its buffer to match.
 
+### Output framing (a command's body cannot forge the trailer)
+
+The `0x1e<exit>\n` trailer marks where a command's output ends. Command stdout is
+untrusted (arbitrary workload bytes), so it **can** contain a literal `0x1e` - and a naive
+"read until `0x1e`" would let a workload that prints `0x1e5\n` forge an early trailer,
+desyncing the reader and every reply after it (finding **R2b**). Nether closes this at the
+trusted framer: the in-guest agent **delimiter-escapes** the output body before it hits the
+wire, so a raw `0x1e` appears **only** in the real trailer.
+
+The escape (`tools/agent.c` `write_escaped` <-> `src/agent/control.zig` `outUnescape`):
+
+- Delimiter `OUT_DELIM = 0x1e`; escape lead `OUT_ESC = 0x1f`.
+- In the **body**, a `0x1e` or `0x1f` byte is emitted as `0x1f, (byte ^ 0x40)` - i.e. a
+  printable `^` / `_`, never a raw `0x1e`. The trailer's `0x1e` is written raw.
+- To recover the literal bytes, un-escape the body **after** framing on the raw `0x1e`: on
+  a `0x1f`, the next byte XOR `0x40` is the original.
+
+This makes the frame boundary **unforgeable by body content** for both nether's own
+accounting (exit code, output cap, command audit) and the driving client. It is
+**backward-safe**: a client that does not un-escape still frames correctly (the body never
+contains a raw `0x1e`), and output with no `0x1e`/`0x1f` is byte-identical on the wire -
+un-escaping is only needed for byte-perfect display of those two control bytes. Scope: this
+defends against a hostile *workload* (the untrusted thing the agent runs). A compromised
+*guest kernel* could write raw bytes to the vsock directly, but that is a VM-escape-class
+threat contained by the hardware boundary (HVF/EPT), not by wire framing.
+
+Binary or `0x1e`-bearing payloads that need exact fidelity without a client-side un-escape
+should move over `__get__` (length-framed, binary-safe), not command stdout.
+
 ### Concurrency on the primary socket
 
 The primary socket carries both host-intercepted query replies and the streamed reply of
