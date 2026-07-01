@@ -926,11 +926,15 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         core.agent.render = &render;
     }
     defer if (control_on) render.deinit();
+    // vsock event routing: a host-dialed data/probe conn's events go to the data plane
+    // (the P0 bridge spike), the guest-initiated agent conn to the agent. See control.zig.
+    var vs_probe: control.VsockProbe = .{};
+    var vs_router: control.VsockRouter = .{ .agent = &core.agent, .probe = &vs_probe };
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
-        vs.on_event = if (agent_mode) agentEvent else vsockEcho;
-        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &core.agent) else @as(*anyopaque, vs);
+        vs.on_event = if (agent_mode) control.VsockRouter.dispatch else vsockEcho;
+        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &vs_router) else @as(*anyopaque, vs);
         vs_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), gmem);
@@ -1068,6 +1072,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             .agent = &core.agent,
             .meter = &core.meter,
             .journal = &core.journal,
+            .probe = &vs_probe,
             .gpu = if (gpu_on) &gpu_be else null,
             .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
             .snapshot = .{ .ctx = &snap_ctx, .func = snapshot.snapshotCall },

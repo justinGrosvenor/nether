@@ -552,6 +552,101 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
     }
 }
 
+/// The connection id an event carries, if any (for routing host-dialed conns).
+fn evConn(ev: nether.vsock.Event) ?u16 {
+    return switch (ev) {
+        .accept => |id| id,
+        .connected => |id| id,
+        .recv => |r| r.conn,
+        .shutdown => |id| id,
+        .reset => |id| id,
+    };
+}
+
+/// P0 spike for the Phase-2 data-plane bridge (docs/park-concurrency-plan.md): drives
+/// ONE host-initiated vsock connection to a guest-listening port and records its
+/// lifecycle, so `__vsockprobe__` can prove host->guest connect + RW + teardown on a
+/// live guest before the real bridge is built. Its own lock (NOT the vsock D3 lock)
+/// guards state: events fire on the vCPU/device thread, the poll runs on the control
+/// thread. This is the seed of the data-plane bridge's per-conn context.
+pub const VsockProbe = struct {
+    lock: Lock = .{},
+    conn: ?u16 = null,
+    state: State = .idle,
+    echo: [128]u8 = undefined,
+    echo_len: usize = 0,
+
+    pub const State = enum { idle, connecting, established, closed, reset };
+
+    pub fn start(self: *VsockProbe, id: u16) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.conn = id;
+        self.state = .connecting;
+        self.echo_len = 0;
+    }
+
+    fn owns(self: *VsockProbe, id: u16) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.conn != null and self.conn.? == id;
+    }
+
+    /// Fires on the device thread (inside the vsock D3 lock) for our dialed conn.
+    fn event(self: *VsockProbe, ev: nether.vsock.Event) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        switch (ev) {
+            .connected => self.state = .established,
+            .recv => |r| {
+                const n = @min(self.echo.len - self.echo_len, r.bytes.len);
+                @memcpy(self.echo[self.echo_len..][0..n], r.bytes[0..n]);
+                self.echo_len += n;
+            },
+            .shutdown => self.state = .closed,
+            .reset => self.state = .reset,
+            else => {},
+        }
+    }
+
+    /// Copy the echo bytes into `buf` and return the current state + copied length.
+    pub fn read(self: *VsockProbe, buf: []u8) struct { state: State, len: usize } {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const n = @min(buf.len, self.echo_len);
+        @memcpy(buf[0..n], self.echo[0..n]);
+        return .{ .state = self.state, .len = n };
+    }
+
+    pub fn clear(self: *VsockProbe) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.conn = null;
+        self.state = .idle;
+        self.echo_len = 0;
+    }
+};
+
+/// vsock event router: a host-dialed data/probe conn's events go to the data plane
+/// (the VsockProbe now; the Phase-2 bridge later); everything else - notably the
+/// guest-initiated agent conn - goes to the agent. Without this, a dialed conn's
+/// reset/shutdown would clobber the agent's conn-id tracking (agentEvent clears it on
+/// ANY reset). Seed of the data-plane bridge (docs/park-concurrency-plan.md).
+pub const VsockRouter = struct {
+    agent: *AgentCtx,
+    probe: ?*VsockProbe = null,
+
+    pub fn dispatch(ctx: *anyopaque, ev: nether.vsock.Event) void {
+        const self: *VsockRouter = @ptrCast(@alignCast(ctx));
+        if (self.probe) |p| {
+            if (evConn(ev)) |id| {
+                if (p.owns(id)) return p.event(ev);
+            }
+        }
+        agentEvent(self.agent, ev);
+    }
+};
+
 /// Control plane: a Unix-domain socket the platform connects to in order to drive
 /// the in-guest agent without owning this process's stdio. One control client at
 /// a time: its command lines are forwarded to the agent over vsock, and the
@@ -568,6 +663,7 @@ pub const ControlCtx = struct {
     snapshot: ?platform.Snapshotter = null, // on-demand base capture, for __snapshot__
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
+    probe: ?*VsockProbe = null, // P0 data-plane spike, for __vsockprobe__ (HVF)
     info: SandboxInfo = .{}, // static capabilities/limits, for __info__
     // How long a driving command waits for the in-guest agent to connect before failing
     // with an ERR (rather than blocking this control thread forever). Generous enough for
@@ -920,6 +1016,47 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         _ = ctx.meter.commands.fetchAdd(1, .release);
         return;
     }
+    // Diagnostic (P0 spike, docs/park-concurrency-plan.md): prove host->guest vsock
+    // connect on a LIVE guest, the go/no-go for the data-plane bridge. Dials
+    // <guest_port> (a guest process must be listening on that vsock port), sends a
+    // probe, reports the echo, and tears down. Events for this dialed conn are routed to
+    // ctx.probe (not the agent) by VsockRouter, so the agent conn is unaffected.
+    if (std.mem.startsWith(u8, line, "__vsockprobe__ ") or std.mem.eql(u8, line, "__vsockprobe__\n") or std.mem.eql(u8, line, "__vsockprobe__")) {
+        const probe = ctx.probe orelse return reply(c, "ERR vsock probe not wired on this backend\n");
+        const arg = if (std.mem.startsWith(u8, line, "__vsockprobe__ ")) std.mem.trim(u8, line["__vsockprobe__ ".len..], " \r\n") else "";
+        const port = std.fmt.parseInt(u32, arg, 10) catch return reply(c, "ERR __vsockprobe__ <guest_port>\n");
+        const id = ctx.vsdev.hostConnect(55000, port) orelse return reply(c, "ERR host connect: conn table full\n");
+        probe.start(id);
+        var buf: [128]u8 = undefined;
+        // Wait (bounded) for the handshake: guest accept -> OP_RESPONSE -> established.
+        var waited: u32 = 0;
+        var snap = probe.read(&buf);
+        while (snap.state == .connecting and waited < 3000) : (waited += 10) {
+            _ = usleep(10_000);
+            snap = probe.read(&buf);
+        }
+        if (snap.state != .established) {
+            ctx.vsdev.hostClose(id);
+            probe.clear();
+            var eb: [96]u8 = undefined;
+            return reply(c, std.fmt.bufPrint(&eb, "ERR host->guest connect not established (state={s})\n", .{@tagName(snap.state)}) catch "ERR host connect failed\n");
+        }
+        // Established: send a probe payload and wait for the guest to echo it back.
+        _ = ctx.vsdev.hostSend(id, "PING\n");
+        waited = 0;
+        snap = probe.read(&buf);
+        while (snap.len == 0 and snap.state == .established and waited < 1000) : (waited += 10) {
+            _ = usleep(10_000);
+            snap = probe.read(&buf);
+        }
+        ctx.vsdev.hostClose(id);
+        var ob: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&ob, "OK host->guest vsock: established; echo={d}B: {s}\n", .{ snap.len, buf[0..snap.len] }) catch "OK host->guest vsock established\n";
+        _ = writeAll(c, msg);
+        _ = ctx.meter.bytes_out.fetchAdd(msg.len, .release);
+        probe.clear();
+        return;
+    }
     // Reserved namespace: `__name__` is Nether's control-command space. A line that
     // looks like one but matched none above (a typo, or a client mistaking a guest
     // verb for a control command) is a protocol error - reject it loudly instead of
@@ -970,6 +1107,7 @@ pub const ControlOpts = struct {
     agent: *AgentCtx,
     meter: *Metering,
     journal: *nether.Journal,
+    probe: ?*VsockProbe = null, // P0 data-plane spike, for __vsockprobe__ (HVF)
     gpu: ?*nether.VirtioGpu = null,
     stop: platform.Stop, // backend-agnostic guest stop for __shutdown__
     snapshot: ?platform.Snapshotter = null, // on-demand base capture for __snapshot__ (HVF)
@@ -1006,6 +1144,7 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
         .snapshot = o.snapshot,
         .gpu = o.gpu,
         .journal = o.journal,
+        .probe = o.probe,
         .info = o.info,
     };
     if (std.Thread.spawn(.{}, controlListener, .{ctl})) |t| t.detach() else |_| {}
