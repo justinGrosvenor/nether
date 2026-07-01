@@ -266,7 +266,10 @@ pub const Gpu = struct {
         const e = self.backing[base_entry.*];
         const within = off - base_off.*;
         if (within + 4 > e.len) return 0; // pixel would span entries (offsets are 4-aligned, pages aren't)
-        const s = mem.slice(e.addr + within, 4) orelse return 0;
+        // e.addr is a raw guest-controlled u64 (RESOURCE_ATTACH_BACKING); add before the
+        // overflow-safe mem.slice would trap on wraparound. Check the add explicitly.
+        const gpa = std.math.add(u64, e.addr, within) catch return 0;
+        const s = mem.slice(gpa, 4) orelse return 0;
         return std.mem.readInt(u32, s[0..4], .little);
     }
 

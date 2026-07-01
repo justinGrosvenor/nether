@@ -813,6 +813,7 @@ pub const Slirp = struct {
                 continue;
             } // pad
             const len = bootp[i + 1];
+            if (i + 2 + len > bootp.len) break; // option body runs past the packet - stop before an OOB read
             if (opt == 53 and len >= 1) req_type = bootp[i + 2];
             i += 2 + len;
         }

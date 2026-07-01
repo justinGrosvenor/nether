@@ -28,6 +28,12 @@
 #include <pwd.h>
 #include <grp.h>
 
+/* Guest is always Linux (aarch64-linux-musl); musl defines SOCK_CLOEXEC, but guard it so
+ * a host-SDK lint pass (macOS, no such flag) still parses this file. */
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 02000000
+#endif
+
 /* Optional in-guest privilege drop (defense-in-depth; the VM is the primary boundary).
  * The host sets `nether.run_as=<user>` on the kernel cmdline when run_as= is in
  * nether.conf; we resolve it once and run every command under that uid/gid instead of
@@ -149,7 +155,12 @@ static void do_get(int s, const char *path) {
 
 int main(void) {
     init_runas(); // pick up nether.run_as=<user> from the kernel cmdline, if set
-    int s = socket(AF_VSOCK, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC: the host control fd must NOT survive into an exec'd guest command.
+    // Without it every `sh -c cmd` inherits this fd and could write framing bytes into
+    // the control stream (forge exit codes / desync metering) or read queued payloads -
+    // defeating the run_as containment. run() closes the pipe fds in the child but not
+    // this one; CLOEXEC closes it on exec automatically (the agent parent never execs).
+    int s = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s < 0) return 1;
     struct sockaddr_vm a;
     memset(&a, 0, sizeof a);

@@ -991,6 +991,10 @@ pub fn controlListener(ctx: *ControlCtx) void {
     _ = libc.unlink(ctx.path);
     var addr = SockaddrUn{};
     const p = std.mem.span(ctx.path);
+    if (p.len + 1 > addr.path.len) { // + NUL; the fixed sun_path is 104 (macOS) / 108 (Linux)
+        std.debug.print("[control] control_socket path too long ({d} > {d})\n", .{ p.len, addr.path.len - 1 });
+        return;
+    }
     @memcpy(addr.path[0..p.len], p);
     // `path` is at offset 2 on both OSes; the address length is that + the path + NUL.
     // Only BSD/macOS has the leading sun_len byte to populate.

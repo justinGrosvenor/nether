@@ -211,13 +211,23 @@ pub fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
 /// only realpath's the PARENT dir, so a pre-existing symlink AT the basename could still
 /// redirect the write outside the jail. O_NOFOLLOW closes that hole race-free - the final
 /// open itself refuses a symlink (ELOOP) rather than an lstat check that could TOCTOU.
-/// BSD/macOS oflag values, matching the rest of this codebase. Returns the fd, or -1.
+/// oflag bit values differ between BSD/macOS and Linux; selected at comptime so the KVM
+/// path gets real O_CREAT + O_NOFOLLOW (mis-decoded macOS bits there would drop both,
+/// breaking __get__ with ENOENT and silently disabling the symlink defense). Returns the
+/// fd, or -1.
 pub fn createTruncNoFollow(path: [*:0]const u8) c_int {
-    const O_WRONLY = 0x0001;
-    const O_CREAT = 0x0200;
-    const O_TRUNC = 0x0400;
-    const O_NOFOLLOW = 0x0100; // BSD/macOS value (Linux differs; the platform path is HVF)
-    return libc.open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, @as(c_int, 0o644));
+    const flags = if (builtin.os.tag == .macos) .{
+        .WRONLY = 0x0001,
+        .CREAT = 0x0200,
+        .TRUNC = 0x0400,
+        .NOFOLLOW = 0x0100,
+    } else .{ // Linux (asm-generic)
+        .WRONLY = 0o000001,
+        .CREAT = 0o000100,
+        .TRUNC = 0o001000,
+        .NOFOLLOW = 0o400000,
+    };
+    return libc.open(path, flags.WRONLY | flags.CREAT | flags.TRUNC | flags.NOFOLLOW, @as(c_int, 0o644));
 }
 
 /// Flush a MAP_SHARED mapping (a persistent virtio-blk disk) to its backing file, so a
