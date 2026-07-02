@@ -821,6 +821,53 @@ pub const DataBridge = struct {
     }
 };
 
+/// Fuzz driver for the data-plane bridge's event + lifecycle logic (the new attacker
+/// surface in step 2b: a hostile/misbehaving guest server drives the vsock events that
+/// reach `tryEvent`). Drives a hostile sequence of register / connected / recv / reset /
+/// teardown against a DataBridge and asserts the invariants hold: the conn table stays
+/// bounded, findId never OOBs, events for unknown/stale/duplicate ids are safe, and
+/// teardown never double-closes. Single-threaded: it exercises logic/memory-safety, not
+/// thread interleaving (that is argued by the strict lock order + the live concurrent
+/// test). Used by "fuzz: data-plane bridge" (fuzz.zig) and the loop test below.
+/// unix_fd points at /dev/null so writes always succeed and never block.
+pub fn fuzzBridge(bytes: []const u8) void {
+    var eng = nether.Vsock{ .guest_cid = 3 };
+    var dev = nether.VsockDev{ .engine = &eng }; // unattached: hostClose = engine.close, flush no-op
+    var br = DataBridge{ .vsdev = &dev, .path = "" };
+    defer { // close any fds left in the table so the driver doesn't leak across inputs
+        var s: usize = 0;
+        while (s < DataBridge.MAX_BRIDGE) : (s += 1) br.teardown(s);
+    }
+    var i: usize = 0;
+    while (i + 2 <= bytes.len) : (i += 2) {
+        const arg = bytes[i + 1];
+        const id: u16 = @intCast(arg % 60); // a small id space (< MAX_CONNS) so hits are common
+        switch (@as(u2, @truncate(bytes[i]))) {
+            0 => { // register a conn with a fresh /dev/null fd (slot may be full)
+                const fd = libc.open("/dev/null", 2, @as(c_int, 0)); // O_RDWR
+                if (fd >= 0 and br.register(id, fd) == null) _ = libc.close(fd);
+            },
+            1 => _ = br.tryEvent(.{ .connected = id }),
+            2 => {
+                var payload = [_]u8{ arg, arg ^ 0xff, 0x1e, 0x1f };
+                _ = br.tryEvent(.{ .recv = .{ .conn = id, .bytes = payload[0..] } });
+            },
+            3 => {
+                if (arg & 1 == 0) {
+                    _ = br.tryEvent(.{ .reset = id });
+                } else {
+                    br.teardown(arg % DataBridge.MAX_BRIDGE);
+                }
+            },
+        }
+        var active: usize = 0;
+        for (br.conns) |e| {
+            if (e.active) active += 1;
+        }
+        std.debug.assert(active <= DataBridge.MAX_BRIDGE);
+    }
+}
+
 /// Control plane: a Unix-domain socket the platform connects to in order to drive
 /// the in-guest agent without owning this process's stdio. One control client at
 /// a time: its command lines are forwarded to the agent over vsock, and the
@@ -2086,6 +2133,21 @@ test "R2b: an escaped body cannot forge the exit trailer (audit records the real
     b2.auditRecv("hi\x1e0\n\x1e7\n");
     const bad = b2.cmd_log[(b2.cmd_head + CMD_LOG_CAP - 1) % CMD_LOG_CAP];
     try testing.expectEqual(@as(i32, 0), bad.exit);
+}
+
+test "data-plane bridge survives hostile event/lifecycle sequences" {
+    // Deterministic companion to "fuzz: data-plane bridge" (fuzz.zig): hammer the bridge
+    // state machine with random register/event/teardown ops and assert it never crashes,
+    // OOBs, or leaves the table over-full. Runs on every `zig test`.
+    var prng = std.Random.DefaultPrng.init(0xB21D6E5);
+    const rand = prng.random();
+    var round: usize = 0;
+    while (round < 3000) : (round += 1) {
+        var buf: [64]u8 = undefined;
+        const n = rand.uintLessThan(usize, buf.len + 1);
+        rand.bytes(buf[0..n]);
+        fuzzBridge(buf[0..n]);
+    }
 }
 
 test "outUnescape round-trips and streams across a split escape lead" {

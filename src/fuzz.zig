@@ -29,6 +29,7 @@ const Screen = @import("vt/Screen.zig");
 const virtq = @import("virtio/virtq.zig");
 const virtio = @import("virtio/virtio.zig");
 const vsock = @import("virtio/virtio_vsock.zig");
+const control = @import("agent/control.zig");
 const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
 const pci = @import("chipset/pci.zig");
@@ -672,6 +673,19 @@ test "fuzz: vsock snapshot state" {
             var st: vsock.Vsock.State = undefined;
             smith.bytes(std.mem.asBytes(&st));
             feedVsockState(&st);
+        }
+    }.one, .{});
+}
+
+// The data-plane bridge (park-concurrency 3b, step 2b): a hostile/misbehaving guest
+// server drives the vsock events that reach the bridge. Fuzz its event + lifecycle
+// state machine (register/connected/recv/reset/teardown) for memory-safety + invariants.
+test "fuzz: data-plane bridge" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [128]u8 = undefined;
+            const n = smith.slice(&buf);
+            control.fuzzBridge(buf[0..n]);
         }
     }.one, .{});
 }
