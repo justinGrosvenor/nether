@@ -1100,6 +1100,20 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         });
     }
 
+    // Data-plane bridge (park-concurrency 3b, step 2b): when nether.conf sets `data_socket`,
+    // a host Unix listener splices each connection to a fresh host->guest vsock stream to the
+    // in-guest forwarder (started via nether.app_port), so a tenant's loopback server is a
+    // concurrent upstream. Wire the router to it BEFORE start() so its conn events route here.
+    var data_bridge: control.DataBridge = undefined;
+    var data_sock_buf: [256]u8 = undefined;
+    if (confGet("data_socket", &data_sock_buf)) |ds| {
+        if (ds.len > 0) {
+            data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter };
+            vs_router.bridge = &data_bridge;
+            data_bridge.start();
+        }
+    }
+
     // Host stdin: in agent-REPL mode it drives the guest agent (stdin -> sandbox
     // exec -> stdout). Otherwise (interactive or control mode) it feeds the PL011
     // RX for a guest shell; control mode drives the agent over the Unix socket.

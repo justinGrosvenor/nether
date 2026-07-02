@@ -635,15 +635,189 @@ pub const VsockProbe = struct {
 pub const VsockRouter = struct {
     agent: *AgentCtx,
     probe: ?*VsockProbe = null,
+    bridge: ?*DataBridge = null,
 
     pub fn dispatch(ctx: *anyopaque, ev: nether.vsock.Event) void {
         const self: *VsockRouter = @ptrCast(@alignCast(ctx));
+        if (self.bridge) |b| if (b.tryEvent(ev)) return; // data-plane conn?
         if (self.probe) |p| {
             if (evConn(ev)) |id| {
                 if (p.owns(id)) return p.event(ev);
             }
         }
         agentEvent(self.agent, ev);
+    }
+};
+
+/// The in-guest forwarder's vsock listen port (the agent owns 5000). The host bridge dials
+/// this; the forwarder relays to the tenant's loopback server. Must match tools/forwarder.c.
+const FWD_VSOCK_PORT: u32 = 5001;
+const BRIDGE_STALL_TIMEOUT_MS: u32 = 5_000;
+
+/// Host-side data-plane bridge (Phase 2 step 2b, docs/park-concurrency-plan.md 3b): a
+/// Unix-domain listener swerver connects to. Each accepted connection is spliced to a
+/// fresh host->guest vsock stream to the in-guest forwarder, which relays to the tenant's
+/// loopback server - so a tenant's ordinary TCP server is reachable as a concurrent
+/// upstream. Many conns run at once.
+///
+/// The two directions run on different threads: unix->vsock in a per-conn PUMP thread
+/// (blocking read -> hostSendAll), vsock->unix from the VsockRouter event (device thread:
+/// .recv -> write the unix fd). The pump thread OWNS closing both fds; the device thread
+/// only shutdown()s the unix fd to wake a blocked pump. Lock order is strict and
+/// inversion-free: the device thread holds the vsock D3 lock THEN this lock (in tryEvent);
+/// pump/listener threads take this lock and the D3 lock (hostConnect/hostSend/hostClose)
+/// but NEVER both at once.
+pub const DataBridge = struct {
+    vsdev: *nether.VsockDev,
+    path: [*:0]const u8,
+    meter: ?*Metering = null,
+    lock: Lock = .{},
+    conns: [MAX_BRIDGE]Entry = [_]Entry{.{}} ** MAX_BRIDGE,
+    next_port: u32 = 40000,
+
+    const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
+    const State = enum { connecting, established, dead };
+    const Entry = struct {
+        active: bool = false,
+        state: State = .connecting,
+        vsock_id: u16 = 0,
+        unix_fd: c_int = -1,
+    };
+
+    pub fn start(self: *DataBridge) void {
+        if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
+            std.debug.print("[bridge] failed to start data-plane listener\n", .{});
+        }
+    }
+
+    fn findId(self: *DataBridge, id: u16) ?usize {
+        for (&self.conns, 0..) |*e, i| if (e.active and e.vsock_id == id) return i;
+        return null;
+    }
+
+    /// Router hook (device thread, inside the vsock D3 lock): handle an event for a
+    /// bridge-owned conn. Returns true iff this conn belongs to the bridge.
+    pub fn tryEvent(self: *DataBridge, ev: nether.vsock.Event) bool {
+        const id = evConn(ev) orelse return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const i = self.findId(id) orelse return false;
+        const e = &self.conns[i];
+        switch (ev) {
+            .connected => e.state = .established,
+            .recv => |r| {
+                // Bounded by SO_SNDTIMEO on the unix fd (set at accept), so a wedged swerver
+                // reader cannot stall the guest here. A failed/short write kills the conn:
+                // wake the pump via shutdown, it closes both fds.
+                if (e.unix_fd >= 0 and writeAll(e.unix_fd, r.bytes)) {
+                    if (self.meter) |m| _ = m.bytes_out.fetchAdd(r.bytes.len, .release);
+                } else {
+                    e.state = .dead;
+                    if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
+                }
+            },
+            .shutdown, .reset => {
+                e.state = .dead;
+                if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd); // wake the blocked pump
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn register(self: *DataBridge, id: u16, unix_fd: c_int) ?usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.conns, 0..) |*e, i| {
+            if (!e.active) {
+                e.* = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd };
+                return i;
+            }
+        }
+        return null; // pool full
+    }
+
+    /// Close both fds + free the slot. The pump thread is the single owner of this.
+    fn teardown(self: *DataBridge, slot: usize) void {
+        self.lock.lock();
+        const e = self.conns[slot];
+        self.conns[slot].active = false;
+        self.lock.unlock();
+        if (!e.active) return;
+        self.vsdev.hostClose(e.vsock_id);
+        if (e.unix_fd >= 0) _ = libc.close(e.unix_fd);
+    }
+
+    fn listenerLoop(self: *DataBridge) void {
+        const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        _ = libc.unlink(self.path);
+        var addr = SockaddrUn{};
+        const p = std.mem.span(self.path);
+        if (p.len + 1 > addr.path.len) {
+            std.debug.print("[bridge] data_socket path too long ({d})\n", .{p.len});
+            return;
+        }
+        @memcpy(addr.path[0..p.len], p);
+        const addr_len: u32 = @intCast(@offsetOf(SockaddrUn, "path") + p.len + 1);
+        if (@hasField(SockaddrUn, "len")) addr.len = @intCast(addr_len);
+        if (libc.bind(fd, &addr, addr_len) < 0 or libc.listen(fd, 16) < 0) {
+            std.debug.print("[bridge] bind/listen failed on {s}\n", .{self.path});
+            return;
+        }
+        if (libc.fchmod(fd, 0o600) != 0) std.debug.print("[bridge] warning: fchmod 0600 failed\n", .{});
+        const owner_uid = libc.getuid();
+        std.debug.print("[bridge] data plane on {s} -> guest vsock:{d}\n", .{ self.path, FWD_VSOCK_PORT });
+        while (true) {
+            const c = libc.accept(fd, null, null);
+            if (c < 0) continue;
+            // Owner-uid gate, like the control socket (same trust: it reaches into the guest).
+            const peer = hostutil.peerUid(c);
+            if (peer == null or peer.? != owner_uid) {
+                _ = libc.close(c);
+                continue;
+            }
+            // Bound a wedged swerver reader from stalling the device thread on the vsock->unix write.
+            hostutil.setSendTimeout(c, BRIDGE_STALL_TIMEOUT_MS);
+            // Dial the in-guest forwarder and register the pair BEFORE spawning the pump.
+            self.next_port +%= 1;
+            const id = self.vsdev.hostConnect(self.next_port, FWD_VSOCK_PORT) orelse {
+                _ = libc.close(c); // vsock conn table full
+                continue;
+            };
+            const slot = self.register(id, c) orelse {
+                self.vsdev.hostClose(id);
+                _ = libc.close(c); // bridge pool full
+                continue;
+            };
+            if (std.Thread.spawn(.{}, pumpLoop, .{ self, slot })) |t| t.detach() else |_| self.teardown(slot);
+        }
+    }
+
+    fn pumpLoop(self: *DataBridge, slot: usize) void {
+        // Wait (bounded) for the host->guest connect to establish (the guest forwarder accepts).
+        var waited: u32 = 0;
+        while (waited < 3000) : (waited += 10) {
+            self.lock.lock();
+            const st = self.conns[slot].state;
+            self.lock.unlock();
+            if (st != .connecting) break;
+            _ = usleep(10_000);
+        }
+        self.lock.lock();
+        const e = self.conns[slot];
+        self.lock.unlock();
+        if (e.state != .established) return self.teardown(slot);
+        // unix -> vsock: blocking read, forward to the forwarder (credit-aware). A reset from
+        // the guest shutdown()s unix_fd (device thread), so this read returns 0 and we tear down.
+        var buf: [16384]u8 = undefined;
+        while (true) {
+            const n = libc.read(e.unix_fd, &buf, buf.len);
+            if (n <= 0) break;
+            if (!hostSendAll(self.vsdev, e.vsock_id, buf[0..@intCast(n)])) break;
+            if (self.meter) |m| _ = m.bytes_in.fetchAdd(@intCast(n), .release);
+        }
+        self.teardown(slot);
     }
 };
 

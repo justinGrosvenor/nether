@@ -118,7 +118,9 @@ int main(void) {
         }
         if (poll(pfds, (nfds_t)(1 + 2 * nconn), -1) < 0) continue;
 
-        /* New host->guest connection: accept it and dial the tenant server. */
+        /* New host->guest connection: accept it and dial the tenant server. Then loop back
+         * to poll() BEFORE servicing: the new pair is not in the current pfds, so servicing
+         * this round would read stale revents and could block read() on a not-ready fd. */
         if (pfds[0].revents & POLLIN) {
             int vf = accept(ls, NULL, NULL);
             if (vf >= 0) {
@@ -131,6 +133,7 @@ int main(void) {
                     close(vf); /* pool full or server not up: refuse this conn */
                 }
             }
+            continue;
         }
 
         /* Service live pairs. Closing one swaps in the last (keeping the array dense) and
