@@ -144,6 +144,7 @@ pub const SandboxInfo = struct {
     x402: bool = false, // settlement mode: on = billable (teardown emits an x402 settlement); off = general workload
     app_port: u32 = 0, // tenant loopback port bridged via the data plane (0 = no data plane) (3b)
     max_data_conns: u64 = 0, // cap on concurrent data-plane conns (0 = engine default)
+    data_idle_ms: u64 = 0, // per-conn data-plane idle reap (0 = disabled)
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -168,6 +169,7 @@ pub const SandboxInfo = struct {
             \\data_plane={s}
             \\app_port={d}
             \\max_data_conns={d}
+            \\data_idle_ms={d}
             \\{c}0
             \\
         , .{
@@ -188,6 +190,7 @@ pub const SandboxInfo = struct {
             onOff(self.app_port > 0),
             self.app_port,
             self.max_data_conns,
+            self.data_idle_ms,
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
@@ -703,6 +706,7 @@ pub const DataBridge = struct {
     conns: [MAX_BRIDGE]Entry = [_]Entry{.{}} ** MAX_BRIDGE,
     next_port: u32 = 40000,
     max_conns: usize = MAX_BRIDGE, // govern cap on concurrent data-plane conns (<= MAX_BRIDGE)
+    idle_ms: u64 = 0, // per-conn idle timeout (data_idle_ms; 0 = disabled): reap slow/leaked conns
 
     pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
     const State = enum { connecting, established, dead };
@@ -712,11 +716,34 @@ pub const DataBridge = struct {
         vsock_id: u16 = 0,
         unix_fd: c_int = -1,
         start_ms: i64 = 0, // for the data_ms lifetime meter
+        last_ms: i64 = 0, // last activity either direction, for the idle reaper
     };
 
     pub fn start(self: *DataBridge) void {
         if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
             std.debug.print("[bridge] failed to start data-plane listener\n", .{});
+        }
+        if (std.Thread.spawn(.{}, reaperLoop, .{self})) |t| t.detach() else |_| {}
+    }
+
+    /// Reap conns idle in BOTH directions for longer than `idle_ms` - so a slow or wedged
+    /// guest server (accepts a request, then goes silent) cannot tie up a bridge slot
+    /// indefinitely. Marks the conn dead and shutdown()s its unix fd; the pump thread's
+    /// blocked read then returns and tears it down (single-owner close). No-op if disabled.
+    fn reaperLoop(self: *DataBridge) void {
+        while (true) {
+            _ = usleep(500_000); // 2 Hz
+            if (self.idle_ms == 0) continue;
+            const cutoff: i64 = @intCast(self.idle_ms);
+            const now = nowMs();
+            self.lock.lock();
+            for (&self.conns) |*e| {
+                if (e.active and e.state != .dead and (now - e.last_ms) > cutoff) {
+                    e.state = .dead;
+                    if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
+                }
+            }
+            self.lock.unlock();
         }
     }
 
@@ -740,7 +767,11 @@ pub const DataBridge = struct {
                 // reader cannot stall the guest here. A failed/short write kills the conn:
                 // wake the pump via shutdown, it closes both fds.
                 if (e.unix_fd >= 0 and writeAll(e.unix_fd, r.bytes)) {
-                    if (self.meter) |m| _ = m.bytes_out.fetchAdd(r.bytes.len, .release);
+                    e.last_ms = nowMs(); // guest->host activity (keeps the reaper off it)
+                    if (self.meter) |m| {
+                        _ = m.bytes_out.fetchAdd(r.bytes.len, .release);
+                        m.touch(); // data-plane traffic counts as sandbox activity (whole-VM idle watchdog)
+                    }
                 } else {
                     e.state = .dead;
                     if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
@@ -765,7 +796,8 @@ pub const DataBridge = struct {
         }
         if (active >= self.max_conns) return null; // govern cap reached
         const slot = free orelse return null; // pool full
-        self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = nowMs() };
+        const now = nowMs();
+        self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = now, .last_ms = now };
         if (self.meter) |m| _ = m.data_conns.fetchAdd(1, .release);
         return slot;
     }
@@ -849,7 +881,13 @@ pub const DataBridge = struct {
             const n = libc.read(e.unix_fd, &buf, buf.len);
             if (n <= 0) break;
             if (!hostSendAll(self.vsdev, e.vsock_id, buf[0..@intCast(n)])) break;
-            if (self.meter) |m| _ = m.bytes_in.fetchAdd(@intCast(n), .release);
+            self.lock.lock();
+            if (self.conns[slot].active) self.conns[slot].last_ms = nowMs(); // host->guest activity
+            self.lock.unlock();
+            if (self.meter) |m| {
+                _ = m.bytes_in.fetchAdd(@intCast(n), .release);
+                m.touch();
+            }
         }
         self.teardown(slot);
     }

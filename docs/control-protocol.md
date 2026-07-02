@@ -289,6 +289,7 @@ to it instead of exec'ing a command per request. Two knobs:
 app_port = 8080                 # the tenant's ORDINARY loopback TCP port inside the guest
 data_socket = /run/nether/<id>.data.sock   # host Unix socket the platform proxies to
 max_data_conns = 48             # optional cap on concurrent data-plane conns (<= 48)
+data_idle_ms = 30000            # optional: reap a conn idle (both ways) this long (0 = off)
 ```
 
 `app_port` makes `/init` start the in-guest forwarder (it bridges guest vsock:5001 to
@@ -300,9 +301,12 @@ each connection to it is spliced to a fresh host->guest vsock stream to the forw
 open a connection per request (or pool), write the request bytes, read the response. It is a
 **raw byte-stream** (no framing, no request-ids), so ordinary upstream/proxy machinery
 applies directly. Up to `max_data_conns` concurrent conns per VM (default/cap 48). A slow or
-wedged consumer is bounded by `SO_SNDTIMEO` (it cannot stall the guest); the govern cap
-refuses excess conns (backpressure) rather than unbounded fan-out. `__info__` reports
-`data_plane`, `app_port`, `max_data_conns`; `__stats__` and the bill report `data_conns` +
+wedged consumer is bounded by `SO_SNDTIMEO` (it cannot stall the guest); a slow or silent
+guest server (accepts, then goes quiet) is reaped after `data_idle_ms` of two-way idleness,
+so it cannot tie up a conn slot; the govern cap refuses excess conns (backpressure) rather
+than unbounded fan-out. Data-plane traffic also counts as sandbox activity, so a VM busy
+only with proxied requests is not idle-reclaimed. `__info__` reports `data_plane`,
+`app_port`, `max_data_conns`, `data_idle_ms`; `__stats__` and the bill report `data_conns` +
 `data_ms` (plus the shared `bytes_in`/`bytes_out`). A snapshot **fork inherits** `app_port`
 (on the cmdline), so a warmed base with the tenant server already running forks into an
 instantly-serving VM. Verified live on HVF: concurrent host connections reach an ordinary
