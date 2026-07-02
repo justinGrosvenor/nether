@@ -41,6 +41,7 @@ pub const vt = struct {
 /// The render pillar: a server-side terminal model of the agent's session, fed by
 /// its output and snapshot via the `__screen__` control command.
 pub const Render = @import("agent/render.zig").Render;
+pub const RenderMap = @import("agent/render.zig").RenderMap;
 pub const audit = @import("agent/audit.zig");
 pub const Journal = audit.Journal;
 

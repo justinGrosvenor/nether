@@ -206,14 +206,14 @@ fn linuxMain() !void {
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
     const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
 
-    // Render pillar: in control mode, tee the agent's output into a VT screen so the
-    // platform can fetch a rendered snapshot via __screen__.
-    var render: nether.Render = undefined;
+    // Render pillar: in control mode, tee each command's output into its own VT screen
+    // (per-command history) so the platform can fetch a rendered snapshot via __screen__ [id].
+    var render: nether.RenderMap = undefined;
     if (control_on) {
         const rows: u16 = @intCast(std.math.clamp(confGetInt("screen_rows", 24), 1, 200));
         const cols: u16 = @intCast(std.math.clamp(confGetInt("screen_cols", 80), 1, 400));
-        render = try nether.Render.init(allocator, rows, cols);
-        core.agent.render = &render;
+        render = nether.RenderMap.init(allocator, rows, cols);
+        core.agent.renders = &render;
     }
     defer if (control_on) render.deinit();
 
@@ -922,14 +922,14 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
     const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
 
-    // Render pillar: in control mode, tee the agent's terminal output into a VT
-    // screen so the platform can fetch a rendered snapshot via `__screen__`.
-    var render: nether.Render = undefined;
+    // Render pillar: in control mode, tee each command's terminal output into its own VT
+    // screen (per-command history) so the platform can fetch a snapshot via `__screen__ [id]`.
+    var render: nether.RenderMap = undefined;
     if (control_on) {
         const rows: u16 = @intCast(std.math.clamp(confGetInt("screen_rows", 24), 1, 200));
         const cols: u16 = @intCast(std.math.clamp(confGetInt("screen_cols", 80), 1, 400));
-        render = try nether.Render.init(allocator, rows, cols);
-        core.agent.render = &render;
+        render = nether.RenderMap.init(allocator, rows, cols);
+        core.agent.renders = &render;
     }
     defer if (control_on) render.deinit();
     // vsock event routing: a host-dialed data/probe conn's events go to the data plane

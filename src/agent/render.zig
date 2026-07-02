@@ -129,6 +129,126 @@ pub const Render = struct {
     }
 };
 
+/// A bounded ring of PER-COMMAND render screens (park-concurrency 2c). Each command's
+/// output tees into its own VT `Screen`, so a controller can fetch a specific command's
+/// rendered output (`__screen__ <id>`) or the latest (`__screen__`) with a short history,
+/// instead of one continuously-overwritten terminal. `rotate` starts a fresh screen per
+/// command (called when a command is forwarded); `feed` tees reply bytes into the current
+/// one. The map lock guards the ring + current pointer; each `Render` keeps its own grid
+/// lock. Lock order is always map -> render, so there is no inversion.
+pub const RenderMap = struct {
+    lock: Lock = .{},
+    alloc: std.mem.Allocator,
+    rows: u16,
+    cols: u16,
+    slots: [CAP]Slot = [_]Slot{.{}} ** CAP,
+    head: usize = 0, // next slot to (re)use
+    cur: ?usize = null, // slot currently receiving output
+    total: u64 = 0, // lifetime command screens; the newest id == total
+
+    pub const CAP = 6; // retained history depth (older command screens are recycled)
+    const Slot = struct { id: u64 = 0, render: ?Render = null };
+
+    pub fn init(alloc: std.mem.Allocator, rows: u16, cols: u16) RenderMap {
+        return .{ .alloc = alloc, .rows = rows, .cols = cols };
+    }
+
+    pub fn deinit(self: *RenderMap) void {
+        for (&self.slots) |*s| if (s.render) |*r| r.deinit();
+    }
+
+    /// Begin a fresh screen for the next command; returns its id (== total). Recycles the
+    /// oldest slot (deinit + fresh init clears it). Safe if the alloc fails (cur -> null).
+    pub fn rotate(self: *RenderMap) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const slot = &self.slots[self.head];
+        if (slot.render) |*r| r.deinit();
+        slot.render = Render.init(self.alloc, self.rows, self.cols) catch null;
+        self.total += 1;
+        slot.id = self.total;
+        self.cur = if (slot.render != null) self.head else null;
+        self.head = (self.head + 1) % CAP;
+        return self.total;
+    }
+
+    /// Tee reply bytes into the current command's screen (no-op before the first rotate).
+    pub fn feed(self: *RenderMap, bytes: []const u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.cur) |i| if (self.slots[i].render) |*r| r.feed(bytes);
+    }
+
+    // Resolve a screen by id (0 = current). Caller holds the lock.
+    fn find(self: *RenderMap, id: u64) ?*Render {
+        if (id == 0) {
+            if (self.cur) |i| return if (self.slots[i].render) |*r| r else null;
+            return null;
+        }
+        for (&self.slots) |*s| {
+            if (s.id == id) return if (s.render) |*r| r else null;
+        }
+        return null;
+    }
+
+    /// Snapshot screen `id` (0 = current) into `out`; 0 bytes if that id is not retained.
+    pub fn snapshot(self: *RenderMap, id: u64, out: []u8) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return if (self.find(id)) |r| r.snapshot(out) else 0;
+    }
+
+    /// Streaming diff of screen `id` (0 = current); 0 bytes if not retained.
+    pub fn diff(self: *RenderMap, id: u64, out: []u8) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return if (self.find(id)) |r| r.diff(out) else 0;
+    }
+
+    /// True if any screen exists yet (a command has produced output).
+    pub fn hasAny(self: *RenderMap) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.cur != null;
+    }
+
+    pub fn resetDiff(self: *RenderMap) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.slots) |*s| if (s.render) |*r| r.resetDiff();
+    }
+};
+
+test "RenderMap keeps per-command screens addressable by id" {
+    var rm = RenderMap.init(std.testing.allocator, 8, 40);
+    defer rm.deinit();
+    const id1 = rm.rotate();
+    rm.feed("first\x1e0\n");
+    const id2 = rm.rotate();
+    rm.feed("second\x1e0\n");
+    try std.testing.expectEqual(@as(u64, 1), id1);
+    try std.testing.expectEqual(@as(u64, 2), id2);
+    var buf: [256]u8 = undefined;
+    // current (0) == latest == id2
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..rm.snapshot(0, &buf)], "second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..rm.snapshot(id1, &buf)], "first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..rm.snapshot(id2, &buf)], "second") != null);
+    try std.testing.expectEqual(@as(usize, 0), rm.snapshot(999, &buf)); // unknown id -> empty
+}
+
+test "RenderMap recycles the oldest screen past CAP" {
+    var rm = RenderMap.init(std.testing.allocator, 8, 40);
+    defer rm.deinit();
+    var i: u64 = 0;
+    while (i < RenderMap.CAP + 2) : (i += 1) {
+        _ = rm.rotate();
+        rm.feed("x\x1e0\n");
+    }
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), rm.snapshot(1, &buf)); // oldest recycled
+    try std.testing.expect(rm.snapshot(RenderMap.CAP + 2, &buf) > 0); // newest retained
+}
+
 test "feed strips 0x1e<exit> trailers and renders output" {
     var r = try Render.init(std.testing.allocator, 8, 40);
     defer r.deinit();

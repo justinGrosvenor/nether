@@ -193,6 +193,14 @@ pub const SandboxInfo = struct {
     }
 };
 
+/// Parse the optional numeric screen id after a `__screen__ `/`__screendiff__ ` prefix.
+/// 0 (no arg / unparseable) means "the current/latest command's screen".
+fn screenArgId(line: []const u8, prefix: []const u8) u64 {
+    if (!std.mem.startsWith(u8, line, prefix)) return 0;
+    const arg = std.mem.trim(u8, line[prefix.len..], " \r\n");
+    return std.fmt.parseInt(u64, arg, 10) catch 0;
+}
+
 fn onOff(b: bool) []const u8 {
     return if (b) "on" else "off";
 }
@@ -349,9 +357,10 @@ pub const AgentCtx = struct {
     /// When set, agent reply bytes are diverted into this capture (file transfer)
     /// instead of relayed/printed. Set/cleared by the control thread.
     capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
-    /// The render pillar: when set, command output is teed into a VT screen so the
-    /// platform can fetch a rendered snapshot via `__screen__`.
-    render: ?*nether.Render = null,
+    /// The render pillar: when set, each command's output is teed into its own VT screen
+    /// (a bounded per-command history) so the platform can fetch a rendered snapshot via
+    /// `__screen__ [id]` (default = the latest command's screen).
+    renders: ?*nether.RenderMap = null,
     parsing_exit: bool = false, // mid-parse of the 0x1e<code>\n trailer
     exit_buf: [16]u8 = undefined,
     exit_len: usize = 0,
@@ -390,6 +399,9 @@ pub const AgentCtx = struct {
     /// A command was forwarded to the agent: stash it as the pending command awaiting
     /// an exit code. Called on the control thread.
     fn auditForward(a: *AgentCtx, line: []const u8) void {
+        // Start a fresh render screen for this command so its output does not overwrite the
+        // previous one (per-command history; the next .recv bytes tee into this screen).
+        if (a.renders) |rm| _ = rm.rotate();
         // Trim a trailing newline / blanks for a clean record.
         var end = line.len;
         while (end > 0 and (line[end - 1] == '\n' or line[end - 1] == '\r' or line[end - 1] == ' ')) end -= 1;
@@ -555,7 +567,7 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
         } else {
             if (a.meter) |m| m.touch(); // agent output: the sandbox is doing work
 
-            if (a.render) |rd| rd.feed(r.bytes); // tee command output into the render screen
+            if (a.renders) |rm| rm.feed(r.bytes); // tee output into the current command's screen
             a.auditRecv(r.bytes); // observe exit codes for the command audit log
             if (a.pipe_w >= 0) {
                 if (a.max_output == 0) {
@@ -1106,8 +1118,8 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
             "__events__ [seq] unified event timeline (cmd/net/lifecycle); cursor-polled\n" ++
             "__cmdlog__       command audit log (per-command exit + cpu_ms)\n" ++
             "__netlog__       egress audit log (dest + firewall verdict)\n" ++
-            "__screen__       terminal snapshot (scrollback + live)\n" ++
-            "__screendiff__   terminal changed rows since last call (primary-only)\n" ++
+            "__screen__ [id]  a command's terminal snapshot (default: the latest command)\n" ++
+            "__screendiff__ [id] a command's changed rows since last call (primary-only)\n" ++
             "__frame__        framebuffer as a binary PPM\n" ++
             "__framediff__    framebuffer changed tiles since last call (primary-only)\n" ++
             "__help__         this list\n" ++
@@ -1164,25 +1176,28 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         } else reply(c, "ERR journal not enabled\n");
         return;
     }
-    // Render: full snapshot of the sandbox terminal (scrollback + live), host-
-    // intercepted like __stats__.
-    if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__")) {
-        if (ctx.agent.render) |rd| {
+    // Render: snapshot a command's terminal (scrollback + live), host-intercepted like
+    // __stats__. `__screen__` = the latest command's screen; `__screen__ <id>` = a specific
+    // one from the retained history (see __cmdlog__-style per-command ids the render reports).
+    if (std.mem.eql(u8, line, "__screen__\n") or std.mem.eql(u8, line, "__screen__") or std.mem.startsWith(u8, line, "__screen__ ")) {
+        if (ctx.agent.renders) |rm| {
+            const id = screenArgId(line, "__screen__ ");
             var buf: [64 * 1024]u8 = undefined;
-            const n = rd.snapshot(&buf);
+            const n = rm.snapshot(id, &buf);
+            if (n == 0 and id != 0) return reply(c, "ERR no such screen id (recycled or never existed)\n");
             _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
         return;
     }
-    // Render streaming: only the live rows that changed since the last __screendiff__
-    // (the first call emits the whole screen). Lets the platform follow the screen
-    // cheaply by polling.
-    if (std.mem.eql(u8, line, "__screendiff__\n") or std.mem.eql(u8, line, "__screendiff__")) {
+    // Render streaming: only the live rows of a command's screen that changed since the last
+    // __screendiff__ (the first call emits the whole screen). `__screendiff__ [id]`.
+    if (std.mem.eql(u8, line, "__screendiff__\n") or std.mem.eql(u8, line, "__screendiff__") or std.mem.startsWith(u8, line, "__screendiff__ ")) {
         if (!is_primary) return reply(c, "ERR __screendiff__ is primary-only (per-client diff state)\n");
-        if (ctx.agent.render) |rd| {
+        if (ctx.agent.renders) |rm| {
+            const id = screenArgId(line, "__screendiff__ ");
             var buf: [64 * 1024]u8 = undefined;
-            const n = rd.diff(&buf);
+            const n = rm.diff(id, &buf);
             _ = writeAll(c, buf[0..n]);
             _ = ctx.meter.bytes_out.fetchAdd(n, .release);
         } else reply(c, "ERR render not enabled\n");
@@ -1486,7 +1501,7 @@ fn clientThread(ctx: *ControlCtx, c: c_int) void {
     const is_primary = ctx.client.cmpxchgStrong(-1, c, .acq_rel, .acquire) == null;
     defer if (is_primary) ctx.client.store(-1, .release);
     if (is_primary) {
-        if (ctx.agent.render) |rd| rd.resetDiff(); // a fresh primary gets a full screen first
+        if (ctx.agent.renders) |rm| rm.resetDiff(); // a fresh primary gets a full screen first
         if (ctx.gpu) |g| g.resetFrameDiff(); // ...and a full framebuffer first
     }
     // Line-buffer the client stream so `__stats__` etc. are intercepted per line.

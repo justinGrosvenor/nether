@@ -813,7 +813,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     // surviving connection id comes across from the snapshot, so a command round-trips
     // immediately with no reconnect.
     var core = control.Core{};
-    var render: nether.Render = undefined;
+    var render: nether.RenderMap = undefined;
     var ctl_ctx: control.ControlCtx = undefined;
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
@@ -822,11 +822,11 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         core.x402 = conf.confBool("x402"); // settlement mode (from the fork's nether.conf; default off)
         core.journal.emit(.life, "restored from snapshot fork");
 
-        // Render pillar: tee agent output into a VT screen for __screen__.
+        // Render pillar: tee each command's output into its own VT screen for __screen__ [id].
         const rows: u16 = @intCast(std.math.clamp(conf.confGetInt("screen_rows", 24), 1, 200));
         const cols: u16 = @intCast(std.math.clamp(conf.confGetInt("screen_cols", 80), 1, 400));
-        render = try nether.Render.init(allocator, rows, cols);
-        core.agent.render = &render;
+        render = nether.RenderMap.init(allocator, rows, cols);
+        core.agent.renders = &render;
 
         // Re-wire the engine callbacks to this process and resume the agent connection.
         const vs = vs_engine.?;
