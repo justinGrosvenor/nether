@@ -1111,7 +1111,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var data_sock_buf: [256]u8 = undefined;
     if (confGet("data_socket", &data_sock_buf)) |ds| {
         if (ds.len > 0) {
-            data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter };
+            data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter, .alloc = allocator };
             const mdc = confGetInt("max_data_conns", 0);
             if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
             data_bridge.idle_ms = confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)

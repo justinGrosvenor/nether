@@ -32,6 +32,9 @@ pub const libc = struct {
     pub extern "c" fn getpeereid(fd: c_int, euid: *u32, egid: *u32) c_int;
     pub extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *u32) c_int;
     pub extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: u32) c_int;
+    pub extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
+    pub extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int; // variadic: arm64 macOS ABI differs from a fixed decl
+    pub extern "c" fn poll(fds: *Pollfd, nfds: c_uint, timeout: c_int) c_int;
     pub extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
     pub extern "c" fn socketpair(domain: c_int, ty: c_int, proto: c_int, fds: *[2]c_int) c_int;
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
@@ -61,6 +64,56 @@ pub fn setSendTimeout(fd: c_int, ms: u32) void {
 /// it is safe to call on a socket another thread still owns (no fd-reuse race).
 pub fn shutdownRdwr(fd: c_int) void {
     _ = libc.shutdown(fd, 2); // SHUT_RDWR (2 on macOS and Linux)
+}
+
+/// Non-blocking partial send: returns the bytes accepted (0 on EAGAIN or error). Requires
+/// the fd to be O_NONBLOCK (setNonblock) - on macOS AF_UNIX, MSG_DONTWAIT alone is NOT
+/// honored. Used by the data-plane bridge to deliver without ever blocking the vCPU thread.
+pub fn trySend(fd: c_int, buf: []const u8) usize {
+    if (buf.len == 0) return 0;
+    const MSG_DONTWAIT: c_int = if (builtin.os.tag == .macos) 0x80 else 0x40;
+    const n = libc.send(fd, buf.ptr, buf.len, MSG_DONTWAIT);
+    return if (n > 0) @intCast(n) else 0;
+}
+
+/// Enlarge a socket's send buffer so brief reader lag doesn't immediately fail a
+/// non-blocking send. BSD/macOS + Linux socket-option values.
+pub fn setSendBuf(fd: c_int, bytes: c_int) void {
+    const SOL_SOCKET: c_int = if (builtin.os.tag == .macos) 0xffff else 1;
+    const SO_SNDBUF: c_int = if (builtin.os.tag == .macos) 0x1001 else 7;
+    _ = libc.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, @sizeOf(c_int));
+}
+
+/// Put `fd` in non-blocking mode (O_NONBLOCK). macOS honors this on AF_UNIX where
+/// MSG_DONTWAIT alone does NOT; pair it with pollRW for reads/writes.
+pub fn setNonblock(fd: c_int) void {
+    const F_GETFL: c_int = 3;
+    const F_SETFL: c_int = 4;
+    const O_NONBLOCK: c_int = if (builtin.os.tag == .macos) 0x0004 else 0o4000;
+    const fl = libc.fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (fl >= 0) _ = libc.fcntl(fd, F_SETFL, @as(c_int, fl | O_NONBLOCK));
+}
+
+pub const Pollfd = extern struct { fd: c_int, events: i16, revents: i16 };
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+/// Wait up to `timeout_ms` for `fd`. Also polls writability when `want_write`. Returns a
+/// bitmask: bit0 (1) = readable, bit1 (2) = writable; 0 = timeout; -1 = hangup/error.
+/// poll flag values are identical on macOS and Linux.
+pub fn pollRW(fd: c_int, want_write: bool, timeout_ms: c_int) i32 {
+    var p = Pollfd{ .fd = fd, .events = POLLIN | (if (want_write) POLLOUT else 0), .revents = 0 };
+    const r = libc.poll(&p, 1, timeout_ms);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL) != 0) return -1;
+    var res: i32 = 0;
+    if (p.revents & POLLIN != 0) res |= 1;
+    if (p.revents & POLLOUT != 0) res |= 2;
+    return res;
 }
 
 /// Ignore SIGPIPE process-wide so a `write` to a control client that disconnected

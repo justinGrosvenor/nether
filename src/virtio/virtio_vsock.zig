@@ -135,6 +135,10 @@ pub const Conn = struct {
     // Our receive accounting, advertised back to the guest.
     fwd_cnt: u32 = 0, // cumulative bytes we have consumed from the guest
     buf_alloc: u32 = DEFAULT_BUF_ALLOC,
+    // Flow control: when true, onRw does NOT auto-credit on receipt; the caller credits
+    // (creditRecv) only as it DELIVERS the bytes, so a slow consumer backpressures the guest.
+    defer_credit: bool = false,
+    credit_acc: u32 = 0, // delivered bytes accrued since the last CREDIT_UPDATE (coalescing)
 
     pub const State = enum { closed, connecting, established, closing };
 
@@ -277,8 +281,12 @@ pub const Vsock = struct {
         c.peer_fwd_cnt = h.fwd_cnt;
         if (payload.len > 0) {
             self.fire(.{ .recv = .{ .conn = id, .bytes = payload } });
-            c.fwd_cnt +%= @intCast(payload.len); // consumed synchronously
-            self.sendCtl(c, Op.CREDIT_UPDATE); // reopen the guest's window
+            if (!c.defer_credit) {
+                c.fwd_cnt +%= @intCast(payload.len); // consumed synchronously
+                self.sendCtl(c, Op.CREDIT_UPDATE); // reopen the guest's window
+            }
+            // deferred-credit conns (data plane): the handler buffers the payload and credits
+            // via creditRecv only as it delivers, so a slow consumer backpressures the guest.
         }
     }
 
@@ -330,6 +338,33 @@ pub const Vsock = struct {
         };
         self.sendCtl(c, Op.REQUEST);
         return id;
+    }
+
+    /// Like connect(), but with a BOUNDED RX window and deferred crediting: the guest may
+    /// have only `window` bytes in flight before it blocks, and we credit it back only as we
+    /// DELIVER (creditRecv) - real backpressure for a slow consumer (the data-plane bridge).
+    pub fn connectWindow(self: *Vsock, host_port: u32, guest_port: u32, window: u32) ?u16 {
+        const id = self.allocConn() orelse return null;
+        const c = &self.conns[id];
+        c.* = .{ .state = .connecting, .host_port = host_port, .guest_port = guest_port, .buf_alloc = window, .defer_credit = true };
+        self.sendCtl(c, Op.REQUEST);
+        return id;
+    }
+
+    /// Credit the guest for `n` bytes now DELIVERED on a deferred-credit conn. fwd_cnt is
+    /// cumulative, so we COALESCE: emit one CREDIT_UPDATE per quarter-window accrued (one
+    /// per packet would flood the shared OUT ring and drop credits, throttling the guest;
+    /// the guest still keeps >= 3/4 of its window open between updates). No-op if gone.
+    pub fn creditRecv(self: *Vsock, id: u16, n: u32) void {
+        if (id >= MAX_CONNS or n == 0) return;
+        const c = &self.conns[id];
+        if (c.state != .established) return;
+        c.fwd_cnt +%= n;
+        c.credit_acc += n;
+        if (c.credit_acc * 4 >= c.buf_alloc) {
+            self.sendCtl(c, Op.CREDIT_UPDATE);
+            c.credit_acc = 0;
+        }
     }
 
     /// Send host->guest data on an established connection. Honors the guest's
@@ -633,6 +668,23 @@ pub const VsockDev = struct {
         self.lock.unlock();
         self.flush();
         return n;
+    }
+
+    /// Host thread: open a bounded-window, deferred-credit conn (data-plane bridge).
+    pub fn hostConnectWindow(self: *VsockDev, host_port: u32, guest_port: u32, window: u32) ?u16 {
+        self.lock.lock();
+        const id = self.engine.connectWindow(host_port, guest_port, window);
+        self.lock.unlock();
+        self.flush();
+        return id;
+    }
+
+    /// Host thread: credit `n` delivered bytes back to a deferred-credit conn (reopen window).
+    pub fn hostCredit(self: *VsockDev, id: u16, n: u32) void {
+        self.lock.lock();
+        self.engine.creditRecv(id, n);
+        self.lock.unlock();
+        self.flush();
     }
 
     pub fn hostClose(self: *VsockDev, id: u16) void {

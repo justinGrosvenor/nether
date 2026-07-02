@@ -683,7 +683,6 @@ pub const VsockRouter = struct {
 /// The in-guest forwarder's vsock listen port (the agent owns 5000). The host bridge dials
 /// this; the forwarder relays to the tenant's loopback server. Must match tools/forwarder.c.
 const FWD_VSOCK_PORT: u32 = 5001;
-const BRIDGE_STALL_TIMEOUT_MS: u32 = 5_000;
 
 /// Host-side data-plane bridge (Phase 2 step 2b, docs/park-concurrency-plan.md 3b): a
 /// Unix-domain listener swerver connects to. Each accepted connection is spliced to a
@@ -702,13 +701,16 @@ pub const DataBridge = struct {
     vsdev: *nether.VsockDev,
     path: [*:0]const u8,
     meter: ?*Metering = null,
+    alloc: std.mem.Allocator = undefined, // for per-conn delivery buffers
     lock: Lock = .{},
     conns: [MAX_BRIDGE]Entry = [_]Entry{.{}} ** MAX_BRIDGE,
     next_port: u32 = 40000,
     max_conns: usize = MAX_BRIDGE, // govern cap on concurrent data-plane conns (<= MAX_BRIDGE)
     idle_ms: u64 = 0, // per-conn idle timeout (data_idle_ms; 0 = disabled): reap slow/leaked conns
+    window: u32 = WINDOW, // per-conn vsock RX window == delivery-buffer capacity
 
     pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
+    pub const WINDOW: u32 = 256 * 1024; // guest in-flight bound == per-conn delivery buffer size
     const State = enum { connecting, established, dead };
     const Entry = struct {
         active: bool = false,
@@ -717,7 +719,45 @@ pub const DataBridge = struct {
         unix_fd: c_int = -1,
         start_ms: i64 = 0, // for the data_ms lifetime meter
         last_ms: i64 = 0, // last activity either direction, for the idle reaper
+        // Delivery ring buffer (guest->consumer). onRw (device thread) buffers here; the
+        // device thread and the pump drain it to the unix socket with NON-BLOCKING sends -
+        // so the vCPU/device thread NEVER blocks (the Medium finding) - and credit the guest
+        // only for what actually drained. Capacity == the conn's window, so it never overflows.
+        buf: []u8 = &.{},
+        bh: usize = 0, // ring read head
+        bc: usize = 0, // bytes currently buffered
     };
+
+    /// Append to a conn's delivery ring (caller holds the lock). false = would overflow,
+    /// which cannot happen while the guest respects our window == capacity; the caller drops.
+    fn bufAppend(e: *Entry, bytes: []const u8) bool {
+        if (e.bc + bytes.len > e.buf.len) return false;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const wpos = (e.bh + e.bc) % e.buf.len;
+            const run = @min(bytes.len - off, e.buf.len - wpos);
+            @memcpy(e.buf[wpos..][0..run], bytes[off..][0..run]);
+            e.bc += run;
+            off += run;
+        }
+        return true;
+    }
+
+    /// Drain a conn's ring to its unix socket with NON-BLOCKING sends (caller holds the
+    /// lock). Returns the bytes delivered, which the caller credits back to the guest.
+    fn bufDrain(e: *Entry) usize {
+        var delivered: usize = 0;
+        while (e.bc > 0 and e.unix_fd >= 0) {
+            const run = @min(e.bc, e.buf.len - e.bh); // contiguous span from the head
+            const n = hostutil.trySend(e.unix_fd, e.buf[e.bh..][0..run]);
+            if (n == 0) break; // unix full (or error); the pump retries on POLLOUT
+            e.bh = (e.bh + n) % e.buf.len;
+            e.bc -= n;
+            delivered += n;
+            if (n < run) break; // partial: socket is full
+        }
+        return delivered;
+    }
 
     pub fn start(self: *DataBridge) void {
         if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
@@ -763,18 +803,23 @@ pub const DataBridge = struct {
         switch (ev) {
             .connected => e.state = .established,
             .recv => |r| {
-                // Bounded by SO_SNDTIMEO on the unix fd (set at accept), so a wedged swerver
-                // reader cannot stall the guest here. A failed/short write kills the conn:
-                // wake the pump via shutdown, it closes both fds.
-                if (e.unix_fd >= 0 and writeAll(e.unix_fd, r.bytes)) {
-                    e.last_ms = nowMs(); // guest->host activity (keeps the reaper off it)
-                    if (self.meter) |m| {
-                        _ = m.bytes_out.fetchAdd(r.bytes.len, .release);
-                        m.touch(); // data-plane traffic counts as sandbox activity (whole-VM idle watchdog)
-                    }
-                } else {
-                    e.state = .dead;
+                // Device thread, INSIDE the vsock D3 lock, so it must NEVER block (the Medium
+                // finding: a blocking write here freezes the whole guest vsock on a wedged
+                // consumer). Buffer the payload (always fits: window == capacity, so in-flight
+                // <= capacity), drain to the unix socket NON-BLOCKING, and credit the guest only
+                // for what delivered. A slow consumer stops getting credit -> the guest server
+                // backpressures (its write blocks) -> no flood, no drop, no stall.
+                if (!bufAppend(e, r.bytes)) {
+                    e.state = .dead; // window violated (should be impossible): drop
                     if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
+                } else {
+                    const delivered = bufDrain(e);
+                    if (delivered > 0) {
+                        self.vsdev.engine.creditRecv(e.vsock_id, @intCast(delivered)); // inline, under D3
+                        if (self.meter) |m| _ = m.bytes_out.fetchAdd(delivered, .release);
+                    }
+                    e.last_ms = nowMs();
+                    if (self.meter) |m| m.touch(); // data-plane traffic = sandbox activity
                 }
             },
             .shutdown, .reset => {
@@ -796,8 +841,9 @@ pub const DataBridge = struct {
         }
         if (active >= self.max_conns) return null; // govern cap reached
         const slot = free orelse return null; // pool full
+        const buf = self.alloc.alloc(u8, self.window) catch return null; // delivery buffer
         const now = nowMs();
-        self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = now, .last_ms = now };
+        self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = now, .last_ms = now, .buf = buf };
         if (self.meter) |m| _ = m.data_conns.fetchAdd(1, .release);
         return slot;
     }
@@ -805,13 +851,24 @@ pub const DataBridge = struct {
     /// Close both fds + free the slot. The pump thread is the single owner of this.
     fn teardown(self: *DataBridge, slot: usize) void {
         self.lock.lock();
-        const e = self.conns[slot];
-        self.conns[slot].active = false;
+        var e = self.conns[slot];
+        self.conns[slot] = .{}; // clear slot (inactive + buf detached) so a late event skips it
         self.lock.unlock();
         if (!e.active) return;
-        if (self.meter) |m| _ = m.data_ms.fetchAdd(@intCast(@max(0, nowMs() - e.start_ms)), .release);
+        // Reset the guest conn FIRST so no more .recv fires for this (freed) slot; the buffer
+        // already holds whatever was received.
         self.vsdev.hostClose(e.vsock_id);
+        // Graceful flush: deliver the remaining buffered bytes to the consumer before closing
+        // (a normal guest close must not lose the response tail). Bounded (~5s) so a wedged
+        // consumer can't hang teardown; the guest is already gone, so no crediting is needed.
+        var budget: u32 = 0;
+        while (e.bc > 0 and e.unix_fd >= 0 and budget < 500) : (budget += 1) {
+            if (bufDrain(&e) > 0) continue;
+            if (hostutil.pollRW(e.unix_fd, true, 10) < 0) break; // consumer gone / error
+        }
+        if (self.meter) |m| _ = m.data_ms.fetchAdd(@intCast(@max(0, nowMs() - e.start_ms)), .release);
         if (e.unix_fd >= 0) _ = libc.close(e.unix_fd);
+        if (e.buf.len > 0) self.alloc.free(e.buf);
     }
 
     fn listenerLoop(self: *DataBridge) void {
@@ -843,11 +900,15 @@ pub const DataBridge = struct {
                 _ = libc.close(c);
                 continue;
             }
-            // Bound a wedged swerver reader from stalling the device thread on the vsock->unix write.
-            hostutil.setSendTimeout(c, BRIDGE_STALL_TIMEOUT_MS);
-            // Dial the in-guest forwarder and register the pair BEFORE spawning the pump.
+            // Non-blocking so the device-thread delivery (tryEvent) NEVER blocks the vCPU on a
+            // wedged consumer; a large send buffer so brief lag doesn't fail a send. The pump
+            // reads/drains this fd via pollRW.
+            hostutil.setNonblock(c);
+            hostutil.setSendBuf(c, 256 * 1024);
+            // Dial the in-guest forwarder with a BOUNDED window (== the delivery-buffer size),
+            // deferred-credit, so a slow consumer backpressures the guest. Register before the pump.
             self.next_port +%= 1;
-            const id = self.vsdev.hostConnect(self.next_port, FWD_VSOCK_PORT) orelse {
+            const id = self.vsdev.hostConnectWindow(self.next_port, FWD_VSOCK_PORT, self.window) orelse {
                 _ = libc.close(c); // vsock conn table full
                 continue;
             };
@@ -874,19 +935,42 @@ pub const DataBridge = struct {
         const e = self.conns[slot];
         self.lock.unlock();
         if (e.state != .established) return self.teardown(slot);
-        // unix -> vsock: blocking read, forward to the forwarder (credit-aware). A reset from
-        // the guest shutdown()s unix_fd (device thread), so this read returns 0 and we tear down.
+        // The unix fd is non-blocking. Poll it for READ (consumer->guest) and, whenever the
+        // delivery buffer has bytes, for WRITE (drain buffer->consumer). Draining credits the
+        // guest for what delivered, reopening its window (backpressure). A teardown/reset
+        // shutdown()s the fd -> pollRW reports a hangup (-1) -> we break. Lock order is safe:
+        // we take the bridge lock and the D3 lock (hostSendAll/hostCredit) but NEVER both at once.
         var buf: [16384]u8 = undefined;
         while (true) {
-            const n = libc.read(e.unix_fd, &buf, buf.len);
-            if (n <= 0) break;
-            if (!hostSendAll(self.vsdev, e.vsock_id, buf[0..@intCast(n)])) break;
             self.lock.lock();
-            if (self.conns[slot].active) self.conns[slot].last_ms = nowMs(); // host->guest activity
+            const has_buf = self.conns[slot].active and self.conns[slot].bc > 0;
             self.lock.unlock();
-            if (self.meter) |m| {
-                _ = m.bytes_in.fetchAdd(@intCast(n), .release);
-                m.touch();
+            const pr = hostutil.pollRW(e.unix_fd, has_buf, 1000);
+            if (pr < 0) break; // hangup / error
+            if (pr == 0) continue; // timeout
+            if (pr & 1 != 0) { // consumer -> guest
+                const n = libc.read(e.unix_fd, &buf, buf.len);
+                if (n == 0) break; // EOF
+                if (n > 0) {
+                    if (!hostSendAll(self.vsdev, e.vsock_id, buf[0..@intCast(n)])) break;
+                    self.lock.lock();
+                    if (self.conns[slot].active) self.conns[slot].last_ms = nowMs();
+                    self.lock.unlock();
+                    if (self.meter) |m| {
+                        _ = m.bytes_in.fetchAdd(@intCast(n), .release);
+                        m.touch();
+                    }
+                }
+            }
+            if (pr & 2 != 0) { // socket writable -> drain the delivery buffer
+                self.lock.lock();
+                const delivered = if (self.conns[slot].active) bufDrain(&self.conns[slot]) else 0;
+                if (delivered > 0 and self.conns[slot].active) self.conns[slot].last_ms = nowMs();
+                self.lock.unlock();
+                if (delivered > 0) {
+                    self.vsdev.hostCredit(e.vsock_id, @intCast(delivered)); // D3, no bridge lock held
+                    if (self.meter) |m| _ = m.bytes_out.fetchAdd(delivered, .release);
+                }
             }
         }
         self.teardown(slot);
@@ -905,7 +989,7 @@ pub const DataBridge = struct {
 pub fn fuzzBridge(bytes: []const u8) void {
     var eng = nether.Vsock{ .guest_cid = 3 };
     var dev = nether.VsockDev{ .engine = &eng }; // unattached: hostClose = engine.close, flush no-op
-    var br = DataBridge{ .vsdev = &dev, .path = "" };
+    var br = DataBridge{ .vsdev = &dev, .path = "", .alloc = std.testing.allocator, .window = 4096 };
     defer { // close any fds left in the table so the driver doesn't leak across inputs
         var s: usize = 0;
         while (s < DataBridge.MAX_BRIDGE) : (s += 1) br.teardown(s);
@@ -1643,6 +1727,51 @@ test "peerUid returns the owner uid for a local socketpair" {
     const peer = hostutil.peerUid(fds[0]);
     try testing.expect(peer != null);
     try testing.expectEqual(libc.getuid(), peer.?);
+}
+
+test "data-plane delivery ring is byte-exact across many wraparounds" {
+    // The bridge's per-conn ring (bufAppend/bufDrain) is the lossless-delivery core: onRw
+    // buffers into it, the device thread + pump drain it non-blocking to the unix socket.
+    // Drive a small ring with random-length chunks through a socketpair and assert every
+    // byte arrives in order (hundreds of wraparounds), independent of a live guest.
+    var fds: [2]c_int = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    hostutil.setNonblock(fds[0]); // read end: so the final drain-check read returns EAGAIN, not blocks
+    hostutil.setNonblock(fds[1]); // write end: bufDrain uses trySend (must be non-blocking)
+    hostutil.setSendBuf(fds[1], 4 << 20); // hold the whole test's bytes without a reader
+
+    var ring: [64]u8 = undefined; // small -> forces frequent wraparound
+    var e = DataBridge.Entry{ .active = true, .unix_fd = fds[1], .buf = &ring };
+    var expected: [80 * 1024]u8 = undefined;
+    var elen: usize = 0;
+    var b: u8 = 0;
+    var round: usize = 0;
+    while (round < 3000) : (round += 1) {
+        const room = e.buf.len - e.bc;
+        const n = @min(round % 23, room);
+        var chunk: [23]u8 = undefined;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            chunk[i] = b;
+            b +%= 1;
+        }
+        try testing.expect(DataBridge.bufAppend(&e, chunk[0..n]));
+        @memcpy(expected[elen..][0..n], chunk[0..n]);
+        elen += n;
+        _ = DataBridge.bufDrain(&e); // opportunistic non-blocking drain (like the device thread)
+    }
+    while (e.bc > 0) if (DataBridge.bufDrain(&e) == 0) break; // final flush (like teardown)
+
+    var got: [80 * 1024]u8 = undefined;
+    var glen: usize = 0;
+    while (true) {
+        const r = libc.read(fds[0], @ptrCast(got[glen..].ptr), got.len - glen);
+        if (r <= 0) break; // EAGAIN once drained
+        glen += @intCast(r);
+    }
+    try testing.expectEqualSlices(u8, expected[0..elen], got[0..glen]);
 }
 
 // The control protocol is the integration contract (docs/control-protocol.md). This
