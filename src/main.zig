@@ -1096,6 +1096,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
+                .app_port = @intCast(confGetInt("app_port", 0)),
+                .max_data_conns = confGetInt("max_data_conns", 0),
             },
         });
     }
@@ -1109,6 +1111,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     if (confGet("data_socket", &data_sock_buf)) |ds| {
         if (ds.len > 0) {
             data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter };
+            const mdc = confGetInt("max_data_conns", 0);
+            if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
             vs_router.bridge = &data_bridge;
             data_bridge.start();
         }

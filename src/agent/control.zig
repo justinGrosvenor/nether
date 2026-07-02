@@ -30,6 +30,8 @@ pub const Metering = struct {
     commands: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     bytes_in: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // client -> sandbox
     bytes_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // sandbox -> client
+    data_conns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // data-plane conns accepted (3b)
+    data_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // summed data-plane conn lifetimes
     net: ?*nether.Slirp = null, // network NAT, for egress/ingress byte counts
     // Last control-plane activity (nowMs): a client command or agent output. The
     // idle watchdog reclaims a sandbox that has seen none for idle_timeout_s.
@@ -58,6 +60,8 @@ pub const Metering = struct {
             \\net_tx_bytes={d}
             \\net_rx_bytes={d}
             \\net_blocked={d}
+            \\data_conns={d}
+            \\data_ms={d}
             \\{c}0
             \\
         , .{
@@ -72,6 +76,8 @@ pub const Metering = struct {
             net_tx,
             net_rx,
             net_blocked,
+            self.data_conns.load(.acquire),
+            self.data_ms.load(.acquire),
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
@@ -84,7 +90,7 @@ pub const Metering = struct {
         const net_tx = if (self.net) |s| s.tx_bytes.load(.monotonic) else 0;
         const net_rx = if (self.net) |s| s.rx_bytes.load(.monotonic) else 0;
         const net_blocked = if (self.net) |s| s.blocked_count.load(.monotonic) else 0;
-        return std.fmt.bufPrint(buf, "uptime_ms={d} cpu_ms={d} mem_peak_mb={d} ram_mb={d} cpus={d} commands={d} bytes_in={d} bytes_out={d} net_tx={d} net_rx={d} net_blocked={d}", .{
+        return std.fmt.bufPrint(buf, "uptime_ms={d} cpu_ms={d} mem_peak_mb={d} ram_mb={d} cpus={d} commands={d} bytes_in={d} bytes_out={d} net_tx={d} net_rx={d} net_blocked={d} data_conns={d} data_ms={d}", .{
             nowMs() - self.start_ms,
             hostutil.processCpuMs(),
             hostutil.processMaxRssMb(),
@@ -96,6 +102,8 @@ pub const Metering = struct {
             net_tx,
             net_rx,
             net_blocked,
+            self.data_conns.load(.acquire),
+            self.data_ms.load(.acquire),
         }) catch buf[0..0];
     }
 };
@@ -134,6 +142,8 @@ pub const SandboxInfo = struct {
     rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
     max_output_bytes: u64 = 0, // per-command output cap (0 = unlimited)
     x402: bool = false, // settlement mode: on = billable (teardown emits an x402 settlement); off = general workload
+    app_port: u32 = 0, // tenant loopback port bridged via the data plane (0 = no data plane) (3b)
+    max_data_conns: u64 = 0, // cap on concurrent data-plane conns (0 = engine default)
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -155,6 +165,9 @@ pub const SandboxInfo = struct {
             \\net_rate_kbps={d}
             \\max_output_bytes={d}
             \\x402={s}
+            \\data_plane={s}
+            \\app_port={d}
+            \\max_data_conns={d}
             \\{c}0
             \\
         , .{
@@ -172,6 +185,9 @@ pub const SandboxInfo = struct {
             self.rate_kbps,
             self.max_output_bytes,
             onOff(self.x402),
+            onOff(self.app_port > 0),
+            self.app_port,
+            self.max_data_conns,
             @as(u8, 0x1e),
         }) catch return 0).len;
     }
@@ -674,14 +690,16 @@ pub const DataBridge = struct {
     lock: Lock = .{},
     conns: [MAX_BRIDGE]Entry = [_]Entry{.{}} ** MAX_BRIDGE,
     next_port: u32 = 40000,
+    max_conns: usize = MAX_BRIDGE, // govern cap on concurrent data-plane conns (<= MAX_BRIDGE)
 
-    const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
+    pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
     const State = enum { connecting, established, dead };
     const Entry = struct {
         active: bool = false,
         state: State = .connecting,
         vsock_id: u16 = 0,
         unix_fd: c_int = -1,
+        start_ms: i64 = 0, // for the data_ms lifetime meter
     };
 
     pub fn start(self: *DataBridge) void {
@@ -728,13 +746,16 @@ pub const DataBridge = struct {
     fn register(self: *DataBridge, id: u16, unix_fd: c_int) ?usize {
         self.lock.lock();
         defer self.lock.unlock();
+        var active: usize = 0;
+        var free: ?usize = null;
         for (&self.conns, 0..) |*e, i| {
-            if (!e.active) {
-                e.* = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd };
-                return i;
-            }
+            if (e.active) active += 1 else if (free == null) free = i;
         }
-        return null; // pool full
+        if (active >= self.max_conns) return null; // govern cap reached
+        const slot = free orelse return null; // pool full
+        self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = nowMs() };
+        if (self.meter) |m| _ = m.data_conns.fetchAdd(1, .release);
+        return slot;
     }
 
     /// Close both fds + free the slot. The pump thread is the single owner of this.
@@ -744,6 +765,7 @@ pub const DataBridge = struct {
         self.conns[slot].active = false;
         self.lock.unlock();
         if (!e.active) return;
+        if (self.meter) |m| _ = m.data_ms.fetchAdd(@intCast(@max(0, nowMs() - e.start_ms)), .release);
         self.vsdev.hostClose(e.vsock_id);
         if (e.unix_fd >= 0) _ = libc.close(e.unix_fd);
     }
