@@ -816,11 +816,17 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var cmdline_buf: [256]u8 = undefined;
     var runas_buf: [64]u8 = undefined;
     const runas: []const u8 = confGet("run_as", &runas_buf) orelse "";
-    const cmdline: [:0]const u8 = std.fmt.bufPrintZ(&cmdline_buf, "{s}{s}{s}{s}", .{
+    // `nether.app_port=<n>`: the tenant's loopback TCP port the in-guest forwarder bridges
+    // to the host data plane (docs/park-concurrency-plan.md 3b). /init starts /forwarder when set.
+    var appport_buf: [16]u8 = undefined;
+    const app_port: []const u8 = confGet("app_port", &appport_buf) orelse "";
+    const cmdline: [:0]const u8 = std.fmt.bufPrintZ(&cmdline_buf, "{s}{s}{s}{s}{s}{s}", .{
         base_cmdline,
         if (runas.len > 0) " nether.run_as=" else "",
         runas,
         if (disk_fresh) " nether.disk_fresh=1" else "",
+        if (app_port.len > 0) " nether.app_port=" else "",
+        app_port,
     }) catch base_cmdline;
 
     var dtb_buf: [16 * 1024]u8 = undefined;

@@ -30,6 +30,10 @@ command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
 ZIG="${ZIG:-zig}"
 echo "[guest-aarch64] building the agent (aarch64-linux-musl)"
 "$ZIG" cc -target aarch64-linux-musl -static -O2 tools/agent.c -o kernels/rootfs/agent
+# The data-plane forwarder (docs/park-concurrency-plan.md 3b): bridges host->guest vsock
+# conns to the tenant's loopback TCP server, so a tenant runs an ordinary TCP server.
+echo "[guest-aarch64] building the forwarder (aarch64-linux-musl)"
+"$ZIG" cc -target aarch64-linux-musl -static -O2 tools/forwarder.c -o kernels/rootfs/forwarder
 
 # Write the canonical /init (the tracked source of the guest boot logic): load the
 # virtio/vsock/blk + ext4 modules, auto-mount a persistent disk at /data, bring up the
@@ -84,6 +88,11 @@ echo "nameserver 10.0.2.3" > /etc/resolv.conf
 # agent/control mode.
 [ -x /agent ] && /agent &
 
+# The data-plane forwarder: when the host set nether.app_port=<n>, bridge host->guest
+# vsock (port 5001) to the tenant's loopback TCP server at 127.0.0.1:<n>, so the tenant
+# runs an ordinary TCP server (docs/park-concurrency-plan.md 3b). No-op otherwise.
+grep -q 'nether.app_port=' /proc/cmdline 2>/dev/null && [ -x /forwarder ] && /forwarder &
+
 echo
 echo "  Nether - aarch64 Linux on Apple Hypervisor.framework"
 echo "  $(uname -srm)"
@@ -105,7 +114,7 @@ docker run --rm --platform linux/arm64 -v "$PWD:/host" alpine:3.21 sh -c '
   grep -q "^nether:" /rootfs/etc/passwd || echo "nether:x:1000:1000:nether:/home/nether:/bin/sh" >> /rootfs/etc/passwd
   grep -q "^nether:" /rootfs/etc/group  || echo "nether:x:1000:" >> /rootfs/etc/group
   mkdir -p /rootfs/home/nether && chown 1000:1000 /rootfs/home/nether
-  chmod +x /rootfs/init /rootfs/agent
+  chmod +x /rootfs/init /rootfs/agent /rootfs/forwarder
   cd /rootfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > /host/kernels/initramfs.new.cpio.gz
 '
 
