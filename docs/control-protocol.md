@@ -217,8 +217,9 @@ appears only in settlement mode). Flip it per sandbox; nothing else about the ru
 `max_runtime_s` (wall-clock cap), `max_cpu_s` (CPU-time cap), `idle_timeout_s` (reclaim on
 inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
 default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb`
-(sizing), `disk`/`disk_size_mb` (persistent disk; below). All caps are reported back by
-`__info__` so a client can verify what it got.
+(sizing), `disk`/`disk_size_mb` (persistent disk; below), `app_port`/`data_socket`/
+`max_data_conns` (data-plane proxy to an in-guest server; below). All caps are reported back
+by `__info__` so a client can verify what it got.
 
 ### In-guest privilege drop (`run_as`)
 
@@ -277,6 +278,35 @@ net_rate_kbps = 2000            # download bandwidth cap (0 = unlimited)
 Verified live on HVF: with `net=1` (firewall on) a public host connects (`ALLOW`) while
 `169.254.169.254` and `192.168.x.x` are refused (`BLOCK`); with `net_open=1` the firewall
 is off and private destinations connect. `__info__` reports `net=` and `firewall=`.
+
+### Data-plane proxy (reach a tenant's in-guest server)
+
+For a long-lived tenant that runs its own server *inside* the VM (HTTP, worker, etc.),
+Nether exposes it to the host as a concurrent upstream - so the platform proxies requests
+to it instead of exec'ing a command per request. Two knobs:
+
+```
+app_port = 8080                 # the tenant's ORDINARY loopback TCP port inside the guest
+data_socket = /run/nether/<id>.data.sock   # host Unix socket the platform proxies to
+max_data_conns = 48             # optional cap on concurrent data-plane conns (<= 48)
+```
+
+`app_port` makes `/init` start the in-guest forwarder (it bridges guest vsock:5001 to
+`127.0.0.1:<app_port>`), so the tenant writes a **completely ordinary loopback TCP server -
+no vsock awareness**. On the host, `data_socket` is an **owner-uid-gated** Unix listener;
+each connection to it is spliced to a fresh host->guest vsock stream to the forwarder.
+
+**Contract for a driving client (swerver):** treat `data_socket` as a proxy **upstream** -
+open a connection per request (or pool), write the request bytes, read the response. It is a
+**raw byte-stream** (no framing, no request-ids), so ordinary upstream/proxy machinery
+applies directly. Up to `max_data_conns` concurrent conns per VM (default/cap 48). A slow or
+wedged consumer is bounded by `SO_SNDTIMEO` (it cannot stall the guest); the govern cap
+refuses excess conns (backpressure) rather than unbounded fan-out. `__info__` reports
+`data_plane`, `app_port`, `max_data_conns`; `__stats__` and the bill report `data_conns` +
+`data_ms` (plus the shared `bytes_in`/`bytes_out`). A snapshot **fork inherits** `app_port`
+(on the cmdline), so a warmed base with the tenant server already running forks into an
+instantly-serving VM. Verified live on HVF: concurrent host connections reach an ordinary
+`127.0.0.1:8080` guest server and back; the cap refuses excess; the meters advance.
 
 ## Snapshot / fork (HVF)
 
