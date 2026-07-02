@@ -72,18 +72,19 @@ static int dial_app(void) {
     return fd;
 }
 
-/* Read from `from`, write it all to `to`. Returns 0 on EOF/error (caller closes the pair). */
-static int splice_once(int from, int to) {
+/* Read from `from`, write it all to `to`. Returns bytes spliced (>0), 0 on read EOF, or
+ * -1 on a read/write error. The caller closes the pair when this is <= 0. */
+static long splice_once(int from, int to) {
     char buf[16384];
     ssize_t r = read(from, buf, sizeof buf);
-    if (r <= 0) return 0;
+    if (r <= 0) return r; /* 0 = EOF, <0 = read error (e.g. ECONNRESET) */
     size_t off = 0;
     while (off < (size_t)r) {
         ssize_t w = write(to, buf + off, (size_t)r - off);
-        if (w <= 0) return 0;
+        if (w <= 0) return -1;
         off += (size_t)w;
     }
-    return 1;
+    return (long)r;
 }
 
 int main(void) {
@@ -141,12 +142,18 @@ int main(void) {
          * which is level-triggered and re-fires immediately for any still-readable fd. */
         for (int i = 0; i < nconn; i++) {
             int dead = 0;
-            if (pfds[1 + 2 * i].revents & POLLIN)
-                if (!splice_once(conns[i].vf, conns[i].tf)) dead = 1;
-            if (!dead && (pfds[2 + 2 * i].revents & POLLIN))
-                if (!splice_once(conns[i].tf, conns[i].vf)) dead = 1;
-            if (!dead && ((pfds[1 + 2 * i].revents | pfds[2 + 2 * i].revents) & (POLLHUP | POLLERR)))
-                dead = 1;
+            /* Splice on ANY event (POLLIN/POLLHUP/POLLERR): a peer that closed or errored may
+             * STILL have BUFFERED data to read (a normal close reports POLLIN|POLLERR|POLLHUP
+             * together). So we always try to read, and only close when splice_once itself
+             * returns <= 0 (a true read EOF or a read/write error) - NEVER on the poll flags
+             * alone. Level-triggered poll re-fires, so a hung-up-but-nonempty fd is drained
+             * fully before we close. Without this, the tail of a transfer whose sender closed
+             * while data was still buffered is silently lost. */
+            const short any = POLLIN | POLLHUP | POLLERR;
+            if (pfds[1 + 2 * i].revents & any)
+                if (splice_once(conns[i].vf, conns[i].tf) <= 0) dead = 1;
+            if (!dead && (pfds[2 + 2 * i].revents & any))
+                if (splice_once(conns[i].tf, conns[i].vf) <= 0) dead = 1;
             if (dead) {
                 close(conns[i].vf);
                 close(conns[i].tf);
