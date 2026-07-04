@@ -347,7 +347,14 @@ exactly as it drives a fresh boot: connect → `__info__` → send commands.
 What carries across: RAM (COW), per-vCPU state, GIC, console + virtio-blk, the disk;
 when the base was control-mode, the vsock device + engine + agent connection; and when the
 base ran with `net=1`, the virtio-net **device** (so the guest's NIC driver resumes
-coherently). The slirp **NAT engine** does **not** carry across - it holds real host
+coherently). The **data plane** carries too: the in-guest forwarder and the tenant's
+own server live in guest RAM, so a fork inherits them already running. The host-side
+`DataBridge` is not part of the snapshot (it holds a host listener a fork can't inherit),
+so the restore path stands up a fresh one when the fork's `nether.conf` sets `data_socket`
+- giving each fork its own data socket onto the *same* warm tenant server. So a base baked
+with `app_port=` (forwarder running) and driven to start its server forks into an
+**instantly-serving** upstream: the fork answers requests on its `data_socket` in tens of
+milliseconds with no reboot and no server cold start. The slirp **NAT engine** does **not** carry across - it holds real host
 sockets a forked process can't inherit, so the engine restarts fresh: in-flight outbound
 flows reset and the guest re-establishes them at the TCP level (normal for a fork). The
 fork's egress firewall / rate cap come from its own `nether.conf`, and `__stats__`/
