@@ -728,6 +728,19 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     const num_cpus: u32 = @intCast(std.math.clamp(confGetInt("cpus", ARM_NUM_CPUS), 1, ARM_MAX_CPUS));
     const ram_size: usize = @intCast(@max(confGetInt("ram_mb", ARM_RAM_SIZE / nether.memmap.mib), 256) * nether.memmap.mib);
 
+    // The compressed initramfs is placed at the ~192 MiB initrd offset and the guest kernel
+    // unpacks it into a tmpfs rootfs above that, so RAM must hold the initrd AND its expansion.
+    // Too little and the guest panics "VFS: Unable to mount root fs on unknown-block(0,0)" - a
+    // cryptic symptom of small RAM (a 64 MiB runtime image needs ~384 MiB; 256 fails). Warn
+    // early with the numbers, since a pool supervisor forking many VMs hits this exact wall.
+    if (initramfs) |fs| {
+        const fs_mb = fs.len / nether.memmap.mib;
+        const need_mb: usize = 192 + fs_mb * 3; // initrd offset + ~2x unpack headroom
+        const ram_mb = ram_size / nether.memmap.mib;
+        if (ram_mb < need_mb)
+            std.debug.print("[nether] WARNING: ram_mb={d} may be too small for a {d} MiB initramfs; the guest can panic mounting rootfs (need ~{d} MiB). Raise ram_mb.\n", .{ ram_mb, fs_mb, need_mb });
+    }
+
     // Per-sandbox metering (declared early so the net block can point it at the
     // NAT for egress byte counts; read by the __stats__ control command).
     // Core platform state (observe/meter/run): the journal, usage meter, and agent,

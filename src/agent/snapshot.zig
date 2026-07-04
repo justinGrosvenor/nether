@@ -896,6 +896,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 .rate_kbps = conf.confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = conf.confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
+                // Advertise the data plane on a fork too (mirror boot), so a pool supervisor's
+                // __info__ readiness check sees data_plane=on/app_port for a warm, serving fork.
+                .app_port = @intCast(conf.confGetInt("app_port", 0)),
             },
         });
 
