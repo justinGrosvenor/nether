@@ -175,6 +175,11 @@ pub fn armStdinPump(uart: *nether.Pl011) void {
 /// unechoed (the guest echoes). Returns the prior settings, or null for a
 /// non-tty stdin (a pipe), which is left untouched.
 pub fn armEnableRawMode() ?std.posix.termios {
+    // Non-tty stdin (a pipe, or /dev/null in a headless fork): leave it untouched. Check
+    // isatty first so we never tcgetattr a non-tty - on /dev/null that returns ENODEV,
+    // which Zig's posix wrapper treats as "unexpected" and dumps a stack trace before the
+    // catch, spamming every headless fork's log (the platform supervisor forks with no tty).
+    if (libc.isatty(0) == 0) return null;
     var t = std.posix.tcgetattr(0) catch return null;
     const saved = t;
     t.lflag.ICANON = false; // byte-at-a-time

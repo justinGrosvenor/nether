@@ -815,6 +815,12 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var core = control.Core{};
     var render: nether.RenderMap = undefined;
     var ctl_ctx: control.ControlCtx = undefined;
+    // Data-plane bridge for the fork (park-concurrency 3b): declared at function scope so
+    // the router + bridge outlive runSmp (the engine callback references them the whole run).
+    var vs_router: control.VsockRouter = undefined;
+    var data_bridge: control.DataBridge = undefined;
+    var data_sock_buf: [256]u8 = undefined;
+    var have_bridge = false;
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
     if (ctl_present) {
@@ -829,11 +835,34 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         core.agent.renders = &render;
 
         // Re-wire the engine callbacks to this process and resume the agent connection.
+        // Route vsock events through the VsockRouter (not straight to agentEvent) so that,
+        // when this fork runs the data plane, host-dialed data conns reach the bridge while
+        // the surviving agent conn still reaches the agent. A fork needs no probe.
         const vs = vs_engine.?;
-        vs.on_event = control.agentEvent;
-        vs.on_event_ctx = &core.agent;
+        vs_router = .{ .agent = &core.agent };
+        // Data-plane bridge (park-concurrency 3b, warm-fork serving): if this fork's
+        // nether.conf sets data_socket AND the base image runs the in-guest forwarder
+        // (nether.app_port), the fork inherits a WARM tenant server over CoW RAM, so
+        // standing up the host bridge makes it immediately reachable as a concurrent
+        // upstream with no reboot - the product's cold-start path (park -> fork -> serve).
+        if (conf.confGet("data_socket", &data_sock_buf)) |ds| {
+            if (ds.len > 0) {
+                data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter, .alloc = allocator };
+                const mdc = conf.confGetInt("max_data_conns", 0);
+                if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
+                data_bridge.idle_ms = conf.confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
+                vs_router.bridge = &data_bridge;
+                have_bridge = true;
+            }
+        }
+        vs.on_event = control.VsockRouter.dispatch;
+        vs.on_event_ctx = &vs_router;
         _ = vsdev.hostListen(5000); // idempotent (restored listen set already has it); enables future reconnects
         core.agent.conn_id.store(saved_conn_id, .release); // the surviving connection drives immediately
+        if (have_bridge) {
+            data_bridge.start(); // spawn the fork's data-plane listener
+            std.debug.print("[nether] fork data plane ON at {s}: dials the inherited in-guest forwarder; warm tenant server is immediately serving.\n", .{@as([*:0]const u8, @ptrCast(&data_sock_buf))});
+        }
 
         // Wire the (fresh) NAT engine into the meter + journal so __stats__ reports
         // egress bytes and __netlog__ records flows for this fork session.

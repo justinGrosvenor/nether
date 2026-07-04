@@ -15,6 +15,7 @@ pub const libc = struct {
     pub extern "c" fn ftruncate(fd: c_int, length: i64) c_int; // size a backing file (persistent disk)
     pub extern "c" fn msync(addr: *anyopaque, len: usize, flags: c_int) c_int; // flush a MAP_SHARED mapping to its file
     pub extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
+    pub extern "c" fn isatty(fd: c_int) c_int; // 1 for a terminal, 0 otherwise (no errno noise on a non-tty)
     // Unix-domain control socket + a pipe to relay the guest agent's replies.
     pub extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
     pub extern "c" fn bind(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
