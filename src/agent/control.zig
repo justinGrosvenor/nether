@@ -1818,40 +1818,74 @@ test "control protocol: introspection replies, versioning, observer gating" {
         }
     }.d;
 
-    // __info__: versioned capabilities.
-    controlCommand(&ctx, w, "__info__\n", true);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "proto_version=1") != null);
+    // The framed-vs-bare WIRE SHAPE is the load-bearing contract for a consumer's read
+    // loop (a client reads a framed reply to its 0x1e<exit>\n trailer, but a bare ERR/OK
+    // has no 0x1e and must be recognized as terminal). Lock the shape here alongside the
+    // content, so a refactor can't silently drop a trailer (breaking framed consumers) or
+    // add one to a bare reply. Framed reports end exactly 0x1e '0' '\n'; bare lines have no
+    // 0x1e anywhere. Matches tools/nether-ctl.c is_framed() and docs/control-protocol.md.
+    const FRAME = "\x1e0\n";
 
-    // __help__: discoverable command list with the version banner.
+    // __info__: versioned capabilities. FRAMED.
+    controlCommand(&ctx, w, "__info__\n", true);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "proto_version=1") != null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME));
+    }
+
+    // __help__: discoverable command list with the version banner. FRAMED.
     controlCommand(&ctx, w, "__help__\n", true);
     {
         const out = drain(fds[0], &rbuf);
         try testing.expect(std.mem.indexOf(u8, out, "control protocol v1") != null);
         try testing.expect(std.mem.indexOf(u8, out, "__shutdown__") != null);
         try testing.expect(std.mem.indexOf(u8, out, "__put__") != null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME));
     }
 
-    // __stats__: the metered dimensions.
+    // __stats__: the metered dimensions. FRAMED.
     controlCommand(&ctx, w, "__stats__\n", true);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "cpu_ms=") != null);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "cpu_ms=") != null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME));
+    }
 
-    // __events__: the journal's boot lifecycle event is visible.
+    // __events__: the journal's boot lifecycle event is visible. UNFRAMED (self-delimiting
+    // log, no 0x1e trailer - a consumer that waited for one would hang).
     controlCommand(&ctx, w, "__events__\n", true);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "LIFE boot") != null);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "LIFE boot") != null);
+        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
+    }
 
     // Reserved namespace: an unknown __verb__ is rejected loudly (not forwarded to the
-    // guest shell). Tested as primary so it passes the gate and reaches the check.
+    // guest shell). Tested as primary so it passes the gate and reaches the check. BARE.
     controlCommand(&ctx, w, "__bogus__\n", true);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "ERR unknown command") != null);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "ERR unknown command") != null);
+        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null); // bare line: no frame
+    }
 
-    // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire.
+    // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire. BARE.
     controlCommand(&ctx, w, "__shutdown__\n", false);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "ERR read-only observer") != null);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "ERR read-only observer") != null);
+        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
+    }
     try testing.expect(!spy.stopped);
 
-    // Primary may: acked, and the injected stop fires exactly once here.
+    // Primary may: acked, and the injected stop fires exactly once here. BARE OK.
     controlCommand(&ctx, w, "__shutdown__\n", true);
-    try testing.expect(std.mem.indexOf(u8, drain(fds[0], &rbuf), "OK shutting down") != null);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "OK shutting down") != null);
+        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
+    }
     try testing.expect(spy.stopped);
 }
 

@@ -45,17 +45,24 @@ reply (it propagates the guest command's exit code). Build it on the host with
 
 ## Reply shapes
 
-- **Reports** (`__info__`, `__stats__`, `__help__`) end with a `0x1e` byte then `0\n`
-  (the agent's `[exit N]` frame, here always exit 0) so a client knows the reply is
-  complete.
-- **Logs** (`__events__`, `__cmdlog__`, `__netlog__`) are self-delimiting: a header line
-  carries a count/cursor, followed by that many records.
-- **Binary** (`__frame__`, `__framediff__`) write raw bytes on the socket (a PPM image /
-  tile records); the report tells you the length.
-- **Shell commands** (anything not starting with `__`) stream the command's stdout/stderr
-  then a `0x1e<exit-code>\n` trailer.
-- **Errors / acks** are a single `ERR <reason>\n` (or `OK <reason>\n` for `__shutdown__`/
-  `__put__`/`__get__`) line. These are **unframed** - no `0x1e`.
+There are exactly four wire shapes, and which one a command uses is **fixed** - a client
+keys its read loop off it, so the mapping is load-bearing. It matches the reference client
+`tools/nether-ctl.c` `is_framed()` exactly:
+
+- **Framed** - ends with the agent's `0x1e<exit>\n` trailer. The ONLY framed commands are
+  `__info__`, `__stats__`, `__help__` (trailer always exit 0) and **shell commands**
+  (anything not starting with `__`; the trailer carries the command's real exit code).
+  Read until a raw `0x1e`, then the ASCII exit code, then `\n`.
+- **Self-delimiting (unframed)** - no `0x1e` trailer; the reply is complete text/records
+  ending at an idle gap or EOF. These are the logs `__events__`/`__cmdlog__`/`__netlog__`
+  (a header line carries a count/cursor) **and the render snapshots `__screen__` /
+  `__screendiff__`** (self-delimiting rendered rows). Despite reporting sandbox *state*,
+  these are **not** framed - do **not** wait for a `0x1e` on them or you will hang.
+- **Binary (unframed)** - `__frame__` / `__framediff__` write raw bytes (a PPM image / tile
+  records) whose own header carries the dimensions; read to EOF/idle.
+- **Bare line** - a single `ERR <reason>\n`, or `OK <reason>\n` for `__shutdown__` /
+  `__snapshot__` / `__put__` / `__get__`, with no `0x1e`. An `ERR ` bare line can also come
+  back for a command you *expected* to be framed - see the invariant below.
 
 ### Framing invariant (read this if you read until `0x1e`)
 
@@ -165,8 +172,8 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 | `__events__ [seq]` | log | Unified event timeline (CMD/NET/LIFE). No arg dumps the retained ring; `__events__ <seq>` returns only events after that sequence number (the cursor from the previous `EVENTS <seq>` header) for incremental polling. |
 | `__cmdlog__` | log | Per-command audit: `<ms> exit=<code> cpu_ms=<n> <command>`, oldest-first. |
 | `__netlog__` | log | Egress audit: `<ms> <TCP\|UDP> <ip>:<port> <ALLOW\|BLOCK>`, oldest-first. Requires `net=1`. |
-| `__screen__` | report | Terminal snapshot (scrollback + live grid), rendered server-side. Requires control mode. |
-| `__screendiff__` | report | Terminal rows changed since the last call (full screen on first call). **Primary-only** (per-client diff state). |
+| `__screen__` | unframed | Terminal snapshot (scrollback + live grid), rendered server-side, self-delimiting (no `0x1e`). Requires control mode. |
+| `__screendiff__` | unframed | Terminal rows changed since the last call (full screen on first call), self-delimiting. **Primary-only** (per-client diff state). |
 | `__frame__` | binary | The virtio-gpu scanout as a binary PPM. Requires `gpu=1`. |
 | `__framediff__` | binary | Framebuffer tiles changed since the last call. **Primary-only**. Requires `gpu=1`. |
 | `__help__` | report | The command list (this table, abbreviated). |
@@ -301,7 +308,10 @@ each connection to it is spliced to a fresh host->guest vsock stream to the forw
 open a connection per request (or pool), write the request bytes, read the response. It is a
 **raw byte-stream** (no framing, no request-ids), so ordinary upstream/proxy machinery
 applies directly. Up to `max_data_conns` concurrent conns per VM (default/cap 48). A slow or
-wedged consumer is bounded by `SO_SNDTIMEO` (it cannot stall the guest); a slow or silent
+wedged consumer cannot stall the guest: guest->host delivery is fully non-blocking with a
+bounded per-conn window (256 KiB) and credit-on-delivery, so a wedged reader backpressures
+the in-guest server (the guest stops sending) instead of blocking the vCPU - lossless, and
+the vCPU never waits on the consumer. A slow or silent
 guest server (accepts, then goes quiet) is reaped after `data_idle_ms` of two-way idleness,
 so it cannot tie up a conn slot; the govern cap refuses excess conns (backpressure) rather
 than unbounded fan-out. Data-plane traffic also counts as sandbox activity, so a VM busy
