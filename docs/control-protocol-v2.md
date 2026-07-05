@@ -1,9 +1,15 @@
 # Control protocol v2 - "frame everything" (PROPOSAL)
 
-Status: **PROPOSED** (2026-07-04). Owner: NETHER. Affects consumers: `tools/nether-ctl.c`,
-swerver `control_client`, `a private path` codec, `a private path`. Requires a
-`proto_version` bump (1 -> 2) and coordinated consumer updates. This doc is the spec to
-review before implementing; nothing here is built yet.
+Status: **IMPLEMENTED in nether** (2026-07-04). `proto_version` is now `2`; every command/ack
+reply is framed, with negative trailer exits for control-plane errors and a command-intake
+guard against forged frames. Reference client `tools/nether-ctl.c` speaks both v1 and v2.
+Proven live on HVF (`scripts/proto_v2.py`). **Consumers still to migrate:** swerver
+`control_client`, `a private path` codec, `a private path` - each reads `proto_version`
+from the `__info__` handshake, so they can adopt the uniform framed loop (and drop the settle
+timer) at their own pace; a v1 client still works against a v2 server (section 4). This doc is
+the design + migration reference; the live contract is in [control-protocol.md](control-protocol.md).
+Decisions taken: single `-1` control-error code (section 3.4), and **Option A** - all `ERR`/`OK`
+framed uniformly (section 6).
 
 ## 1. Why
 

@@ -112,7 +112,7 @@ pub const Metering = struct {
 /// breaking change to the command set or wire format so an integrating client (swerver)
 /// can check compatibility before driving the sandbox. The command list itself is
 /// discoverable at runtime via `__help__` and documented in docs/control-protocol.md.
-pub const PROTO_VERSION = 1;
+pub const PROTO_VERSION = 2;
 
 /// Default per-command output cap (govern) when `max_output_bytes` is unset. A command's
 /// stdout/stderr is bounded to this many bytes; the rest is dropped with a one-time
@@ -1203,8 +1203,20 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     reply(c, std.fmt.bufPrint(&ok, "OK got {d} bytes -> {s}\n", .{ body.len, hostpath }) catch "OK\n");
 }
 
+/// Send a control-plane reply. v2 (proto_version 2): every `OK`/`ERR` reply is FRAMED with
+/// the `0x1e<exit>\n` trailer - just like reports and shell commands - so a consumer reads
+/// any command/ack reply with one loop and no timing heuristic (the v1 bare/framed ambiguity
+/// is gone). Exit code: `0` for an `OK` ack, `-1` for a control-plane `ERR`. A guest command
+/// exit is always `0..255`, so the negative code never collides - a consumer sign-tests the
+/// exit to tell "the command ran and exited N" from "nether rejected the command". The body
+/// is host-generated ASCII with no raw `0x1e` (the command-intake guard in controlCommand
+/// rejects `0x1e`/`0x1f`), so it needs no escaping. See docs/control-protocol.md.
 fn reply(c: c_int, msg: []const u8) void {
     _ = writeAll(c, msg);
+    const exit: i32 = if (std.mem.startsWith(u8, msg, "OK")) 0 else -1;
+    var tb: [16]u8 = undefined;
+    const t = std.fmt.bufPrint(&tb, "\x1e{d}\n", .{exit}) catch return;
+    _ = writeAll(c, t);
 }
 
 /// Send one command line to the guest agent (waiting for it to connect), counting
@@ -1212,6 +1224,12 @@ fn reply(c: c_int, msg: []const u8) void {
 /// answered by the host without touching the guest.
 fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool) void {
     ctx.meter.touch(); // any client command counts as activity (resets the idle timer)
+    // v2 frames every reply with a raw 0x1e trailer, so an argument echoed into a reply body
+    // (e.g. a __put__/__get__ path) must not carry a 0x1e/0x1f - it could forge the frame.
+    // A well-formed client never sends one (its own validateCommand rejects them); reject
+    // fail-closed so every framed reply body is guaranteed delimiter-free.
+    if (std.mem.indexOfScalar(u8, line, 0x1e) != null or std.mem.indexOfScalar(u8, line, 0x1f) != null)
+        return reply(c, "ERR control byte in command\n");
     if (std.mem.eql(u8, line, "__stats__\n") or std.mem.eql(u8, line, "__stats__")) {
         var rep: [512]u8 = undefined;
         const n = ctx.meter.report(&rep);
@@ -1818,42 +1836,44 @@ test "control protocol: introspection replies, versioning, observer gating" {
         }
     }.d;
 
-    // The framed-vs-bare WIRE SHAPE is the load-bearing contract for a consumer's read
-    // loop (a client reads a framed reply to its 0x1e<exit>\n trailer, but a bare ERR/OK
-    // has no 0x1e and must be recognized as terminal). Lock the shape here alongside the
-    // content, so a refactor can't silently drop a trailer (breaking framed consumers) or
-    // add one to a bare reply. Framed reports end exactly 0x1e '0' '\n'; bare lines have no
-    // 0x1e anywhere. Matches tools/nether-ctl.c is_framed() and docs/control-protocol.md.
-    const FRAME = "\x1e0\n";
+    // The WIRE SHAPE is the load-bearing contract for a consumer's read loop. In v2 EVERY
+    // command/ack reply is framed with the 0x1e<exit>\n trailer (reports + OK acks -> exit 0;
+    // control-plane ERR -> exit -1, a negative that a guest exit 0..255 can never collide
+    // with), so a consumer reads any of them with one loop and no timing heuristic. Only the
+    // streamed replies (logs/screen/binary) stay self-delimiting. Lock the shape here so a
+    // refactor can't drop a trailer (breaking consumers) or misassign the exit. Matches
+    // tools/nether-ctl.c is_framed() and docs/control-protocol.md.
+    const FRAME_OK = "\x1e0\n";
+    const FRAME_ERR = "\x1e-1\n";
 
-    // __info__: versioned capabilities. FRAMED.
+    // __info__: versioned capabilities. FRAMED (exit 0).
     controlCommand(&ctx, w, "__info__\n", true);
     {
         const out = drain(fds[0], &rbuf);
-        try testing.expect(std.mem.indexOf(u8, out, "proto_version=1") != null);
-        try testing.expect(std.mem.endsWith(u8, out, FRAME));
+        try testing.expect(std.mem.indexOf(u8, out, "proto_version=2") != null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_OK));
     }
 
-    // __help__: discoverable command list with the version banner. FRAMED.
+    // __help__: discoverable command list with the version banner. FRAMED (exit 0).
     controlCommand(&ctx, w, "__help__\n", true);
     {
         const out = drain(fds[0], &rbuf);
-        try testing.expect(std.mem.indexOf(u8, out, "control protocol v1") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "control protocol v2") != null);
         try testing.expect(std.mem.indexOf(u8, out, "__shutdown__") != null);
         try testing.expect(std.mem.indexOf(u8, out, "__put__") != null);
-        try testing.expect(std.mem.endsWith(u8, out, FRAME));
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_OK));
     }
 
-    // __stats__: the metered dimensions. FRAMED.
+    // __stats__: the metered dimensions. FRAMED (exit 0).
     controlCommand(&ctx, w, "__stats__\n", true);
     {
         const out = drain(fds[0], &rbuf);
         try testing.expect(std.mem.indexOf(u8, out, "cpu_ms=") != null);
-        try testing.expect(std.mem.endsWith(u8, out, FRAME));
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_OK));
     }
 
-    // __events__: the journal's boot lifecycle event is visible. UNFRAMED (self-delimiting
-    // log, no 0x1e trailer - a consumer that waited for one would hang).
+    // __events__: the journal's boot lifecycle event is visible. STREAMED (self-delimiting
+    // log, no 0x1e trailer - a consumer reads it in streamed mode, not to a frame).
     controlCommand(&ctx, w, "__events__\n", true);
     {
         const out = drain(fds[0], &rbuf);
@@ -1861,30 +1881,40 @@ test "control protocol: introspection replies, versioning, observer gating" {
         try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
     }
 
-    // Reserved namespace: an unknown __verb__ is rejected loudly (not forwarded to the
-    // guest shell). Tested as primary so it passes the gate and reaches the check. BARE.
+    // Reserved namespace: an unknown __verb__ is rejected. v2: FRAMED as a control error
+    // (body "ERR ...", exit -1) - no bare/framed ambiguity for the consumer.
     controlCommand(&ctx, w, "__bogus__\n", true);
     {
         const out = drain(fds[0], &rbuf);
         try testing.expect(std.mem.indexOf(u8, out, "ERR unknown command") != null);
-        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null); // bare line: no frame
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_ERR)); // control error: exit -1
     }
 
-    // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire. BARE.
+    // Control byte in a command is rejected fail-closed (it could forge a frame). FRAMED ERR.
+    controlCommand(&ctx, w, "ls \x1e forged\n", true);
+    {
+        const out = drain(fds[0], &rbuf);
+        try testing.expect(std.mem.indexOf(u8, out, "ERR control byte") != null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_ERR));
+    }
+
+    // Observer gate: a non-primary client cannot drive the sandbox; stop must NOT fire.
+    // FRAMED as a control error (exit -1).
     controlCommand(&ctx, w, "__shutdown__\n", false);
     {
         const out = drain(fds[0], &rbuf);
         try testing.expect(std.mem.indexOf(u8, out, "ERR read-only observer") != null);
-        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_ERR));
     }
     try testing.expect(!spy.stopped);
 
-    // Primary may: acked, and the injected stop fires exactly once here. BARE OK.
+    // Primary may: acked, and the injected stop fires exactly once here. v2: FRAMED OK ack
+    // (exit 0) - so a consumer reads shutdown/snapshot/put/get with the same framed loop.
     controlCommand(&ctx, w, "__shutdown__\n", true);
     {
         const out = drain(fds[0], &rbuf);
         try testing.expect(std.mem.indexOf(u8, out, "OK shutting down") != null);
-        try testing.expect(std.mem.indexOfScalar(u8, out, 0x1e) == null);
+        try testing.expect(std.mem.endsWith(u8, out, FRAME_OK));
     }
     try testing.expect(spy.stopped);
 }

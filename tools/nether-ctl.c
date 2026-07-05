@@ -9,14 +9,17 @@
  *   nether-ctl <socket-path>              # handshake, print __info__
  *   nether-ctl <socket-path> <command...> # handshake, run command, print reply
  *
- * On connect it sends __info__, reads the report, and verifies proto_version (a
- * mismatch is a breaking change; we warn and continue). Then it sends the command
- * line and reads the reply. A shell command and the report-style queries
- * (__info__/__stats__/__help__) end with the agent frame `0x1e<exit>\n`; we print
- * the body (everything before 0x1e) and exit with the guest's exit code. The
- * self-delimiting logs (__events__/__cmdlog__/__netlog__) and binary replies
- * (__frame__) carry no 0x1e, so we fall back to draining until the socket goes
- * idle. Build (host): cc -O2 tools/nether-ctl.c -o nether-ctl
+ * On connect it sends __info__, reads the report, and reads proto_version (it speaks
+ * both 1 and 2, adapting the read loop; any other version warns and continues). Then it
+ * sends the command line and reads the reply. In v2 every command/ack reply is framed
+ * with `0x1e<exit>\n` (reports, shell commands, AND the acks __shutdown__/__snapshot__/
+ * __put__/__get__): we read to the 0x1e, print the body before it, and exit with the code
+ * (a guest 0..255, or a v2 control-plane error <0 which we map to CLI status 1). In v1 the
+ * acks and any ERR/OK were BARE lines with no 0x1e; the bare-status settle guard still
+ * handles them (harmless under v2, where the 0x1e always arrives). The self-delimiting logs
+ * (__events__/__cmdlog__/__netlog__), render snapshots, and binary replies (__frame__)
+ * carry no frame, so we drain until the socket goes idle.
+ * Build (host): cc -O2 tools/nether-ctl.c -o nether-ctl
  */
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -26,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 
 #define RS 0x1e           /* the reply frame separator: body ends at 0x1e, then <exit>\n */
 #define HANG_MS 60000     /* framed reply: give up only after this long with NO progress */
@@ -46,17 +50,25 @@ static int bare_status_line(const char *buf, size_t len) {
     return (len >= 4 && memcmp(buf, "ERR ", 4) == 0) || (len >= 3 && memcmp(buf, "OK ", 3) == 0);
 }
 
-/* Does this command's reply end with the 0x1e<exit>\n frame? Shell commands do, as
- * do the report queries (__info__/__stats__/__help__). The logs (__events__/__cmdlog__
- * /__netlog__), render/framebuffer snapshots, and ERR/OK lines do NOT - they are
- * self-delimiting or binary and end at a line/idle gap. We must know which, because a
- * framed reply has to be read until its 0x1e (a slow command can pause arbitrarily
- * before producing it), while an unframed reply has no in-band terminator. */
-static int is_framed(const char *cmd) {
+/* Does this command's reply end with the 0x1e<exit>\n frame? Depends on the negotiated
+ * proto_version. In BOTH versions: shell commands and the report queries
+ * (__info__/__stats__/__help__) are framed; the logs (__events__/__cmdlog__/__netlog__) and
+ * render/framebuffer snapshots are self-delimiting/binary (not framed). The difference is the
+ * acks: in v1 __shutdown__/__snapshot__/__put__/__get__ replied with a BARE OK/ERR line (read
+ * unframed), but in v2 they are FRAMED like everything else (0x1e<exit>\n), so a client reads
+ * them with the one framed loop and gets the exit code. We must know which, because a framed
+ * reply has to be read until its 0x1e (a slow command can pause arbitrarily before it), while
+ * an unframed reply has no in-band terminator. */
+static int is_framed(const char *cmd, int proto) {
     if (strncmp(cmd, "__", 2) != 0) return 1; /* a shell command -> agent frame */
-    return strncmp(cmd, "__info__", 8) == 0 ||
+    if (strncmp(cmd, "__info__", 8) == 0 ||
         strncmp(cmd, "__stats__", 9) == 0 ||
-        strncmp(cmd, "__help__", 8) == 0;
+        strncmp(cmd, "__help__", 8) == 0) return 1;
+    /* v2: the acks are framed too (v1 sent them bare). */
+    if (proto >= 2 &&
+        (strncmp(cmd, "__shutdown__", 12) == 0 || strncmp(cmd, "__snapshot__", 12) == 0 ||
+         strncmp(cmd, "__put__", 7) == 0 || strncmp(cmd, "__get__", 7) == 0)) return 1;
+    return 0; /* logs / render / binary: self-delimiting */
 }
 
 static int connect_unix(const char *path) {
@@ -86,9 +98,10 @@ static int write_full(int fd, const char *buf, size_t n) {
  * data at all is treated as a dead guest). For an unframed reply (logs/binary/ERR),
  * there is no in-band terminator, so return once the stream goes idle after data, or on
  * EOF. Returns the body byte count (for framed, excludes the frame); *exit_code is the
- * guest exit on a framed reply, else -1. */
+ * framed exit (a guest 0..255, or a v2 control-plane error <0), or INT_MIN if the reply
+ * carried no frame/exit. (Do NOT use -1 as "no exit": v2 control errors ARE -1.) */
 static ssize_t read_reply(int fd, char *buf, size_t cap, int *exit_code, int framed) {
-    *exit_code = -1;
+    *exit_code = INT_MIN;
     size_t len = 0;
     for (;;) {
         /* framed normally blocks (HANG_MS) until the 0x1e frame; but once the buffer is
@@ -133,12 +146,14 @@ int main(int argc, char **argv) {
     ssize_t n = read_reply(fd, buf, sizeof(buf), &ec, 1); /* __info__ is framed */
     if (n <= 0) { fprintf(stderr, "nether-ctl: no __info__ reply\n"); return 1; }
     buf[n < (ssize_t)sizeof(buf) ? n : (ssize_t)sizeof(buf) - 1] = '\0';
+    int proto = 1;
     char *pv = strstr(buf, "proto_version=");
     if (!pv) {
         fprintf(stderr, "nether-ctl: warning: no proto_version in __info__ (old nether?)\n");
-    } else if (atoi(pv + strlen("proto_version=")) != 1) {
-        fprintf(stderr, "nether-ctl: warning: proto_version=%d, expected 1 (breaking change)\n",
-                atoi(pv + strlen("proto_version=")));
+    } else {
+        proto = atoi(pv + strlen("proto_version="));
+        if (proto != 1 && proto != 2)
+            fprintf(stderr, "nether-ctl: warning: proto_version=%d, expected 1 or 2 (breaking change)\n", proto);
     }
 
     /* No command: the handshake's __info__ report IS the output. */
@@ -157,9 +172,14 @@ int main(int argc, char **argv) {
     cmd[clen++] = '\n';
     if (write_full(fd, cmd, clen) < 0) { fprintf(stderr, "nether-ctl: write failed\n"); return 1; }
 
-    n = read_reply(fd, buf, sizeof(buf), &ec, is_framed(argv[2]));
+    n = read_reply(fd, buf, sizeof(buf), &ec, is_framed(argv[2], proto));
     if (n < 0) { fprintf(stderr, "nether-ctl: read failed\n"); return 1; }
     (void)write_full(1, buf, (size_t)n);
-    /* Exit with the guest command's exit code when the reply was framed. */
-    return ec < 0 ? 0 : ec;
+    /* Exit status: a framed reply carries an exit (a guest 0..255, or a v2 control-plane
+     * error <0); an unframed reply carries none. Map a control error to a non-zero CLI
+     * status (an OS exit is a byte, so a negative can't pass through) and mask a guest exit
+     * to its byte. */
+    if (ec == INT_MIN) return 0;   /* no framed exit (unframed reply / bare OK ack) */
+    if (ec < 0) return 1;          /* v2 control-plane error */
+    return ec & 0xff;              /* guest / report exit code */
 }

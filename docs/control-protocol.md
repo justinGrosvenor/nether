@@ -6,9 +6,12 @@ Unix-domain socket via `control_socket=<path>` in `nether.conf`, and drives the 
 over that socket. This is the stable surface to build against; everything else
 (virtio devices, the in-guest agent, the boot path) is implementation detail.
 
-The current version is **`proto_version=1`** (reported by `__info__`, and in `__help__`).
-Bump it on any breaking change to the command set or wire format. The command list is
-also discoverable at runtime via `__help__`, so a client can self-check.
+The current version is **`proto_version=2`** (reported by `__info__`, and in `__help__`).
+v2 frames *every* command/ack reply uniformly (see "Reply shapes"), which removes the v1
+bare/framed ambiguity; it is a breaking wire change from v1, though a v1 client mostly still
+works against a v2 server (see "Version compatibility"). Bump the version on any breaking
+change to the command set or wire format. The command list is also discoverable at runtime
+via `__help__`, so a client can self-check.
 
 ## Connecting
 
@@ -45,43 +48,52 @@ reply (it propagates the guest command's exit code). Build it on the host with
 
 ## Reply shapes
 
-There are exactly four wire shapes, and which one a command uses is **fixed** - a client
-keys its read loop off it, so the mapping is load-bearing. It matches the reference client
-`tools/nether-ctl.c` `is_framed()` exactly:
+There are two categories, and which one a command uses is **fixed** - a client keys its read
+loop off it. In v2 **every command/ack reply is framed**, so the common path is one loop with
+no timing heuristic. It matches the reference client `tools/nether-ctl.c` `is_framed()`:
 
-- **Framed** - ends with the agent's `0x1e<exit>\n` trailer. The ONLY framed commands are
-  `__info__`, `__stats__`, `__help__` (trailer always exit 0) and **shell commands**
-  (anything not starting with `__`; the trailer carries the command's real exit code).
-  Read until a raw `0x1e`, then the ASCII exit code, then `\n`.
-- **Self-delimiting (unframed)** - no `0x1e` trailer; the reply is complete text/records
-  ending at an idle gap or EOF. These are the logs `__events__`/`__cmdlog__`/`__netlog__`
-  (a header line carries a count/cursor) **and the render snapshots `__screen__` /
-  `__screendiff__`** (self-delimiting rendered rows). Despite reporting sandbox *state*,
-  these are **not** framed - do **not** wait for a `0x1e` on them or you will hang.
-- **Binary (unframed)** - `__frame__` / `__framediff__` write raw bytes (a PPM image / tile
-  records) whose own header carries the dimensions; read to EOF/idle.
-- **Bare line** - a single `ERR <reason>\n`, or `OK <reason>\n` for `__shutdown__` /
-  `__snapshot__` / `__put__` / `__get__`, with no `0x1e`. An `ERR ` bare line can also come
-  back for a command you *expected* to be framed - see the invariant below.
+- **Framed** - ends with the agent's `0x1e<exit>\n` trailer. This is *every* command and ack:
+  `__info__`/`__stats__`/`__help__`, **shell commands**, the acks `__shutdown__`/`__snapshot__`/
+  `__put__`/`__get__`, **and every control-plane `ERR`/`OK`** (unknown command, read-only
+  observer, agent-not-connected, too-many-clients, ...). Read until a raw `0x1e`, then the
+  ASCII exit code (which may be negative), then `\n`. The exit code carries the outcome:
 
-### Framing invariant (read this if you read until `0x1e`)
+  | Exit | Meaning | Body |
+  |---|---|---|
+  | `0` | a report, an `OK` ack, or a shell command that exited 0 | report / `OK ...` / stdout |
+  | `1..255` | a **shell command's** real exit code | command stdout+stderr |
+  | `< 0` (`-1`) | a **control-plane error** (nether rejected/failed the command) | `ERR <reason>` |
 
-The reply shapes are NOT uniform, and the trap is that an **`ERR <reason>\n` is unframed
-and can come back for a command you expected to be framed**: an unknown/typo'd `__verb__`,
-`ERR read-only observer` (you're not the primary), or `ERR too many control clients`. A
-client that blocks until `0x1e<exit>\n` would then **hang** waiting for a frame that never
-arrives (until its own timeout).
+  A POSIX exit is always `0..255`, so a negative code unambiguously flags a control-plane
+  error with a single sign test - no timing, no string-matching. (The report/ack bodies are
+  host-generated ASCII with no `0x1e`; shell output is delimiter-escaped by the in-guest agent
+  so a raw `0x1e` only ever marks the trailer - see "Output framing" - and a `0x1e`/`0x1f` in a
+  command is rejected fail-closed so an echoed argument can't forge a frame.)
 
-So the invariant a driving client must encode: a reply to a command is *either* framed
-(ends `0x1e<exit>\n`) *or* a single bare `ERR `/`OK ` line. **Guard for it:** while
-reading toward the `0x1e`, if the buffer is a complete line starting with `ERR ` (or
-`OK `) and no `0x1e` has appeared, treat it as a terminal reply and fail fast (non-zero) -
-do not keep waiting. To avoid mistaking a command whose *output* begins with `ERR ` for a
-control error, settle briefly first: a real command's `0x1e` trailer follows its output
-immediately, so a short grace (the reference client uses 500 ms) disambiguates. The
-reference client `tools/nether-ctl.c` (`read_reply` + `bare_status_line`) implements
-exactly this; mirror it. (The logs/binary replies are unframed too, but a client reads
-those in a mode that knows their shape; the hazard is specifically the unexpected `ERR`.)
+- **Streamed (self-delimiting)** - no `0x1e` trailer; the reply is complete when the stream
+  goes idle or the socket closes. A client reads these in a mode it chose for that command, so
+  they are never subject to any framing ambiguity. Two sub-shapes:
+  - **Logs / render** - `__events__`/`__cmdlog__`/`__netlog__` (a header line carries a
+    count/cursor) and `__screen__`/`__screendiff__` (self-delimiting rendered rows). Do **not**
+    wait for a `0x1e` on these.
+  - **Binary** - `__frame__`/`__framediff__` write raw bytes (a PPM image / tile records) whose
+    own header carries the dimensions; read to EOF/idle.
+  - A streamed command that *cannot run* replies with a framed `ERR` line (per above),
+    distinguishable from a real payload by its `ERR ` prefix (which no payload begins with).
+
+### Version compatibility (v1 vs v2)
+
+v1 sent the acks and every `ERR`/`OK` as a **bare** line with no `0x1e`, which forced a client
+to distinguish a bare status from a framed reply with a timing heuristic (a ~500 ms settle) -
+and that heuristic could truncate a framed reply whose output *began* `OK `/`ERR ` with a late
+trailer. **v2 removes this entirely**: because the acks and errors are now framed, a v2 client
+reads any command/ack reply by simply reading to the `0x1e` - no settle timer, no bare/framed
+guard. A client that must interoperate with *both* server versions reads `proto_version` from
+the `__info__` handshake (framed in both) and keeps the v1 settle path only for
+`proto_version==1`; the reference client `tools/nether-ctl.c` does exactly this. A v1 client
+talking to a v2 server also mostly works (the framed path is transparent; the acks pick up a
+cosmetic trailing `0x1e0\n`), so rollout needs no lockstep. See
+[control-protocol-v2.md](control-protocol-v2.md) for the full design and migration notes.
 
 ### Readiness
 
@@ -91,8 +103,8 @@ queries (`__info__`, `__stats__`, `__help__`) answer immediately. A *driving* co
 through boot, so an early command waits for it - bounded (default 30s). A guest that never
 connects (a broken image) makes the command fail with `ERR agent not connected (guest not
 ready)` rather than blocking forever. So a client can either just send its command (it
-parks until the agent is up) or, to distinguish "booting" from "broken", treat that ERR as
-a fast failure (see the framing-invariant guard above).
+parks until the agent is up) or, to distinguish "booting" from "broken", treat that framed
+control error (exit -1) as a fast failure.
 
 ### Reserved namespace
 
@@ -182,10 +194,10 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 
 | Command | Reply | Purpose |
 |---|---|---|
-| `__shutdown__` | `OK shutting down\n` | Clean teardown: the guest stops via its power-off path and the process exits (emitting the final usage bill). |
-| `__snapshot__ [path]` | `OK`/`ERR` | Capture a fork-source base snapshot on demand (HVF only): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply blocks until the file is on disk, so the platform knows the base is ready to fork. `ERR snapshot not supported on this backend` on KVM. |
-| `__put__ <hostpath> <guestpath>` | `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
-| `__get__ <guestpath> <hostpath>` | `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
+| `__shutdown__` | framed `OK` | Clean teardown: the guest stops via its power-off path and the process exits (emitting the final usage bill). Reply `OK shutting down` + `0x1e0\n`. |
+| `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a fork-source base snapshot on demand (HVF only): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply (framed, exit 0 on `OK` / -1 on `ERR`) blocks until the file is on disk, so the platform knows the base is ready to fork. `ERR snapshot not supported on this backend` on KVM. |
+| `__put__ <hostpath> <guestpath>` | framed `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
+| `__get__ <guestpath> <hostpath>` | framed `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
 | *(anything else)* | framed | Run the line as a shell command in the guest; output streams back, then `0x1e<exit>\n`. Metered as a command. |
 
 ## Lifecycle and settlement
