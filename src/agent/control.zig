@@ -79,7 +79,7 @@ pub const Metering = struct {
             self.data_conns.load(.acquire),
             self.data_ms.load(.acquire),
             @as(u8, 0x1e),
-        }) catch return 0).len;
+        }) catch return framedErr(buf, "ERR report render failed")).len;
     }
 
     /// One-line, machine-readable usage summary for the teardown "bill" - the same
@@ -192,7 +192,7 @@ pub const SandboxInfo = struct {
             self.max_data_conns,
             self.data_idle_ms,
             @as(u8, 0x1e),
-        }) catch return 0).len;
+        }) catch return framedErr(buf, "ERR report render failed")).len;
     }
 };
 
@@ -1142,7 +1142,9 @@ fn waitCapture(cap: *Capture) bool {
     var spins: u32 = 0;
     while (!cap.done.load(.acquire)) {
         spins += 1;
-        if (spins > 600_000) return false; // ~60s ceiling
+        if (spins > 100_000) return false; // ~10s ceiling: bounds a malformed/stalling guest's
+        // hold on the control thread. A real MAX_XFER (16 MiB) transfer over local vsock is
+        // sub-second, so 10s is very generous while cutting the DoS window (audit finding).
         _ = usleep(100);
     }
     return true;
@@ -1250,10 +1252,30 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     // the write outside the jail (a defense-in-depth escape on the create-write path).
     const fd = hostutil.createTruncNoFollow(hp);
     if (fd < 0) return reply(c, "ERR cannot write host file\n");
-    defer _ = libc.close(fd);
-    if (!writeAll(fd, body)) return reply(c, "ERR write failed\n");
+    if (!writeAll(fd, body)) {
+        // Don't leave a truncated/partial file masquerading as a real one: remove it. (The
+        // open already truncated any prior file, so failure means no valid file - fail clean.)
+        _ = libc.close(fd);
+        _ = libc.unlink(hp);
+        return reply(c, "ERR write failed\n");
+    }
+    _ = libc.close(fd);
     var ok: [128]u8 = undefined;
     reply(c, std.fmt.bufPrint(&ok, "OK got {d} bytes -> {s}\n", .{ body.len, hostpath }) catch "OK\n");
+}
+
+/// Write a minimal FRAMED reply (`<msg>0x1e<exit>\n`) into buf and return its length. Used
+/// as the fallback when a framed report's bufPrint fails, so the reply is NEVER an empty or
+/// bodyless slice with no trailer - which would hang a framed consumer waiting on the 0x1e.
+/// exit -1 marks a control-plane error (audit: report `catch return 0` dropped the trailer).
+fn framedErr(buf: []u8, msg: []const u8) usize {
+    const r = std.fmt.bufPrint(buf, "{s}\x1e-1\n", .{msg}) catch {
+        const min = "ERR\x1e-1\n";
+        const n = @min(min.len, buf.len);
+        @memcpy(buf[0..n], min[0..n]);
+        return n;
+    };
+    return r.len;
 }
 
 /// Send a control-plane reply. v2 (proto_version 2): every `OK`/`ERR` reply is FRAMED with
@@ -1501,10 +1523,13 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
             snap = probe.read(&buf);
         }
         ctx.vsdev.hostClose(id);
-        var ob: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&ob, "OK host->guest vsock: established; echo={d}B: {s}\n", .{ snap.len, buf[0..snap.len] }) catch "OK host->guest vsock established\n";
-        _ = writeAll(c, msg);
-        _ = ctx.meter.bytes_out.fetchAdd(msg.len, .release);
+        // The echoed bytes are UNTRUSTED (a guest process controls them), so HEX-encode them:
+        // interpolated raw they could carry a 0x1e and forge the reply frame. reply() then
+        // frames the line (0x1e0\n) like every other ack. (audit: __vsockprobe__ frame hole -
+        // it was the one reply path that emitted guest bytes unframed and unescaped.)
+        var ob: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&ob, "OK host->guest vsock: established; echo={d}B: {x}\n", .{ snap.len, buf[0..snap.len] }) catch "OK host->guest vsock established\n";
+        reply(c, msg);
         probe.clear();
         return;
     }
