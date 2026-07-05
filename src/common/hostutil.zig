@@ -39,7 +39,8 @@ pub const libc = struct {
     pub extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
     pub extern "c" fn socketpair(domain: c_int, ty: c_int, proto: c_int, fds: *[2]c_int) c_int;
     // Canonicalize a path (resolving symlinks/.. ) so file transfers can be confined
-    // to a jail directory. `resolved` must hold at least PATH_MAX (1024) bytes.
+    // to a jail directory. `resolved` must hold at least PATH_MAX bytes - 1024 on macOS but
+    // 4096 on Linux (realpath writes the full canonical path); callers size buffers for 4096.
     pub extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
     // Signal disposition: handler passed as an integer (SIG_IGN) or a function address
     // (@intFromPtr of a C-callconv handler). Return is the previous handler, ignored.
@@ -281,7 +282,10 @@ pub fn createTruncNoFollow(path: [*:0]const u8) c_int {
         .TRUNC = 0o001000,
         .NOFOLLOW = 0o400000,
     };
-    return libc.open(path, flags.WRONLY | flags.CREAT | flags.TRUNC | flags.NOFOLLOW, @as(c_int, 0o644));
+    // 0o600: a guest file pulled to the host jail (or a written snapshot) is owner-only, not
+    // world-readable - the transfer is confined to the owner-uid-gated socket, so its output
+    // should not leak to other local users.
+    return libc.open(path, flags.WRONLY | flags.CREAT | flags.TRUNC | flags.NOFOLLOW, @as(c_int, 0o600));
 }
 
 /// Flush a MAP_SHARED mapping (a persistent virtio-blk disk) to its backing file, so a

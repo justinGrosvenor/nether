@@ -1053,7 +1053,7 @@ pub const ControlCtx = struct {
     active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // File-transfer jail, pinned once at listener start (not per call) so the jail
     // can't move if the process cwd ever changes. Empty until set => fail closed.
-    xfer_root_buf: [1024]u8 = undefined,
+    xfer_root_buf: [PATH_MAX]u8 = undefined,
     xfer_root_len: usize = 0,
 
     fn xferRoot(self: *const ControlCtx) []const u8 {
@@ -1064,6 +1064,11 @@ pub const ControlCtx = struct {
 /// Max bytes a single `__put__`/`__get__` moves. Bounds host memory and frames the
 /// guest-side payload; large enough for typical task payloads/artifacts.
 const MAX_XFER: usize = 16 * 1024 * 1024;
+
+/// realpath destination / jailed-path buffer size. Must be >= the platform PATH_MAX, which
+/// is 1024 on macOS but 4096 on Linux - realpath writes the full CANONICAL path here (which
+/// can exceed a short input), so a 1024 buffer overflows the stack on the Linux/KVM build.
+const PATH_MAX: usize = 4096;
 
 /// Send `data` to the guest agent, retrying as its staging ring drains (hostSend
 /// accepts only what fits). Returns false if the connection dies mid-send.
@@ -1110,13 +1115,13 @@ fn within(root: []const u8, path: []const u8) bool {
 /// re-attach a validated basename. Returns a NUL-terminated absolute path inside
 /// the jail in `out`, or null if it escapes or is malformed. An empty `root` (the
 /// jail was never established) fails closed.
-fn jailedPath(out: *[1024]u8, root: []const u8, req: []const u8, creating: bool) ?[*:0]const u8 {
+fn jailedPath(out: *[PATH_MAX]u8, root: []const u8, req: []const u8, creating: bool) ?[*:0]const u8 {
     if (root.len == 0) return null;
     if (req.len == 0 or req.len + 1 > out.len) return null;
 
-    var rb: [1024]u8 = undefined;
+    var rb: [PATH_MAX]u8 = undefined;
     if (!creating) {
-        var tb: [1024]u8 = undefined;
+        var tb: [PATH_MAX]u8 = undefined;
         const reqz = cpath(&tb, req) orelse return null;
         const real_c = libc.realpath(reqz, &rb) orelse return null;
         const real = std.mem.span(real_c);
@@ -1131,7 +1136,7 @@ fn jailedPath(out: *[1024]u8, root: []const u8, req: []const u8, creating: bool)
     const dir = if (slash) |s| (if (s == 0) "/" else req[0..s]) else ".";
     const base = if (slash) |s| req[s + 1 ..] else req;
     if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
-    var tb: [1024]u8 = undefined;
+    var tb: [PATH_MAX]u8 = undefined;
     const dirz = cpath(&tb, dir) orelse return null;
     const rdir_c = libc.realpath(dirz, &rb) orelse return null;
     const rdir = std.mem.span(rdir_c);
@@ -1152,7 +1157,7 @@ fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const sp = std.mem.indexOfScalar(u8, args, ' ') orelse return reply(c, "ERR bad __put__ (need <hostpath> <guestpath>)\n");
     const hostpath = std.mem.trim(u8, args[0..sp], " \t\r\n");
     const guestpath = std.mem.trim(u8, args[sp + 1 ..], " \t\r\n");
-    var pb: [1024]u8 = undefined;
+    var pb: [PATH_MAX]u8 = undefined;
     const hp = jailedPath(&pb, ctx.xferRoot(), hostpath, false) orelse return reply(c, "ERR host path outside transfer dir\n");
     const data = readFileMac(ctx.allocator, hp) catch return reply(c, "ERR cannot read host file\n");
     defer ctx.allocator.free(data);
@@ -1190,7 +1195,7 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     if (!waitCapture(&cap) or cap.err) return reply(c, "ERR guest read failed (missing?)\n");
     const body = cap.buf[cap.body_off..cap.expect];
 
-    var pb: [1024]u8 = undefined;
+    var pb: [PATH_MAX]u8 = undefined;
     const hp = jailedPath(&pb, ctx.xferRoot(), hostpath, true) orelse return reply(c, "ERR host path outside transfer dir\n");
     // O_NOFOLLOW: jailedPath confirmed the path is inside the jail, but it only resolved
     // the parent dir - refuse a pre-existing symlink at the basename that would redirect
@@ -1403,7 +1408,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         const snapr = ctx.snapshot orelse return reply(c, "ERR snapshot not supported on this backend\n");
         const arg = if (std.mem.startsWith(u8, line, "__snapshot__ ")) std.mem.trim(u8, line["__snapshot__ ".len..], " \r\n") else "";
         const req = if (arg.len == 0) "nether.snap" else arg;
-        var pbuf: [1024]u8 = undefined;
+        var pbuf: [PATH_MAX]u8 = undefined;
         const jailed = jailedPath(&pbuf, ctx.xferRoot(), req, true) orelse return reply(c, "ERR snapshot path outside the transfer jail\n");
         if (ctx.journal) |j| j.emit(.life, "snapshot requested");
         const ok = snapr.call(jailed);
@@ -1639,7 +1644,13 @@ fn clientThread(ctx: *ControlCtx, c: c_int) void {
     hostutil.setSendTimeout(c, RELAY_STALL_TIMEOUT_MS);
     // Claim the primary slot if it is free; otherwise serve as an observer.
     const is_primary = ctx.client.cmpxchgStrong(-1, c, .acq_rel, .acquire) == null;
-    defer if (is_primary) ctx.client.store(-1, .release);
+    // Release the primary slot on exit, but ONLY if we still hold it: a cmpxchg (not a bare
+    // store) so a thread whose slot was already reclaimed - e.g. by the relay wedge-drop
+    // (which uses the same cmpxchg at controlRelay), after which a new primary claimed it -
+    // does not clobber that successor's claim (which would leave it a hung "ghost" primary).
+    defer if (is_primary) {
+        _ = ctx.client.cmpxchgStrong(c, -1, .acq_rel, .acquire);
+    };
     if (is_primary) {
         if (ctx.agent.renders) |rm| rm.resetDiff(); // a fresh primary gets a full screen first
         if (ctx.gpu) |g| g.resetFrameDiff(); // ...and a full framebuffer first
@@ -2079,11 +2090,11 @@ test "transfer jail (jailedPath) confines real paths, incl symlink escapes" {
     _ = c.symlink("/etc/hosts", escape); // escapes to a real file outside the jail
 
     // The jail root is the canonical path (/tmp is a symlink to /private/tmp on macOS).
-    var rootbuf: [1024]u8 = undefined;
+    var rootbuf: [PATH_MAX]u8 = undefined;
     const root_c = libc.realpath(jail, &rootbuf) orelse return error.SkipZigTest;
     const root = std.mem.span(root_c);
 
-    var out: [1024]u8 = undefined;
+    var out: [PATH_MAX]u8 = undefined;
     // Read of a file inside the jail -> accepted.
     try testing.expect(jailedPath(&out, root, inside, false) != null);
     // Read through a symlink that escapes the jail -> rejected (realpath resolves out).
@@ -2130,9 +2141,9 @@ test "create-write refuses a symlink at the basename (no jail escape via O_NOFOL
     _ = libc.close(tfd);
     if (c.symlink(target, evil) != 0) return error.SkipZigTest;
 
-    var root: [1024]u8 = undefined;
+    var root: [PATH_MAX]u8 = undefined;
     const root_c = libc.realpath(jail, &root) orelse return error.SkipZigTest;
-    var out: [1024]u8 = undefined;
+    var out: [PATH_MAX]u8 = undefined;
     // jailedPath ACCEPTS the path string (basename is a plain name inside the jail)...
     const hp = jailedPath(&out, std.mem.span(root_c), evil, true) orelse return error.SkipZigTest;
     // ...but the create-write open refuses to follow the symlink (ELOOP -> fd < 0).
@@ -2145,7 +2156,7 @@ test "create-write refuses a symlink at the basename (no jail escape via O_NOFOL
     try testing.expectEqualStrings("PRECIOUS", data);
 
     // A normal create inside the jail still works through the same helper.
-    var gout: [1024]u8 = undefined;
+    var gout: [PATH_MAX]u8 = undefined;
     const gp = jailedPath(&gout, std.mem.span(root_c), good, true) orelse return error.SkipZigTest;
     const gfd = hostutil.createTruncNoFollow(gp);
     try testing.expect(gfd >= 0);
