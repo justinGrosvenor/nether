@@ -357,6 +357,11 @@ pub const AgentCtx = struct {
     /// relay thread to forward to the connected control client. -1 = REPL mode
     /// (parse and print to stdout instead).
     pipe_w: i32 = -1,
+    /// A reference to the ControlCtx primary-client slot, so the device (vCPU) thread can
+    /// drop a WEDGED client when the pipe fills (a non-reading primary). Set in startControl;
+    /// null in REPL/pre-control modes. See pipePush - this keeps a wedged reader from ever
+    /// blocking the vCPU behind a full pipe (audit finding: wedged reader stalls the guest).
+    client: ?*std.atomic.Value(i32) = null,
     /// When set, agent reply bytes are diverted into this capture (file transfer)
     /// instead of relayed/printed. Set/cleared by the control thread.
     capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
@@ -437,6 +442,44 @@ pub const AgentCtx = struct {
         }
     }
 
+    /// Push agent reply bytes into the relay pipe WITHOUT ever blocking the vCPU. The pipe is
+    /// non-blocking (set in startControl); a healthy control client drains it in microseconds.
+    /// On a full pipe we poll briefly for space - backpressure, so a momentarily-slow but
+    /// healthy client catches up and NEVER loses output - and only if the pipe stays full do we
+    /// drop the wedged client (which unblocks the relay to resume draining) and retry. So a
+    /// wedged reader stalls the vCPU at most ~PIPE_WEDGE_MS, not the relay's full 5s.
+    fn pipePush(a: *AgentCtx, bytes: []const u8) void {
+        if (a.pipe_w < 0) return;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const w = libc.write(a.pipe_w, bytes[off..].ptr, bytes.len - off);
+            if (w > 0) {
+                off += @intCast(w);
+                continue;
+            }
+            // Full pipe (EAGAIN): brief backpressure so a healthy client catches up, no loss.
+            const p1 = hostutil.pollRW(a.pipe_w, true, PIPE_WEDGE_MS);
+            if (p1 >= 0 and (p1 & 2) != 0) continue; // space freed: retry
+            if (p1 < 0) return; // pipe hangup
+            // Still full: the reader is wedged. Drop it so the relay resumes draining, retry
+            // once; if it is somehow still stuck, drop the rest rather than stall the vCPU.
+            a.dropClient();
+            const p2 = hostutil.pollRW(a.pipe_w, true, PIPE_WEDGE_MS);
+            if (!(p2 >= 0 and (p2 & 2) != 0)) return;
+        }
+    }
+
+    /// Drop the primary control client (a wedged reader): clear the slot if we still hold it
+    /// and shutdown the fd so the relay's blocked write fails and it resumes draining. Uses
+    /// cmpxchg so it never clobbers a fresh primary that already reclaimed the slot.
+    fn dropClient(a: *AgentCtx) void {
+        const slot = a.client orelse return;
+        const c = slot.load(.acquire);
+        if (c >= 0 and slot.cmpxchgStrong(c, -1, .acq_rel, .acquire) == null) {
+            hostutil.shutdownRdwr(c);
+        }
+    }
+
     /// Relay agent reply bytes to the control client (pipe_w) with a per-command
     /// output cap. Body bytes past `max_output` are dropped (with a one-time notice),
     /// but the trailer (0x1e<exit>\n) is always forwarded so the client still gets the
@@ -465,15 +508,15 @@ pub const AgentCtx = struct {
                     a.cmd_truncated = false;
                 }
             } else {
-                if (i > span) _ = writeAll(a.pipe_w, bytes[span..i]); // flush forwarded run
+                if (i > span) a.pipePush(bytes[span..i]); // flush forwarded run
                 if (!a.cmd_truncated) {
                     a.cmd_truncated = true;
-                    _ = writeAll(a.pipe_w, "\n...[output capped]\n");
+                    a.pipePush("\n...[output capped]\n");
                 }
                 span = i + 1; // skip the suppressed byte
             }
         }
-        if (bytes.len > span) _ = writeAll(a.pipe_w, bytes[span..bytes.len]);
+        if (bytes.len > span) a.pipePush(bytes[span..bytes.len]);
     }
 
     fn commitPending(a: *AgentCtx, exit: i32) void {
@@ -574,7 +617,7 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             a.auditRecv(r.bytes); // observe exit codes for the command audit log
             if (a.pipe_w >= 0) {
                 if (a.max_output == 0) {
-                    _ = libc.write(a.pipe_w, r.bytes.ptr, r.bytes.len); // -> relay -> control client
+                    a.pipePush(r.bytes); // -> relay -> control client (non-blocking)
                 } else a.relayCapped(r.bytes); // govern: bound a runaway command's output
             } else a.onRecv(r.bytes);
         },
@@ -1050,6 +1093,11 @@ pub const ControlCtx = struct {
     // and receives the agent relay stream. Additional connections are read-only
     // observers (host-intercepted queries only); -1 = no primary.
     client: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    // Bumped every time a client claims the primary slot. The relay reads it to detect a
+    // primary handoff: if a NEW primary claims while a command's output is still streaming,
+    // the relay skips the departed primary's tail (to the next 0x1e trailer boundary) so the
+    // leftover does not desync the new primary's session (audit finding: relay tail leak).
+    client_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // File-transfer jail, pinned once at listener start (not per call) so the jail
     // can't move if the process cwd ever changes. Empty until set => fail closed.
@@ -1535,6 +1583,10 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
         std.debug.print("[control] pipe() failed; control socket disabled\n", .{});
         return;
     }
+    // Non-blocking write end: the device (vCPU) thread pushes agent output here and must
+    // NEVER block on a full pipe behind a wedged reader (pipePush handles EAGAIN). The read
+    // end stays blocking - the relay thread parks on it between commands.
+    hostutil.setNonblock(pipe[1]);
     o.agent.pipe_w = pipe[1];
     ctl.* = .{
         .vsdev = o.vsdev,
@@ -1550,6 +1602,7 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
         .probe = o.probe,
         .info = o.info,
     };
+    o.agent.client = &ctl.client; // so the device thread can drop a wedged primary
     if (std.Thread.spawn(.{}, controlListener, .{ctl})) |t| t.detach() else |_| {}
     if (std.Thread.spawn(.{}, controlRelay, .{ctl})) |t| t.detach() else |_| {}
 }
@@ -1559,12 +1612,22 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
 /// bounds an accidental fan-out, not an attacker.
 const MAX_CLIENTS: u32 = 8;
 
-/// How long a write to a control client may block on a full socket buffer before the
-/// client is judged wedged and dropped. The control socket is local IPC, so a healthy
-/// client drains in microseconds; only a consumer that stops reading for this long (and
-/// would otherwise stall the relay -> pipe -> agent -> vCPU chain, freezing the guest)
-/// trips it. Generous, since the cost of a false positive is just a forced reconnect.
-const RELAY_STALL_TIMEOUT_MS: u32 = 5_000;
+/// How long a write to a control client may block on a full socket buffer before the relay
+/// judges the client wedged and drops it. This is the worst-case window the pipe can stay
+/// full (and thus the vCPU/device thread can be starved on the D3 lock behind it), so it is
+/// kept SHORT: the control socket is local IPC drained at GB/s, and the pipe + socket buffers
+/// (~320 KiB) already absorb any transient slowness, so a client still >320 KiB behind after
+/// this long has genuinely stopped reading. The device's non-blocking pipePush bounds the
+/// common case even tighter (~PIPE_WEDGE_MS); this is the robust backstop when a shutdown
+/// fails to wake the relay's blocked write (macOS does not reliably interrupt it).
+const RELAY_STALL_TIMEOUT_MS: u32 = 500;
+
+/// How long the device (vCPU) thread applies backpressure on a full relay pipe before it
+/// judges the reader wedged and drops it (pipePush). This is now the WORST-CASE vCPU stall a
+/// wedged reader can cause (previously up to RELAY_STALL_TIMEOUT_MS): short, since a healthy
+/// client drains the local-IPC pipe in microseconds, so a full pipe for this long means the
+/// reader has genuinely stopped. The relay's SO_SNDTIMEO drop is the backstop.
+const PIPE_WEDGE_MS: i32 = 100;
 
 pub fn controlListener(ctx: *ControlCtx) void {
     const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1644,6 +1707,10 @@ fn clientThread(ctx: *ControlCtx, c: c_int) void {
     hostutil.setSendTimeout(c, RELAY_STALL_TIMEOUT_MS);
     // Claim the primary slot if it is free; otherwise serve as an observer.
     const is_primary = ctx.client.cmpxchgStrong(-1, c, .acq_rel, .acquire) == null;
+    // A fresh primary bumps the relay generation: if the previous primary left a command's
+    // output still streaming, the relay skips that tail (to the next trailer) so it does not
+    // land in this new primary's session and desync it.
+    if (is_primary) _ = ctx.client_gen.fetchAdd(1, .release);
     // Release the primary slot on exit, but ONLY if we still hold it: a cmpxchg (not a bare
     // store) so a thread whose slot was already reclaimed - e.g. by the relay wedge-drop
     // (which uses the same cmpxchg at controlRelay), after which a new primary claimed it -
@@ -1702,27 +1769,64 @@ fn clientThread(ctx: *ControlCtx, c: c_int) void {
 /// control client.
 pub fn controlRelay(ctx: *ControlCtx) void {
     var buf: [4096]u8 = undefined;
+    // Command-boundary tracking, so a primary handoff mid-command doesn't leak the departed
+    // primary's tail into the next primary's session. A raw 0x1e marks a trailer (the agent
+    // escapes body bytes, so a 0x1e never appears in output), then digits, then \n.
+    var in_trailer = false; // between a raw 0x1e and its \n
+    var mid_command = false; // output has streamed since the last completed trailer
+    var skipping = false; // discarding a departed primary's tail until the next trailer
+    var my_gen = ctx.client_gen.load(.acquire);
     while (true) {
         const n = libc.read(ctx.pipe_r, &buf, buf.len);
         if (n <= 0) return;
-        const c = ctx.client.load(.acquire);
-        if (c >= 0) {
-            const w = libc.write(c, buf[0..@intCast(n)].ptr, @intCast(n));
-            if (w == n) {
-                _ = ctx.meter.bytes_out.fetchAdd(@intCast(n), .release);
+        const bytes = buf[0..@intCast(n)];
+
+        // A new primary claimed the slot. If a command was still streaming, skip its tail to
+        // the next trailer boundary so this new primary starts clean (audit: relay tail leak).
+        const gen = ctx.client_gen.load(.acquire);
+        if (gen != my_gen) {
+            my_gen = gen;
+            if (mid_command) skipping = true;
+        }
+
+        // Scan the whole chunk to maintain trailer/command state; if skipping, find where the
+        // in-flight command's trailer ends and deliver only what follows.
+        var deliver_start: usize = 0;
+        for (bytes, 0..) |b, i| {
+            if (in_trailer) {
+                if (b == '\n') {
+                    in_trailer = false;
+                    mid_command = false;
+                    if (skipping) {
+                        skipping = false;
+                        deliver_start = i + 1; // discard through this trailer; deliver the rest
+                    }
+                }
+            } else if (b == 0x1e) {
+                in_trailer = true;
             } else {
-                // The primary is not draining: the SO_SNDTIMEO-bounded write returned
-                // short or failed, meaning the client has not read for RELAY_STALL_TIMEOUT_MS.
-                // Drop it so the relay keeps draining the pipe and the GUEST does not stall
-                // behind a wedged consumer. Clear the slot only if it is still this client
-                // (cmpxchg avoids clobbering a newly reconnected primary), and shutdown -
-                // not close - so its owner clientThread wakes, frees the fd, and the slot
-                // reopens for a fresh primary.
-                if (w > 0) _ = ctx.meter.bytes_out.fetchAdd(@intCast(w), .release);
-                _ = ctx.client.cmpxchgStrong(c, -1, .acq_rel, .acquire);
-                hostutil.shutdownRdwr(c);
-                std.debug.print("[control] primary client wedged (no read in {d}ms); dropped to keep the guest live\n", .{RELAY_STALL_TIMEOUT_MS});
+                mid_command = true;
             }
+        }
+        if (skipping) continue; // whole chunk was the departed primary's tail: discard
+
+        const out = bytes[deliver_start..];
+        if (out.len == 0) continue;
+        const c = ctx.client.load(.acquire);
+        if (c < 0) continue; // no primary: drain+discard (keeps the vCPU live)
+        const w = libc.write(c, out.ptr, out.len);
+        if (w == @as(isize, @intCast(out.len))) {
+            _ = ctx.meter.bytes_out.fetchAdd(out.len, .release);
+        } else {
+            // The primary is not draining (SO_SNDTIMEO-bounded write fell short): it stopped
+            // reading for RELAY_STALL_TIMEOUT_MS. Drop it (cmpxchg so a freshly reconnected
+            // primary is not clobbered; shutdown - not close - so its clientThread wakes and
+            // frees the fd) so the relay keeps draining. The device thread's pipePush drops a
+            // wedged reader even faster (~PIPE_WEDGE_MS), so this is a backstop.
+            if (w > 0) _ = ctx.meter.bytes_out.fetchAdd(@intCast(w), .release);
+            _ = ctx.client.cmpxchgStrong(c, -1, .acq_rel, .acquire);
+            hostutil.shutdownRdwr(c);
+            std.debug.print("[control] primary client wedged (no read in {d}ms); dropped to keep the guest live\n", .{RELAY_STALL_TIMEOUT_MS});
         }
     }
 }
