@@ -37,8 +37,12 @@ pub const HDR_LEN = 44;
 pub const MAX_PAYLOAD = 3072;
 const PKT_CAP = HDR_LEN + MAX_PAYLOAD;
 
-/// Outbound staging ring depth and connection table size. Fixed pools (no
-/// per-packet allocation) keep the engine snapshot-friendly.
+/// Outbound staging ring depth and connection table size. Fixed pools (no per-packet
+/// allocation) keep the engine snapshot-friendly. NOTE: these sizes are part of the snapshot
+/// ABI - `Vsock.State` is raw-copied into the snapshot and its `@sizeOf` is a layout
+/// fingerprint (snapshot.zig validateHeader), so changing any of them requires re-baking
+/// existing base snapshots (a restore of an old base then fails closed with a clear message,
+/// never a silent misrestore). See docs/snapshot-fork-driveability.md "Format / compatibility".
 const OUT_RING = 64;
 pub const MAX_CONNS = 64;
 const MAX_LISTEN = 16;
