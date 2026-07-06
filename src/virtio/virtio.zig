@@ -56,6 +56,11 @@ pub const Device = struct {
     bar1: u32 = 0,
     probe_lo: bool = false,
     probe_hi: bool = false,
+    // The BAR base nether pre-assigned; the bus routes MMIO to THIS (mmio() snapshots it once).
+    // If the guest reprograms the BAR elsewhere the routing no longer covers the device, which
+    // fails SILENTLY - so warn once (below). Modern PVH guests keep the pre-assigned BAR.
+    assigned_base: u64 = 0,
+    bar_move_warned: bool = false,
 
     device_feature_select: u32 = 0,
     driver_feature_select: u32 = 0,
@@ -180,9 +185,18 @@ pub const Device = struct {
     pub fn assignBar(self: *Device, base: u64) void {
         self.bar0 = @as(u32, @truncate(base)) & 0xFFFFFFF0;
         self.bar1 = @truncate(base >> 32);
+        self.assigned_base = self.barBase(); // the base the bus routes to
     }
     pub fn barBase(self: *Device) u64 {
         return (@as(u64, self.bar1) << 32) | (self.bar0 & 0xFFFFFFF0);
+    }
+    /// Warn (once) if the guest has reprogrammed the BAR off nether's pre-assigned base: the
+    /// bus's captured MMIO range no longer covers this device, so its config/notify writes go
+    /// nowhere - a SILENT failure. Turns "device mysteriously never set up" into a clear log.
+    fn warnBarMove(self: *Device) void {
+        if (self.assigned_base == 0 or self.bar_move_warned or self.barBase() == self.assigned_base) return;
+        self.bar_move_warned = true;
+        std.debug.print("[virtio] WARNING: guest moved BAR 0x{x}->0x{x}; MMIO routing not updated, device may be unreachable (modern PVH guests keep the pre-assigned BAR)\n", .{ self.assigned_base, self.barBase() });
     }
 
     /// Pointer-free snapshot of a Device's mutable transport state. The live
@@ -239,6 +253,7 @@ pub const Device = struct {
         self.isr = s.isr;
         self.bar0 = s.bar0;
         self.bar1 = s.bar1;
+        self.assigned_base = self.barBase(); // a fork's bus re-routes to the restored base
         self.config = s.config;
         self.queues = s.queues;
         self.qenable = s.qenable;
@@ -313,6 +328,7 @@ pub const Device = struct {
                 self.bar0 = value & 0xFFFFFFF0;
                 self.probe_lo = false;
                 trace.log("bar0=0x{x}", .{self.bar0});
+                self.warnBarMove();
             }
         } else if (size == 4 and reg == 0x14) {
             if (value == 0xFFFFFFFF) self.probe_hi = true else {
@@ -323,6 +339,7 @@ pub const Device = struct {
                 // (mmio() snapshots barBase() once) no longer covers the device and
                 // its config writes go nowhere - a candidate for "net never set up".
                 trace.log("bar64=0x{x}", .{(@as(u64, self.bar1) << 32) | self.bar0});
+                self.warnBarMove();
             }
         } else if (reg == cap_msix + 2) {
             // MSI-X message control: bit 15 enable, bit 14 function mask.
@@ -543,6 +560,39 @@ test "config space exposes a modern virtio function" {
 
     dev.commonWrite(0x00, 1);
     try std.testing.expectEqual(@as(u32, 1), dev.commonRead(0x04)); // VERSION_1 in high dword
+}
+
+test "virtio warns once when the guest moves a BAR off the assigned base" {
+    var ram = [_]u8{0} ** 64;
+    const Noop = struct {
+        fn notify(p: *anyopaque, d: *Device, q: u16) void {
+            _ = p;
+            _ = d;
+            _ = q;
+        }
+        fn cfg(p: *anyopaque, o: u16, s: u8) u32 {
+            _ = p;
+            _ = o;
+            _ = s;
+            return 0;
+        }
+    };
+    var dummy: u8 = 0;
+    var dev = Device.init(.{ .ptr = &dummy, .device_id = 4, .num_queues = 1, .device_features = 0, .notify = Noop.notify, .config_read = Noop.cfg }, .{ .bytes = &ram, .base = 0 });
+
+    dev.assignBar(0x8000_0000_0000); // pre-assigned 64-bit base (bar0 low=0, bar1 high=0x8000)
+    // Normal PCI enumeration: the guest re-programs the SAME base (low then high) -> no move.
+    dev.cfgWrite(0x10, 4, 0x0000_0000);
+    dev.cfgWrite(0x14, 4, 0x0000_8000);
+    try std.testing.expect(!dev.bar_move_warned);
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000), dev.barBase());
+
+    // The guest MOVES the BAR (reprograms the high dword elsewhere) -> flagged exactly once,
+    // and a further move does not re-warn (the warning is one-shot).
+    dev.cfgWrite(0x14, 4, 0x0000_9000);
+    try std.testing.expect(dev.bar_move_warned);
+    dev.cfgWrite(0x10, 4, 0x0001_0000);
+    try std.testing.expect(dev.bar_move_warned);
 }
 
 test "device transport state round-trips through export/import" {

@@ -85,6 +85,15 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
 
     const safe = quiesceSafe(sn, ctx.ram, ctx.handles, n, 200);
     std.debug.print("[nether] snapshot quiesce: {s}\n", .{if (safe) "all vCPUs idle at WFI (consistent)" else "best-effort (some vCPU not idle)"});
+    // Fail closed on a non-quiescent guest: a base snapshot captured while a vCPU is mid-
+    // instruction (not parked at WFI) can bake inconsistent CPU/device state that every fork
+    // then inherits. A base is a fork source, so refuse by default - resuming the guest first
+    // so it is not left parked. `snapshot_allow_dirty=1` opts into the old best-effort capture.
+    if (!safe and !conf.confBool("snapshot_allow_dirty")) {
+        std.debug.print("[nether] snapshot: guest not quiescent; refusing (set snapshot_allow_dirty=1 to override).\n", .{});
+        sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+        return false;
+    }
     const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
     // Capture the GIC state, sized to the framework's actual state. If this fails (or is
     // implausibly large), ABORT - a snapshot with no GIC state restores a broken interrupt
