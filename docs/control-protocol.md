@@ -309,6 +309,7 @@ app_port = 8080                 # the tenant's ORDINARY loopback TCP port inside
 data_socket = /run/nether/<id>.data.sock   # host Unix socket the platform proxies to
 max_data_conns = 48             # optional cap on concurrent data-plane conns (<= 48)
 data_idle_ms = 30000            # optional: reap a conn idle (both ways) this long (0 = off)
+data_rate_kbps = 8000           # optional per-VM data-plane bandwidth cap (0 = unlimited)
 ```
 
 `app_port` makes `/init` start the in-guest forwarder (it bridges guest vsock:5001 to
@@ -326,9 +327,16 @@ the in-guest server (the guest stops sending) instead of blocking the vCPU - los
 the vCPU never waits on the consumer. A slow or silent
 guest server (accepts, then goes quiet) is reaped after `data_idle_ms` of two-way idleness,
 so it cannot tie up a conn slot; the govern cap refuses excess conns (backpressure) rather
-than unbounded fan-out. Data-plane traffic also counts as sandbox activity, so a VM busy
-only with proxied requests is not idle-reclaimed. `__info__` reports `data_plane`,
-`app_port`, `max_data_conns`, `data_idle_ms`; `__stats__` and the bill report `data_conns` +
+than unbounded fan-out. `data_rate_kbps` sets a **per-VM aggregate upstream bandwidth cap**: a
+token bucket paces the guest->host delivery across all of a VM's data conns, and because we
+credit the guest only on delivery, pacing delivery paces the guest's send (it stalls at its
+256 KiB window) - so a flooding tenant is throttled to the cap **without dropping bytes**,
+and the cap is per-VM (each VM has its own bucket, so one tenant's flood cannot affect
+another). Verified live on HVF (`scripts/data_plane_pacing.py`): an 8 MiB transfer paces to
+~1 MB/s under an 8000-kbps cap vs ~850 MB/s uncapped, byte-for-byte lossless. Data-plane
+traffic also counts as sandbox activity, so a VM busy only with proxied requests is not
+idle-reclaimed. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
+`data_idle_ms`, `data_rate_kbps`; `__stats__` and the bill report `data_conns` +
 `data_ms` (plus the shared `bytes_in`/`bytes_out`). A snapshot **fork inherits** `app_port`
 (on the cmdline), so a warmed base with the tenant server already running forks into an
 instantly-serving VM. Verified live on HVF: concurrent host connections reach an ordinary

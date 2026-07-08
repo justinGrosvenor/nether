@@ -860,6 +860,8 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 const mdc = conf.confGetInt("max_data_conns", 0);
                 if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
                 data_bridge.idle_ms = conf.confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
+                const drk = conf.confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
+                if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
                 vs_router.bridge = &data_bridge;
                 have_bridge = true;
             }
@@ -908,6 +910,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 // Advertise the data plane on a fork too (mirror boot), so a pool supervisor's
                 // __info__ readiness check sees data_plane=on/app_port for a warm, serving fork.
                 .app_port = @intCast(conf.confGetInt("app_port", 0)),
+                .max_data_conns = conf.confGetInt("max_data_conns", 0),
+                .data_idle_ms = conf.confGetInt("data_idle_ms", 0),
+                .data_rate_kbps = conf.confGetInt("data_rate_kbps", 0),
             },
         });
 

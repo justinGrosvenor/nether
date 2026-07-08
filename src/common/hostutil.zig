@@ -68,6 +68,13 @@ pub fn shutdownRdwr(fd: c_int) void {
     _ = libc.shutdown(fd, 2); // SHUT_RDWR (2 on macOS and Linux)
 }
 
+/// Half-close only the READ side (SHUT_RD = 0 on macOS and Linux): a blocked poll/read wakes
+/// with EOF, but the WRITE side stays open so any buffered tail can still be delivered. Used
+/// for a graceful guest close so the delivery ring flushes losslessly before the fd closes.
+pub fn shutdownRd(fd: c_int) void {
+    _ = libc.shutdown(fd, 0);
+}
+
 /// Non-blocking partial send: returns the bytes accepted (0 on EAGAIN or error). Requires
 /// the fd to be O_NONBLOCK (setNonblock) - on macOS AF_UNIX, MSG_DONTWAIT alone is NOT
 /// honored. Used by the data-plane bridge to deliver without ever blocking the vCPU thread.

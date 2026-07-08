@@ -1112,6 +1112,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .app_port = @intCast(confGetInt("app_port", 0)),
                 .max_data_conns = confGetInt("max_data_conns", 0),
                 .data_idle_ms = confGetInt("data_idle_ms", 0),
+                .data_rate_kbps = confGetInt("data_rate_kbps", 0),
             },
         });
     }
@@ -1128,6 +1129,8 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             const mdc = confGetInt("max_data_conns", 0);
             if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
             data_bridge.idle_ms = confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
+            const drk = confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
+            if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
             vs_router.bridge = &data_bridge;
             data_bridge.start();
         }

@@ -145,6 +145,7 @@ pub const SandboxInfo = struct {
     app_port: u32 = 0, // tenant loopback port bridged via the data plane (0 = no data plane) (3b)
     max_data_conns: u64 = 0, // cap on concurrent data-plane conns (0 = engine default)
     data_idle_ms: u64 = 0, // per-conn data-plane idle reap (0 = disabled)
+    data_rate_kbps: u64 = 0, // per-VM data-plane bandwidth cap (0 = unlimited)
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -170,6 +171,7 @@ pub const SandboxInfo = struct {
             \\app_port={d}
             \\max_data_conns={d}
             \\data_idle_ms={d}
+            \\data_rate_kbps={d}
             \\{c}0
             \\
         , .{
@@ -191,6 +193,7 @@ pub const SandboxInfo = struct {
             self.app_port,
             self.max_data_conns,
             self.data_idle_ms,
+            self.data_rate_kbps,
             @as(u8, 0x1e),
         }) catch return framedErr(buf, "ERR report render failed")).len;
     }
@@ -751,9 +754,18 @@ pub const DataBridge = struct {
     max_conns: usize = MAX_BRIDGE, // govern cap on concurrent data-plane conns (<= MAX_BRIDGE)
     idle_ms: u64 = 0, // per-conn idle timeout (data_idle_ms; 0 = disabled): reap slow/leaked conns
     window: u32 = WINDOW, // per-conn vsock RX window == delivery-buffer capacity
+    // Per-VM data-plane bandwidth cap (govern): a token bucket over the guest->host DELIVERY
+    // to the consumer, shared across all data conns. Because delivery credits the guest on
+    // delivery, pacing delivery paces the guest's send (it stalls at the 256 KiB window), so
+    // a flooding tenant is capped without dropping bytes. 0 = unlimited. rate_bps bytes/sec.
+    rate_bps: u64 = 0,
+    pace_lock: Lock = .{},
+    tokens: i64 = 0, // available delivery budget (bytes); refilled at rate_bps
+    pace_ms: i64 = 0, // last token refill time
 
     pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
     pub const WINDOW: u32 = 256 * 1024; // guest in-flight bound == per-conn delivery buffer size
+    const PACE_TICK_MS = 20; // pump pacing granularity under a rate cap (smooth + no busy-spin)
     const State = enum { connecting, established, dead };
     const Entry = struct {
         active: bool = false,
@@ -786,18 +798,56 @@ pub const DataBridge = struct {
         return true;
     }
 
+    /// Take up to `want` bytes of delivery budget from the per-VM token bucket, refilling by
+    /// elapsed time at rate_bps first. Returns the granted amount (== want when unlimited).
+    /// The bucket is shared across all data conns, so both the device thread (tryEvent) and
+    /// the pump threads call this - hence pace_lock.
+    fn takeTokens(self: *DataBridge, want: usize) usize {
+        if (self.rate_bps == 0) return want; // unlimited: no pacing
+        self.pace_lock.lock();
+        defer self.pace_lock.unlock();
+        const now = nowMs();
+        if (now > self.pace_ms) {
+            const add = @divFloor((now - self.pace_ms) * @as(i64, @intCast(self.rate_bps)), 1000);
+            self.tokens += add;
+            self.pace_ms = now;
+            const burst: i64 = @intCast(self.rate_bps / 5); // cap accrual at ~200ms of rate
+            if (self.tokens > burst) self.tokens = burst;
+        }
+        if (self.tokens <= 0) return 0;
+        const grant = @min(want, @as(usize, @intCast(self.tokens)));
+        self.tokens -= @intCast(grant);
+        return grant;
+    }
+
+    /// Return budget taken but not spent (e.g. the unix socket filled before we sent it all).
+    fn returnTokens(self: *DataBridge, n: usize) void {
+        if (self.rate_bps == 0 or n == 0) return;
+        self.pace_lock.lock();
+        defer self.pace_lock.unlock();
+        self.tokens += @intCast(n);
+    }
+
     /// Drain a conn's ring to its unix socket with NON-BLOCKING sends (caller holds the
-    /// lock). Returns the bytes delivered, which the caller credits back to the guest.
-    fn bufDrain(e: *Entry) usize {
+    /// lock). Returns the bytes delivered, which the caller credits back to the guest. Under
+    /// a rate cap the drain is bounded by the per-VM token bucket: the excess stays buffered
+    /// (the pump flushes it as tokens refill), and since we credit only what we deliver, the
+    /// guest stalls at its 256 KiB window - so a flooding tenant is paced, not dropped.
+    fn bufDrain(self: *DataBridge, e: *Entry, paced: bool) usize {
         var delivered: usize = 0;
         while (e.bc > 0 and e.unix_fd >= 0) {
             const run = @min(e.bc, e.buf.len - e.bh); // contiguous span from the head
-            const n = hostutil.trySend(e.unix_fd, e.buf[e.bh..][0..run]);
+            // Teardown flush passes paced=false: the guest is already gone (no flood to pace,
+            // no crediting), so we must deliver the tail unthrottled and not risk truncating it.
+            const grant = if (paced) self.takeTokens(run) else run;
+            if (grant == 0) break; // rate cap reached: leave the rest buffered (paced)
+            const n = hostutil.trySend(e.unix_fd, e.buf[e.bh..][0..grant]);
+            if (paced and n < grant) self.returnTokens(grant - n); // unsent budget back to the bucket
             if (n == 0) break; // unix full (or error); the pump retries on POLLOUT
             e.bh = (e.bh + n) % e.buf.len;
             e.bc -= n;
             delivered += n;
-            if (n < run) break; // partial: socket is full
+            if (n < run) break; // partial: socket is full (or token-capped)
         }
         return delivered;
     }
@@ -856,7 +906,7 @@ pub const DataBridge = struct {
                     e.state = .dead; // window violated (should be impossible): drop
                     if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
                 } else {
-                    const delivered = bufDrain(e);
+                    const delivered = self.bufDrain(e, true);
                     if (delivered > 0) {
                         self.vsdev.engine.creditRecv(e.vsock_id, @intCast(delivered)); // inline, under D3
                         if (self.meter) |m| _ = m.bytes_out.fetchAdd(delivered, .release);
@@ -865,7 +915,17 @@ pub const DataBridge = struct {
                     if (self.meter) |m| m.touch(); // data-plane traffic = sandbox activity
                 }
             },
-            .shutdown, .reset => {
+            .shutdown => {
+                // Graceful guest FIN: the delivery ring may still hold a tail (up to a full
+                // window under a rate cap). Half-close only our READ side so the blocked pump
+                // wakes on read-EOF and runs teardown, whose flush delivers that tail over the
+                // still-open WRITE side before closing - lossless. (Full shutdown here would
+                // drop the tail, which pacing exposed by keeping the ring full at close.)
+                e.state = .dead;
+                if (e.unix_fd >= 0) hostutil.shutdownRd(e.unix_fd);
+            },
+            .reset => {
+                // Abort: drop whatever is buffered and tear down immediately.
                 e.state = .dead;
                 if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd); // wake the blocked pump
             },
@@ -906,7 +966,7 @@ pub const DataBridge = struct {
         // consumer can't hang teardown; the guest is already gone, so no crediting is needed.
         var budget: u32 = 0;
         while (e.bc > 0 and e.unix_fd >= 0 and budget < 500) : (budget += 1) {
-            if (bufDrain(&e) > 0) continue;
+            if (self.bufDrain(&e, false) > 0) continue;
             if (hostutil.pollRW(e.unix_fd, true, 10) < 0) break; // consumer gone / error
         }
         if (self.meter) |m| _ = m.data_ms.fetchAdd(@intCast(@max(0, nowMs() - e.start_ms)), .release);
@@ -1007,13 +1067,18 @@ pub const DataBridge = struct {
             }
             if (pr & 2 != 0) { // socket writable -> drain the delivery buffer
                 self.lock.lock();
-                const delivered = if (self.conns[slot].active) bufDrain(&self.conns[slot]) else 0;
+                const delivered = if (self.conns[slot].active) self.bufDrain(&self.conns[slot], true) else 0;
                 if (delivered > 0 and self.conns[slot].active) self.conns[slot].last_ms = nowMs();
+                const backlog = self.conns[slot].active and self.conns[slot].bc > 0;
                 self.lock.unlock();
                 if (delivered > 0) {
                     self.vsdev.hostCredit(e.vsock_id, @intCast(delivered)); // D3, no bridge lock held
                     if (self.meter) |m| _ = m.bytes_out.fetchAdd(delivered, .release);
                 }
+                // Under a rate cap the socket stays writable while the token bucket is empty, so
+                // a re-poll would return POLLOUT instantly and busy-spin. Sleep one pacing tick
+                // to let tokens refill; this is also what smooths delivery to ~rate_bps.
+                if (self.rate_bps != 0 and backlog) _ = usleep(PACE_TICK_MS * 1000);
             }
         }
         self.teardown(slot);
@@ -1901,6 +1966,7 @@ test "data-plane delivery ring is byte-exact across many wraparounds" {
     hostutil.setSendBuf(fds[1], 4 << 20); // hold the whole test's bytes without a reader
 
     var ring: [64]u8 = undefined; // small -> forces frequent wraparound
+    var br = DataBridge{ .vsdev = undefined, .path = undefined }; // rate_bps=0: unlimited (no pacing)
     var e = DataBridge.Entry{ .active = true, .unix_fd = fds[1], .buf = &ring };
     var expected: [80 * 1024]u8 = undefined;
     var elen: usize = 0;
@@ -1918,9 +1984,9 @@ test "data-plane delivery ring is byte-exact across many wraparounds" {
         try testing.expect(DataBridge.bufAppend(&e, chunk[0..n]));
         @memcpy(expected[elen..][0..n], chunk[0..n]);
         elen += n;
-        _ = DataBridge.bufDrain(&e); // opportunistic non-blocking drain (like the device thread)
+        _ = br.bufDrain(&e, true); // opportunistic non-blocking drain (like the device thread)
     }
-    while (e.bc > 0) if (DataBridge.bufDrain(&e) == 0) break; // final flush (like teardown)
+    while (e.bc > 0) if (br.bufDrain(&e, false) == 0) break; // final flush (like teardown)
 
     var got: [80 * 1024]u8 = undefined;
     var glen: usize = 0;
