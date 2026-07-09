@@ -75,12 +75,28 @@ pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
 pub extern fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) hv_return_t;
 pub extern fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *u64) hv_return_t;
 
+/// The vCPU's virtual-timer offset (CNTVOFF): guest CNTVCT = host counter - offset.
+/// This is Apple's dedicated API - CNTVOFF_EL2 via hv_vcpu_get/set_sys_reg returns
+/// HV_UNSUPPORTED (0xfae9400f, probed on macOS 15/M-series), which is why restoring
+/// it through the sys-reg list was silently ineffective. Units are raw CNTPCT ticks
+/// at 24 MHz, the same clock mach_absolute_time() returns on Apple Silicon (timebase
+/// 125/3 ns per tick; verified empirically: a fresh vCPU has offset 0 and reads
+/// CNTVCT == mach_absolute_time). Owning-thread-only, like the other vcpu calls.
+pub extern fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: *u64) hv_return_t;
+pub extern fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: u64) hv_return_t;
+
+/// mach_absolute_time: raw CNTPCT ticks on Apple Silicon (the host side of the
+/// vtimer-offset arithmetic above). Declared here with the other libSystem externs.
+pub extern "c" fn mach_absolute_time() u64;
+
 /// The EL1 execution-context system registers captured/restored by a snapshot
 /// (values from <Hypervisor/hv_vcpu_types.h>). This covers the MMU (SCTLR, TTBR0/1,
 /// TCR, MAIR/AMAIR), exception state (SPSR/ELR/ESR/FAR/VBAR), stacks (SP_EL0/1),
-/// thread pointers, the cache-select, pointer-auth key, and the virtual timer
-/// (CNTV_CTL/CVAL/KCTL + CNTVOFF, which rebases the guest's view of the counter so
-/// time is continuous across restore). MPIDR is set at vCPU creation, not here.
+/// thread pointers, the cache-select, pointer-auth key, and the virtual-timer
+/// comparator (CNTV_CTL/CVAL + CNTKCTL). NOTE: CNTVOFF_EL2 stays in the list for
+/// layout stability but both get and set return HV_UNSUPPORTED through the sys-reg
+/// API - counter continuity across restore is done with hv_vcpu_set_vtimer_offset
+/// instead (see the vtimer externs below). MPIDR is set at vCPU creation, not here.
 pub const SNAPSHOT_SYS_REGS = [_]hv_sys_reg_t{
     0xc080, // SCTLR_EL1
     0xc082, // CPACR_EL1

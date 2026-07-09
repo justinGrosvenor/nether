@@ -151,7 +151,11 @@ fn captureImpl(ctx: *SnapCtx, path: [*:0]const u8, resume_after: bool) bool {
     // Write while still quiesced (consistent image). Resume only when this is a live
     // capture (or the write failed - a failed park must leave a usable sandbox); a PARK
     // leaves the vCPUs quiesced so the snapshot is the guest's final live moment.
-    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK);
+    // The guest's virtual-counter value at the quiesce, published by cpu0 from its
+    // owning thread. Stored in the header so a restore resumes the guest count exactly
+    // here (vtimer continuity: a parked guest does not observe the parked wall time).
+    const cntvct_snap = sn.cntvct.load(.acquire);
+    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK, cntvct_snap);
     if (resume_after or !ok) {
         sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
         std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
@@ -396,8 +400,9 @@ fn writeSnapshotFile(
     conn_id: i32, // surviving agent connection id (-1 if none)
     net_dev: ?nether.virtio.Device.DeviceState, // virtio-net transport state (null => no NIC)
     kind: u32, // SNAP_KIND_BASE or SNAP_KIND_PARK (the file's lifecycle contract)
+    cntvct: u64, // guest virtual-counter at capture (0 = unknown -> legacy restore)
 ) bool {
-    const ok = writeSnapshotBody(path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind);
+    const ok = writeSnapshotBody(path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind, cntvct);
     // Strict lifecycle: a failed write never leaves debris. A truncated snapshot would be
     // rejected on restore anyway, but a half-written full-RAM image (tenant secrets
     // frozen inside) must not linger on disk either.
@@ -419,6 +424,7 @@ fn writeSnapshotBody(
     conn_id: i32,
     net_dev: ?nether.virtio.Device.DeviceState,
     kind: u32,
+    cntvct: u64,
 ) bool {
     // O_NOFOLLOW: when the path comes from __snapshot__ it is jailed (parent resolved),
     // so refuse a pre-existing symlink at the basename that would redirect the write
@@ -464,6 +470,12 @@ fn writeSnapshotBody(
     std.mem.writeInt(u32, hdr[76..80], if (net) @as(u32, 1) else 0, .little);
     // Lifecycle kind: BASE (durable, forks many) or PARK (one-shot, consumed by its wake).
     std.mem.writeInt(u32, hdr[80..84], kind, .little);
+    // Guest virtual-counter (CNTVCT) at capture, for vtimer CONTINUITY on restore:
+    // the woken guest's count resumes exactly here, so armed timers keep their
+    // remaining duration and the guest monotonic clock never observes the parked
+    // wall time. Rides in reserved space (84..88 stays reserved zero); 0 = written
+    // by a build without the field (or no capture) -> restore skips the rebase.
+    std.mem.writeInt(u64, hdr[88..96], cntvct, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -498,6 +510,10 @@ const RestoreCtx = struct {
     go: *std.atomic.Value(bool),
     handles: [*]u64, // each secondary records its vCPU handle for the control-plane stop
     snap: *anyopaque, // *hvf_backend.SnapCtl: the quiesce rendezvous, so a FORK can re-park
+    // The orchestrator's ONE vtimer offset (host counter - captured CNTVCT), applied by
+    // each secondary from its OWNING thread after the sys-reg restore, so the guest's
+    // virtual counter resumes at its captured value on every core. 0 = legacy, skip.
+    vtimer_offset: u64,
 };
 
 fn macRestoreCpu(ctx: *RestoreCtx) void {
@@ -509,6 +525,9 @@ fn macRestoreCpu(ctx: *RestoreCtx) void {
     defer vcpu.deinit();
     const st: *const hvfb.CpuState = @ptrCast(@alignCast(ctx.state));
     vcpu.restore(st);
+    // AFTER restore(st): the sys-reg loop must not clobber the rebase (CNTVOFF_EL2
+    // through set_sys_reg is HV_UNSUPPORTED, but keep the order load-bearing anyway).
+    if (ctx.vtimer_offset != 0) _ = hvfb.setVtimerOffset(vcpu.handle, ctx.vtimer_offset);
     ctx.handles[ctx.id] = vcpu.handle; // for hv_vcpus_exit via the restore Stop
     _ = ctx.ready.fetchAdd(1, .release);
     while (!ctx.go.load(.acquire)) _ = usleep(200);
@@ -657,6 +676,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const saved_conn_id = std.mem.readInt(i32, hdr[72..76], .little);
     const net_present = std.mem.readInt(u32, hdr[76..80], .little) == 1;
     const snap_kind = std.mem.readInt(u32, hdr[80..84], .little);
+    // Guest CNTVCT at capture (0 = legacy snapshot without the field -> no rebase,
+    // the pre-continuity behavior: the guest clock jumps by the parked wall time).
+    const cntvct_at_capture = std.mem.readInt(u64, hdr[88..96], .little);
 
     // The RAM region is mapped copy-on-write by offset (not read), so a file that is
     // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
@@ -728,11 +750,21 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     // This keeps the restore lazy (no 512 MiB page-in).
     _ = hvf;
 
+    // Virtual-timer CONTINUITY: compute ONE offset so the guest counter resumes
+    // exactly at its captured value (the system counter is global - one offset serves
+    // all vCPUs, and sharing the exact value keeps their counters perfectly agreed).
+    // Each vCPU applies it from its OWNING thread after its sys-reg restore: cpu0
+    // inline below, secondaries in macRestoreCpu via RestoreCtx. 0 = legacy snapshot,
+    // skip (the guest clock then jumps by the parked wall time, as before this field).
+    const vtimer_offset: u64 = if (cntvct_at_capture != 0) hvfb.hostCounterNow() -% cntvct_at_capture else 0;
+
     // Recreate vCPUs with their captured contexts. cpu0 is this thread; the rest
     // each create/restore on their own thread (HVF binds a vCPU to its creator).
     var vcpu = try vm.createVcpu(0);
     defer vcpu.deinit();
     vcpu.restore(&cpus[0]);
+    if (vtimer_offset != 0 and hvfb.setVtimerOffset(vcpu.handle, vtimer_offset))
+        std.debug.print("[nether] restore: vtimer continuity - guest counter resumes at its captured value (cntvct={d}, offset={d})\n", .{ cntvct_at_capture, vtimer_offset });
 
     var power = nether.Power{};
     var bus = nether.Bus{};
@@ -744,7 +776,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var rc: [hvfb.MAX_SNAP_CPUS]RestoreCtx = undefined;
     var s: u32 = 1;
     while (s < num_cpus) : (s += 1) {
-        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go, .handles = &handles, .snap = &snapctl };
+        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go, .handles = &handles, .snap = &snapctl, .vtimer_offset = vtimer_offset };
         (std.Thread.spawn(.{}, macRestoreCpu, .{&rc[s]}) catch return).detach();
     }
     while (ready.load(.acquire) < num_cpus - 1) _ = usleep(200); // all redistributors exist (+ handles recorded)
@@ -1112,6 +1144,16 @@ test "snapshot header validation gates version, layout, and oversized sizes" {
     try validateHeader(&kh, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK);
     std.mem.writeInt(u32, kh[80..84], 2, .little); // unknown kind
     try testing.expectError(error.BadSnapshot, validateHeader(&kh, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
+
+    // Guest-CNTVCT-at-capture (hdr[88..96], vtimer continuity): any value is a valid
+    // counter reading - present (nonzero) and legacy (zero, pre-field snapshots) both
+    // pass, and bytes 84..88 stay reserved zero padding either way.
+    var th = hdr;
+    std.mem.writeInt(u64, th[88..96], 26_728_953_033_380, .little); // a real 24MHz tick count
+    try validateHeader(&th, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK);
+    std.mem.writeInt(u64, th[88..96], 0, .little); // legacy: no capture -> restore skips the rebase
+    try validateHeader(&th, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, th[84..88], .little)); // 84..88 reserved
 
     var bad = hdr;
     std.mem.writeInt(u32, bad[0..4], 0xdead_beef, .little); // wrong magic

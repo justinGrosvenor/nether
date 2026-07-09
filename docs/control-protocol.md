@@ -409,6 +409,18 @@ and consumes on wake like any park. Verified live: `scripts/park_await_proof.py`
 full generations - the woken fork re-parks mid-recv() and its second wake completes both
 that recv() and preserves the first generation's state.
 
+**Guest time.** The guest's monotonic clock is CONTINUOUS across park/wake: the capture
+records the guest's virtual-counter value (CNTVCT) in the snapshot header and the wake
+rebases every vCPU's vtimer offset so the count resumes exactly there. A parked guest
+does not observe the parked wall time - `/proc/uptime` continues from its pre-park value,
+and a guest timer armed before the park fires with its REMAINING duration after wake
+(a `sleep 3` parked 1s in fires ~2s after wake, however long the park lasted). The same
+applies to a fork of a base: it resumes at the base's age. Wall-clock time (CLOCK_REALTIME)
+is a guest/NTP concern, not a counter concern - a woken guest that needs real time must be
+told it by the platform. Verified live: `scripts/park_timer_proof.py` (two generations).
+Legacy snapshots without the counter field restore with the old behavior (the guest clock
+jumps forward by the parked wall time).
+
 **Guest entropy.** Nether seeds the guest crng at boot via a `/chosen rng-seed` DTB
 property (64 bytes of host entropy; omitted fail-closed if the host has none). Without
 it a quiet microVM needs ~10s of jitter accumulation before `getrandom()` unblocks -

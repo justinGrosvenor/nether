@@ -197,7 +197,46 @@ pub const SnapCtl = struct {
     phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SnapPhase.running)),
     parked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     cpu: [MAX_SNAP_CPUS]CpuState = [_]CpuState{.{}} ** MAX_SNAP_CPUS,
+    /// The guest's effective virtual-counter value (CNTVCT = host counter - vtimer
+    /// offset) at the moment of the last quiesce capture, published by cpu0 from its
+    /// owning thread (the vtimer-offset API is owning-thread-only). ONE canonical
+    /// value: the system counter is global, so cpu0's reading serves all vCPUs. The
+    /// snapshot writer stores it so a restore can resume the guest count exactly
+    /// here (timer continuity). 0 = not captured (legacy behavior on restore).
+    cntvct: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
+
+/// Guest CNTVCT as this vCPU sees it right now: host counter minus the vtimer
+/// offset (both in raw 24 MHz CNTPCT ticks on Apple Silicon; probed - see hvf.zig).
+/// Owning thread only. Falls back to the raw host counter if the offset API fails
+/// (offset stays 0 in that case, which is also HVF's default).
+pub fn guestCounterNow(handle: hvf.hv_vcpu_t) u64 {
+    var off: u64 = 0;
+    _ = hvf.hv_vcpu_get_vtimer_offset(handle, &off);
+    return hvf.mach_absolute_time() -% off;
+}
+
+/// Apply a precomputed vtimer offset to this vCPU (continuity across restore: the
+/// orchestrator computes ONE offset = host counter now - captured CNTVCT, and every
+/// vCPU applies that SAME value so their counters agree exactly - the system counter
+/// is global). Owning thread only; call AFTER the sys-reg restore so nothing
+/// re-orders behind it (CNTV_CTL/CVAL are comparator state, independent of the
+/// offset, and CNTVOFF_EL2 through the sys-reg path is HV_UNSUPPORTED anyway).
+/// Returns false (and logs) if HVF refused.
+pub fn setVtimerOffset(handle: hvf.hv_vcpu_t, offset: u64) bool {
+    const r = hvf.hv_vcpu_set_vtimer_offset(handle, offset);
+    if (r != hvf.HV_SUCCESS) {
+        std.debug.print("[nether] restore: hv_vcpu_set_vtimer_offset failed (0x{x}); guest clock will jump by the parked wall time\n", .{@as(u32, @bitCast(r))});
+        return false;
+    }
+    return true;
+}
+
+/// Host counter now, in the same raw-tick units as the vtimer offset (re-exported
+/// so the snapshot orchestrator can do the offset arithmetic without its own extern).
+pub fn hostCounterNow() u64 {
+    return hvf.mach_absolute_time();
+}
 
 /// Serialize the live GIC state into a freshly allocated buffer sized EXACTLY to the
 /// framework's reported state (caller frees). Returns null on any failure, so the caller
@@ -290,7 +329,12 @@ pub const Vcpu = struct {
             if (snap) |sn| {
                 const ph: SnapPhase = @enumFromInt(sn.phase.load(.acquire));
                 if (ph == .quiesce or ph == .restoring) {
-                    if (ph == .quiesce) sn.cpu[self.id] = self.capture() else self.restore(&sn.cpu[self.id]);
+                    if (ph == .quiesce) {
+                        sn.cpu[self.id] = self.capture();
+                        // cpu0 publishes the canonical guest counter value alongside its
+                        // register capture (owning-thread API; one value serves all vCPUs).
+                        if (self.id == 0) sn.cntvct.store(guestCounterNow(self.handle), .release);
+                    } else self.restore(&sn.cpu[self.id]);
                     _ = sn.parked.fetchAdd(1, .release);
                     while (@as(SnapPhase, @enumFromInt(sn.phase.load(.acquire))) != .resumed) std.atomic.spinLoopHint();
                     continue; // re-enter the guest with (possibly restored) state
