@@ -9,8 +9,8 @@
 # them is ~a-tenth-of-a-second from continuing exactly where it slept.
 import os, socket, subprocess, sys, time, threading, shutil, glob
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
-WORK = "/tmp/npkd"; RS = 0x1e
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
+WORK = os.environ.get("NETHER_WORK", "/tmp/npkd"); RS = 0x1e
 N = 10  # fleet size (each park file ~ram_mb, so N*512MB transient disk)
 
 def uc(p, to=30):

@@ -20,8 +20,8 @@
 #         (4) park->wake latency is reported.
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
-WORK = "/tmp/npk"  # AF_UNIX paths cap ~104B on macOS: keep it short
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
+WORK = os.environ.get("NETHER_WORK", "/tmp/npk")  # AF_UNIX paths cap ~104B on macOS: keep it short
 RS = 0x1e
 NONCE = "PARKED-REPLY-7f3a9c"    # the gen-1 parked reply
 NONCE2 = "PARKED-REPLY-GEN2-b41d" # the gen-2 parked reply (the RE-parked fork's)

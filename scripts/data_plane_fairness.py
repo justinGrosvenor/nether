@@ -7,7 +7,7 @@
 # (a guest-CPU artifact, not host vsock HOL - the whole point of this check is to tell them apart).
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = "/tmp/nfair"; RS = 0x1e
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = os.environ.get("NETHER_WORK", "/tmp/nfair"); RS = 0x1e
 
 def uc(p, to=30):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(to); s.connect(p); return s

@@ -6,7 +6,7 @@
 #     output and stops reading, the data plane (same device thread) stays responsive (~ms).
 import os, socket, subprocess, sys, time, shutil
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = "/tmp/nrelay"; RS = 0x1e
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = os.environ.get("NETHER_WORK", "/tmp/nrelay"); RS = 0x1e
 
 def uc(p, to=15):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(to); s.connect(p); return s

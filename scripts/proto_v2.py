@@ -8,10 +8,10 @@
 # same bytes; (5) the reference client nether-ctl speaks v2 and extracts exit codes.
 import os, socket, subprocess, sys, time, select, shutil
 
-NB = os.path.expanduser("~/nether")
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether")
 BIN = NB + "/zig-out/bin/nether"
 CTL = "/tmp/nether-ctl"
-WORK = "/tmp/nv2"
+WORK = os.environ.get("NETHER_WORK", "/tmp/nv2")
 RS = 0x1e
 
 def uconn(path, to=20):

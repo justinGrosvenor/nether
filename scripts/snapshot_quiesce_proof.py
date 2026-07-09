@@ -1,5 +1,5 @@
 import os,socket,subprocess,time,shutil
-NB=os.path.expanduser("~/nether");BIN=NB+"/zig-out/bin/nether";WORK="/tmp/nsnap";RS=0x1e
+NB=os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether");BIN=NB+"/zig-out/bin/nether";WORK="/tmp/nsnap";RS=0x1e
 def uc(p,to=15):
     s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(to);s.connect(p);return s
 def un(b):

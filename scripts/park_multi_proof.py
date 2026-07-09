@@ -7,8 +7,8 @@
 # proof and corrupt real traffic.
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
-WORK = "/tmp/npkm"; RS = 0x1e
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
+WORK = os.environ.get("NETHER_WORK", "/tmp/npkm"); RS = 0x1e
 TAGS = ["alpha", "bravo", "charlie", "delta"]  # one in-flight request per tag
 
 def uc(p, to=30):

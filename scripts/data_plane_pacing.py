@@ -10,7 +10,7 @@
 # another VM - that isolation is structural (separate process, separate bucket).
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = "/tmp/npace"; RS = 0x1e
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"; WORK = os.environ.get("NETHER_WORK", "/tmp/npace"); RS = 0x1e
 CAP_KBPS = 8000            # 8000 kbps * 125 = 1,000,000 B/s = 1.0 MB/s
 CAP_MBps = CAP_KBPS * 125 / 1e6
 BIG_MIB = 8               # /big streams a fixed 8 MiB so the transfer terminates and we can time it

@@ -14,11 +14,11 @@
 # Run: python3 scripts/pool_serve.py [N]      (requires a codesigned HVF nether binary)
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether")
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether")
 BIN = NB + "/zig-out/bin/nether"
 # AF_UNIX paths cap at ~104 bytes on macOS and a scratch path is longer, so the run dir
 # (which holds the control/data sockets) must live under a short path.
-WORK = "/tmp/nvp"
+WORK = os.environ.get("NETHER_WORK", "/tmp/nvp")
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 RAM_MB = 512  # >= the runtime-image RAM floor (a 64 MiB initramfs needs ~384; see main.zig guard)
 

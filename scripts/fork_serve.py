@@ -7,11 +7,11 @@
 # IID via CoW), with an independent request counter, while the parent keeps serving.
 import os, socket, subprocess, sys, time, threading, shutil
 
-NB = os.path.expanduser("~/nether")
+NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether")
 BIN = NB + "/zig-out/bin/nether"
 # AF_UNIX paths cap at ~104 bytes on macOS and the scratchpad prefix alone is ~93, so the
 # run dir (which holds the control/data sockets) must live under a short path.
-WORK = "/tmp/nfp"
+WORK = os.environ.get("NETHER_WORK", "/tmp/nfp")
 
 def sh_ready(): return os.path.exists(BIN)
 
