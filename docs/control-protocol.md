@@ -401,6 +401,14 @@ gaps). The `OK parked` reply carries the teardown bill in-band (same fields as
 `__stats__`), and the usual `final usage`/`x402 settlement` record still goes to stdout -
 one command, one exit code, no snapshot+kill dance, no lost bill.
 
+**Forks re-park.** A restored fork carries the same capture machinery as a fresh boot
+(`__snapshot__` and `__park__` both work on its control socket), so the full lifecycle
+loop closes: park -> wake -> serve -> park again, indefinitely. Each generation's park is
+self-contained (the capture reads through the fork's COW mapping), bills its own session,
+and consumes on wake like any park. Verified live: `scripts/park_await_proof.py` runs two
+full generations - the woken fork re-parks mid-recv() and its second wake completes both
+that recv() and preserves the first generation's state.
+
 **Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
 
 - **base** (`__snapshot__`): durable; forks many; re-bake on version drift.

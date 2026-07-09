@@ -23,7 +23,8 @@ import os, socket, subprocess, sys, time, threading, shutil
 NB = os.path.expanduser("~/nether"); BIN = NB + "/zig-out/bin/nether"
 WORK = "/tmp/npk"  # AF_UNIX paths cap ~104B on macOS: keep it short
 RS = 0x1e
-NONCE = "PARKED-REPLY-7f3a9c"
+NONCE = "PARKED-REPLY-7f3a9c"    # the gen-1 parked reply
+NONCE2 = "PARKED-REPLY-GEN2-b41d" # the gen-2 parked reply (the RE-parked fork's)
 
 def uc(p, to=30):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(to); s.connect(p); return s
@@ -98,8 +99,10 @@ class EgressBroker:
                     req = self.fresh.get(cid); self.resumed[cid] = True
                 if req is None:
                     self.errors.append("resume for unknown conn %d" % cid); c.close(); return
-                # The parked upstream's reply "arrives" into the revived conn.
-                c.sendall(("REPLY %s\n" % NONCE).encode())
+                # The parked upstream's reply "arrives" into the revived conn. Reply per
+                # REQUEST (not per conn id - ids can recur across park generations).
+                nonce = NONCE2 if b"/slow2" in req else NONCE
+                c.sendall(("REPLY %s\n" % nonce).encode())
                 # hold open; the guest closes its side when done
                 try: c.recv(4096)
                 except Exception: pass
@@ -127,6 +130,9 @@ QUICK = ("python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',909
 SLOW = ("python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',9090));"
         "s.sendall(b'GET /slow\\n');d=s.recv(65536);open('/tmp/reply','wb').write(d);print('done')\""
         " >/tmp/req.log 2>&1 &")
+SLOW2 = ("python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',9090));"
+         "s.sendall(b'GET /slow2\\n');d=s.recv(65536);open('/tmp/reply2','wb').write(d);print('done')\""
+         " >/tmp/req2.log 2>&1 &")
 
 def main():
     if not os.path.exists(BIN): print("FAIL: build %s first" % BIN); return 1
@@ -239,7 +245,48 @@ def main():
         else:
             fails.append("second wake of the consumed park did not fail cleanly (rc=%s, log=%r)" % (rc2, f2log[-200:]))
 
-        try: cmd(fs, "__shutdown__", 5)
+        # 8. GENERATION 2: the woken fork re-parks. New slow request from the SAME guest
+        #    (its gen-1 state intact), __park__ on the FORK's control socket, wake again,
+        #    and the second recv() completes too - the wake -> serve -> park-again loop.
+        cmd(fs, SLOW2, 10)
+        t0 = time.time()
+        while not any(b"/slow2" in v for v in broker.fresh.values()) and time.time() - t0 < 15:
+            time.sleep(0.05)
+        if not any(b"/slow2" in v for v in broker.fresh.values()):
+            fails.append("broker never saw the gen-2 slow request"); raise SystemExit
+        time.sleep(1.0)  # settle into recv()/WFI
+        rep2 = cmd(fs, "__park__ park2.snap", 90)
+        print("[gen2] re-park reply: %s" % rep2.strip()[:80])
+        if not rep2.startswith("OK parked"): fails.append("fork __park__ failed: %r" % rep2)
+        try:
+            rcf = fp.wait(timeout=10)
+            if rcf != 0: fails.append("fork park exit code %s != 0" % rcf)
+        except subprocess.TimeoutExpired:
+            fails.append("fork did not exit after __park__"); fp.kill()
+        snap2 = os.path.join(fork, "park2.snap")
+        fork3 = os.path.join(WORK, "f3"); os.makedirs(fork3)
+        open(os.path.join(fork3, "nether.conf"), "w").write(
+            "restore=1\nrestore_from=%s\ncontrol_socket=f3.sock\negress_socket=%s\n" % (snap2, esock))
+        t_r2 = time.time()
+        f3 = launch(fork3, "fork3.log"); procs.append(f3)
+        f3sk = os.path.join(fork3, "f3.sock")
+        while not os.path.exists(f3sk) and time.time() - t_r2 < 30: time.sleep(0.05)
+        f3s = uc(f3sk)
+        got2 = ""
+        while time.time() - t_r2 < 25:
+            got2 = cat(f3s, "/tmp/reply2")
+            if NONCE2 in got2: break
+            time.sleep(0.1)
+        print("[gen2] guest /tmp/reply2: %r (wake2 %.3fs)" % (got2, time.time() - t_r2))
+        if NONCE2 not in got2: fails.append("gen-2 recv() did not complete (got %r)" % got2)
+        # Gen-1 state carried through BOTH parks: the first reply is still in the guest.
+        got1 = cat(f3s, "/tmp/reply")
+        if NONCE not in got1: fails.append("gen-1 reply lost across re-park (got %r)" % got1)
+        else: print("[gen2] gen-1 reply still present in the twice-parked guest (state carried)")
+        if os.path.exists(snap2): fails.append("park2.snap not consumed by wake2")
+        else: print("[gen2] park2.snap consumed: the lifecycle holds across generations")
+
+        try: cmd(f3s, "__shutdown__", 5)
         except Exception: pass
     except SystemExit: pass
     finally:
@@ -257,7 +304,8 @@ def main():
     print("RESULT: PASS - ordinary blocking guest code parked mid-recv() via ONE __park__ command")
     print("(quiesce, ring-gate, capture, bill in-band, self-exit 0, never resumed); upstream held by")
     print("the platform; the wake completed the SAME recv() AND consumed the one-shot park file")
-    print("(second wake refused). Park-while-awaiting-upstream with a strict lifecycle.")
+    print("(second wake refused). Then the WOKEN FORK re-parked and woke again (generation 2),")
+    print("its second recv() completing with gen-1 state intact: wake -> serve -> park-again closes.")
     return 0
 
 if __name__ == "__main__":

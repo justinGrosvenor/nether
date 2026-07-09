@@ -497,6 +497,7 @@ const RestoreCtx = struct {
     ready: *std.atomic.Value(u32),
     go: *std.atomic.Value(bool),
     handles: [*]u64, // each secondary records its vCPU handle for the control-plane stop
+    snap: *anyopaque, // *hvf_backend.SnapCtl: the quiesce rendezvous, so a FORK can re-park
 };
 
 fn macRestoreCpu(ctx: *RestoreCtx) void {
@@ -511,7 +512,9 @@ fn macRestoreCpu(ctx: *RestoreCtx) void {
     ctx.handles[ctx.id] = vcpu.handle; // for hv_vcpus_exit via the restore Stop
     _ = ctx.ready.fetchAdd(1, .release);
     while (!ctx.go.load(.acquire)) _ = usleep(200);
-    _ = vcpu.runSmp(ctx.bus, ctx.power, null, null) catch {};
+    // The SnapCtl makes the fork re-parkable: __snapshot__/__park__ on a woken fork use
+    // the same self-capture rendezvous as a fresh boot (wake -> serve -> park again).
+    _ = vcpu.runSmp(ctx.bus, ctx.power, null, @ptrCast(@alignCast(ctx.snap))) catch {};
 }
 
 /// The HVF guest stop for the restore path, adapted to `platform.Stop`: request a
@@ -735,12 +738,13 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var bus = nether.Bus{};
     var handles: [hvfb.MAX_SNAP_CPUS]u64 = undefined; // vCPU handles for the control-plane stop
     handles[0] = vcpu.handle;
+    var snapctl = hvfb.SnapCtl{}; // quiesce rendezvous: a woken fork can re-park (__park__/__snapshot__)
     var ready = std.atomic.Value(u32).init(0);
     var go = std.atomic.Value(bool).init(false);
     var rc: [hvfb.MAX_SNAP_CPUS]RestoreCtx = undefined;
     var s: u32 = 1;
     while (s < num_cpus) : (s += 1) {
-        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go, .handles = &handles };
+        rc[s] = .{ .vm = &vm, .id = s, .bus = &bus, .power = &power, .state = &cpus[s], .ready = &ready, .go = &go, .handles = &handles, .snap = &snapctl };
         (std.Thread.spawn(.{}, macRestoreCpu, .{&rc[s]}) catch return).detach();
     }
     while (ready.load(.acquire) < num_cpus - 1) _ = usleep(200); // all redistributors exist (+ handles recorded)
@@ -906,6 +910,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var data_sock_buf: [256]u8 = undefined;
     var egress_sock_buf: [256]u8 = undefined;
     var have_bridge = false;
+    var fork_snap_ctx: SnapCtx = undefined; // fork re-park capture context (control-mode only)
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
     if (ctl_present) {
@@ -978,6 +983,31 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
             slirp_stack.journal = &core.journal;
         }
 
+        // Re-park support: the fork gets the same capture machinery as a fresh boot, so
+        // the wake -> serve -> park-again loop closes. The vCPUs run with the SnapCtl
+        // rendezvous (snapctl above); this SnapCtx points at the fork's own recreated
+        // devices/engine. RAM is the COW mapping - the capture reads through it, so the
+        // new file is fully self-contained (a re-park does not depend on the consumed
+        // parent park staying around, beyond this process's own mapping).
+        fork_snap_ctx = .{
+            .allocator = allocator,
+            .ram = ram,
+            .handles = handles[0..num_cpus],
+            .num_cpus = num_cpus,
+            .snap = &snapctl,
+            .con_dev = &con_dev,
+            .blk_dev = &blk_dev,
+            // Mirror boot: a file-backed persistent disk is NOT captured (the file is the
+            // persistence); the in-memory disk is.
+            .blk_disk = if (blk_is_file) blk.disk[0..0] else blk.disk,
+            .uart = &uart,
+            .vs_dev = &vs_dev,
+            .vsock = vs_engine,
+            .agent = &core.agent,
+            .net_dev = if (net_present) &net_dev else null,
+            .bridge = if (have_bridge) &data_bridge else null,
+        };
+
         var sock_path_buf: [256]u8 = undefined;
         const have_sock_conf = conf.confGet("control_socket", &sock_path_buf) != null;
         const ctl_path: [*:0]const u8 = if (have_sock_conf) @ptrCast(&sock_path_buf) else "/tmp/nether.sock";
@@ -989,6 +1019,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
             .journal = &core.journal,
             .gpu = null, // gpu state is not part of the snapshot
             .stop = .{ .ctx = &hvf_stop, .func = RestoreStop.call },
+            .snapshot = .{ .ctx = &fork_snap_ctx, .func = snapshotCall },
+            .park = .{ .ctx = &fork_snap_ctx, .func = parkCall },
+            .bridge = if (have_bridge) &data_bridge else null,
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
@@ -1038,7 +1071,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     }
 
     go.store(true, .release); // release secondaries; run cpu0
-    const reason = vcpu.runSmp(&bus, &power, null, null) catch |err| {
+    const reason = vcpu.runSmp(&bus, &power, null, &snapctl) catch |err| {
         std.debug.print("\n[nether] forked guest stopped: {s}\n", .{@errorName(err)});
         return err;
     };
