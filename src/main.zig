@@ -833,13 +833,20 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // to the host data plane (docs/park-concurrency-plan.md 3b). /init starts /forwarder when set.
     var appport_buf: [16]u8 = undefined;
     const app_port: []const u8 = confGet("app_port", &appport_buf) orelse "";
-    const cmdline: [:0]const u8 = std.fmt.bufPrintZ(&cmdline_buf, "{s}{s}{s}{s}{s}{s}", .{
+    // `nether.egress_port=<n>`: the loopback port the forwarder's REVERSE mode listens on
+    // in the guest - the tenant's ordinary outbound conns to it become guest->host vsock
+    // conns bridged to the platform's egress_socket (the egress plane).
+    var egport_buf: [16]u8 = undefined;
+    const egress_port: []const u8 = confGet("egress_port", &egport_buf) orelse "";
+    const cmdline: [:0]const u8 = std.fmt.bufPrintZ(&cmdline_buf, "{s}{s}{s}{s}{s}{s}{s}{s}", .{
         base_cmdline,
         if (runas.len > 0) " nether.run_as=" else "",
         runas,
         if (disk_fresh) " nether.disk_fresh=1" else "",
         if (app_port.len > 0) " nether.app_port=" else "",
         app_port,
+        if (egress_port.len > 0) " nether.egress_port=" else "",
+        egress_port,
     }) catch base_cmdline;
 
     var dtb_buf: [16 * 1024]u8 = undefined;
@@ -1113,6 +1120,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .max_data_conns = confGetInt("max_data_conns", 0),
                 .data_idle_ms = confGetInt("data_idle_ms", 0),
                 .data_rate_kbps = confGetInt("data_rate_kbps", 0),
+                .egress = blk: {
+                    var b: [256]u8 = undefined;
+                    const v: []const u8 = confGet("egress_socket", &b) orelse "";
+                    break :blk v.len > 0;
+                },
             },
         });
     }
@@ -1123,17 +1135,30 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // concurrent upstream. Wire the router to it BEFORE start() so its conn events route here.
     var data_bridge: control.DataBridge = undefined;
     var data_sock_buf: [256]u8 = undefined;
-    if (confGet("data_socket", &data_sock_buf)) |ds| {
-        if (ds.len > 0) {
-            data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter, .alloc = allocator };
-            const mdc = confGetInt("max_data_conns", 0);
-            if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
-            data_bridge.idle_ms = confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
-            const drk = confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
-            if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
-            vs_router.bridge = &data_bridge;
-            data_bridge.start();
+    var egress_sock_buf: [256]u8 = undefined;
+    const ds_conf: []const u8 = confGet("data_socket", &data_sock_buf) orelse "";
+    // Egress plane: `egress_socket` is a PLATFORM-owned unix listener nether DIALS, one
+    // conn per guest-initiated vsock conn to EGRESS_VSOCK_PORT (the in-guest forwarder's
+    // reverse mode bridges the tenant's ordinary outbound loopback conns there). The vsock
+    // conn is pure in-memory state, so it SURVIVES a snapshot - the basis of
+    // park-while-awaiting-upstream (the platform holds the real upstream TCP socket).
+    const es_conf: []const u8 = confGet("egress_socket", &egress_sock_buf) orelse "";
+    if (ds_conf.len > 0 or es_conf.len > 0) {
+        data_bridge = .{ .vsdev = &vsdev, .path = if (ds_conf.len > 0) @ptrCast(&data_sock_buf) else "", .meter = &core.meter, .alloc = allocator };
+        const mdc = confGetInt("max_data_conns", 0);
+        if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
+        data_bridge.idle_ms = confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
+        const drk = confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
+        if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
+        if (es_conf.len > 0) {
+            data_bridge.egress_path = @ptrCast(&egress_sock_buf);
+            // Accepted egress conns get a bounded window + credit-on-delivery, so the
+            // bridge's fixed ring backpressures a flooding guest (mirror of the data plane).
+            _ = vsdev.hostListenWindow(control.EGRESS_VSOCK_PORT, data_bridge.window);
         }
+        vs_router.bridge = &data_bridge;
+        snap_ctx.bridge = &data_bridge; // snapshot-time honesty: flag undelivered ring bytes
+        data_bridge.start();
     }
 
     // Host stdin: in agent-REPL mode it drives the guest agent (stdin -> sandbox

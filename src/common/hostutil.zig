@@ -19,6 +19,7 @@ pub const libc = struct {
     // Unix-domain control socket + a pipe to relay the guest agent's replies.
     pub extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
     pub extern "c" fn bind(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
+    pub extern "c" fn connect(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
     pub extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
     pub extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
     pub extern "c" fn unlink(path: [*:0]const u8) c_int;

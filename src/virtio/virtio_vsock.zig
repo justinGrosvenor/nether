@@ -176,6 +176,14 @@ pub const Vsock = struct {
     conns: [MAX_CONNS]Conn = [_]Conn{.{}} ** MAX_CONNS,
     listen_ports: [MAX_LISTEN]u32 = [_]u32{0} ** MAX_LISTEN, // 0 = unused slot
 
+    // Accept-side flow-control policy (host config, deliberately NOT in State - the setup
+    // code re-applies it on restore): conns the GUEST opens to this host port get a bounded
+    // receive window + credit-on-delivery, so a bridge with a fixed delivery ring can
+    // backpressure the guest. Mirror of connectWindow for host-dialed conns. Must take
+    // effect in onRequest BEFORE the RESPONSE header goes out (it advertises buf_alloc).
+    accept_defer_port: u32 = 0, // 0 = no port gets the treatment
+    accept_defer_window: u32 = 0,
+
     out: [OUT_RING]OutPkt = [_]OutPkt{.{}} ** OUT_RING,
     out_head: usize = 0,
     out_tail: usize = 0,
@@ -254,6 +262,10 @@ pub const Vsock = struct {
             .peer_buf_alloc = h.buf_alloc,
             .peer_fwd_cnt = h.fwd_cnt,
         };
+        if (self.accept_defer_port != 0 and h.dst_port == self.accept_defer_port) {
+            c.buf_alloc = self.accept_defer_window; // advertised in the RESPONSE below
+            c.defer_credit = true; // the bridge credits only as it DELIVERS
+        }
         self.sendCtl(c, Op.RESPONSE);
         self.fire(.{ .accept = id });
     }
@@ -658,6 +670,33 @@ pub const VsockDev = struct {
         return self.engine.listen(port);
     }
 
+    /// Listen on a host port whose ACCEPTED conns get a bounded window + deferred credit
+    /// (the egress bridge: guest-dialed conns delivered through a fixed ring). Config is
+    /// not snapshot state - the restore path re-calls this.
+    pub fn hostListenWindow(self: *VsockDev, port: u32, window: u32) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.engine.accept_defer_port = port;
+        self.engine.accept_defer_window = window;
+        return self.engine.listen(port);
+    }
+
+    /// Collect the ids of established conns on host port `port` (restore rehydration:
+    /// parked egress conns survive the snapshot and need their host side re-attached).
+    pub fn hostConnsOnPort(self: *VsockDev, port: u32, out: []u16) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        for (&self.engine.conns, 0..) |*c, i| {
+            if (n == out.len) break;
+            if (c.state == .established and c.host_port == port) {
+                out[n] = @intCast(i);
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     pub fn hostConnect(self: *VsockDev, host_port: u32, guest_port: u32) ?u16 {
         self.lock.lock();
         const id = self.engine.connect(host_port, guest_port);
@@ -1039,6 +1078,35 @@ test "engine state round-trips so a forked connection survives" {
     try testing.expectEqual(Op.RW, hdrs[n - 1].op);
     // And the connection accepts a fresh host send post-import.
     try testing.expectEqual(@as(usize, 4), vs2.send(id, "pong"));
+}
+
+test "accept-window policy bounds guest conns on the configured port only" {
+    var vs = Vsock{ .guest_cid = 3 };
+    var rec = Recorder{};
+    defer rec.deinit();
+    vs.on_event = Recorder.sink;
+    vs.on_event_ctx = &rec;
+    _ = vs.listen(5000);
+    _ = vs.listen(5002);
+    vs.accept_defer_port = 5002; // the egress plane's policy (hostListenWindow)
+    vs.accept_defer_window = 256 * 1024;
+    var pbuf: [HDR_LEN]u8 = undefined;
+    // A conn to the configured port gets the bounded window + deferred credit...
+    vs.rx(guestPkt(&pbuf, .{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 60, .dst_port = 5002, .op = Op.REQUEST, .buf_alloc = 65536 }, &.{}));
+    const eg = vs.findConn(5002, 60).?;
+    try testing.expectEqual(@as(u32, 256 * 1024), vs.conns[eg].buf_alloc);
+    try testing.expect(vs.conns[eg].defer_credit);
+    // ...and the RESPONSE advertised exactly that window to the guest.
+    var hdrs: [4]Hdr = undefined;
+    const n = drainHdrs(&vs, &hdrs);
+    try testing.expect(n >= 1);
+    try testing.expectEqual(Op.RESPONSE, hdrs[n - 1].op);
+    try testing.expectEqual(@as(u32, 256 * 1024), hdrs[n - 1].buf_alloc);
+    // A conn to a DIFFERENT listened port keeps the defaults (auto-credit, big window).
+    vs.rx(guestPkt(&pbuf, .{ .src_cid = 3, .dst_cid = HOST_CID, .src_port = 61, .dst_port = 5000, .op = Op.REQUEST, .buf_alloc = 65536 }, &.{}));
+    const ag = vs.findConn(5000, 61).?;
+    try testing.expectEqual(DEFAULT_BUF_ALLOC, vs.conns[ag].buf_alloc);
+    try testing.expect(!vs.conns[ag].defer_credit);
 }
 
 test "validState rejects a corrupt staging ring (no OOB on import)" {

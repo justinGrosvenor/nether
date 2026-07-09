@@ -146,6 +146,7 @@ pub const SandboxInfo = struct {
     max_data_conns: u64 = 0, // cap on concurrent data-plane conns (0 = engine default)
     data_idle_ms: u64 = 0, // per-conn data-plane idle reap (0 = disabled)
     data_rate_kbps: u64 = 0, // per-VM data-plane bandwidth cap (0 = unlimited)
+    egress: bool = false, // egress plane: guest outbound conns bridged to egress_socket
 
     /// Render the info report (+ the agent's 0x1e<exit>\n framing) into `buf`.
     fn report(self: *const SandboxInfo, buf: []u8) usize {
@@ -172,6 +173,7 @@ pub const SandboxInfo = struct {
             \\max_data_conns={d}
             \\data_idle_ms={d}
             \\data_rate_kbps={d}
+            \\egress_plane={s}
             \\{c}0
             \\
         , .{
@@ -194,6 +196,7 @@ pub const SandboxInfo = struct {
             self.max_data_conns,
             self.data_idle_ms,
             self.data_rate_kbps,
+            onOff(self.egress),
             @as(u8, 0x1e),
         }) catch return framedErr(buf, "ERR report render failed")).len;
     }
@@ -730,6 +733,15 @@ pub const VsockRouter = struct {
 /// this; the forwarder relays to the tenant's loopback server. Must match tools/forwarder.c.
 const FWD_VSOCK_PORT: u32 = 5001;
 
+/// The egress plane's HOST-side vsock listen port (guest-dialed; agent 5000, data plane
+/// 5001). The in-guest forwarder's reverse mode bridges a tenant's ordinary OUTBOUND
+/// loopback conn (127.0.0.1:egress_port) to a guest->host vsock conn on this port; the
+/// host side splices it to the platform's `egress_socket` unix listener. Because the
+/// vsock conn is pure in-memory state it SURVIVES a snapshot, which is what makes
+/// park-while-awaiting-upstream possible (the platform holds the real TCP socket; a
+/// restored fork resumes the guest's blocked recv()). Must match tools/forwarder.c.
+pub const EGRESS_VSOCK_PORT: u32 = 5002;
+
 /// Host-side data-plane bridge (Phase 2 step 2b, docs/park-concurrency-plan.md 3b): a
 /// Unix-domain listener swerver connects to. Each accepted connection is spliced to a
 /// fresh host->guest vsock stream to the in-guest forwarder, which relays to the tenant's
@@ -762,6 +774,13 @@ pub const DataBridge = struct {
     pace_lock: Lock = .{},
     tokens: i64 = 0, // available delivery budget (bytes); refilled at rate_bps
     pace_ms: i64 = 0, // last token refill time
+    // Egress plane (park-while-awaiting-upstream): when set, guest-initiated vsock conns
+    // to EGRESS_VSOCK_PORT are claimed by this bridge and spliced OUT to this unix socket
+    // (a PLATFORM-owned listener nether DIALS per conn - the mirror of data_socket, which
+    // nether listens on). Every dialed conn opens with a one-line preamble
+    // `NETHER-EGRESS v1 conn=<id> resume=<0|1>\n` so the platform can correlate a parked
+    // conn across a snapshot restore (resume=1 = re-splice the parked upstream).
+    egress_path: ?[*:0]const u8 = null,
 
     pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
     pub const WINDOW: u32 = 256 * 1024; // guest in-flight bound == per-conn delivery buffer size
@@ -781,6 +800,7 @@ pub const DataBridge = struct {
         buf: []u8 = &.{},
         bh: usize = 0, // ring read head
         bc: usize = 0, // bytes currently buffered
+        egress: bool = false, // guest-initiated (egress plane) vs host-dialed (data plane)
     };
 
     /// Append to a conn's delivery ring (caller holds the lock). false = would overflow,
@@ -853,9 +873,15 @@ pub const DataBridge = struct {
     }
 
     pub fn start(self: *DataBridge) void {
-        if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
-            std.debug.print("[bridge] failed to start data-plane listener\n", .{});
+        // The unix listener serves the inbound data plane only; egress-only bridges
+        // (egress_socket set, data_socket not) run just the reaper - egress conns arrive
+        // via tryEvent(.accept) and dial out from egressPump.
+        if (std.mem.span(self.path).len > 0) {
+            if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
+                std.debug.print("[bridge] failed to start data-plane listener\n", .{});
+            }
         }
+        if (self.egress_path) |ep| std.debug.print("[bridge] egress plane -> {s} (guest vsock:{d})\n", .{ ep, EGRESS_VSOCK_PORT });
         if (std.Thread.spawn(.{}, reaperLoop, .{self})) |t| t.detach() else |_| {}
     }
 
@@ -863,6 +889,9 @@ pub const DataBridge = struct {
     /// guest server (accepts a request, then goes silent) cannot tie up a bridge slot
     /// indefinitely. Marks the conn dead and shutdown()s its unix fd; the pump thread's
     /// blocked read then returns and tears it down (single-owner close). No-op if disabled.
+    /// EGRESS conns are exempt: two-way idle is their NORMAL state while awaiting a slow
+    /// upstream (the park-while-awaiting case). Their lifecycle belongs to the platform,
+    /// which closes its side of the unix socket to end one.
     fn reaperLoop(self: *DataBridge) void {
         while (true) {
             _ = usleep(500_000); // 2 Hz
@@ -871,7 +900,7 @@ pub const DataBridge = struct {
             const now = nowMs();
             self.lock.lock();
             for (&self.conns) |*e| {
-                if (e.active and e.state != .dead and (now - e.last_ms) > cutoff) {
+                if (e.active and !e.egress and e.state != .dead and (now - e.last_ms) > cutoff) {
                     e.state = .dead;
                     if (e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
                 }
@@ -889,6 +918,29 @@ pub const DataBridge = struct {
     /// bridge-owned conn. Returns true iff this conn belongs to the bridge.
     pub fn tryEvent(self: *DataBridge, ev: nether.vsock.Event) bool {
         const id = evConn(ev) orelse return false;
+        // Guest-initiated egress conn: claim accepts on the egress port. We are on the
+        // device thread INSIDE the D3 lock, so engine access is direct (no host* wrappers -
+        // they re-take D3). The entry is registered SYNCHRONOUSLY so a .recv in the same
+        // guest TX drain cannot race ahead of it; the unix side attaches asynchronously in
+        // egressPump (unix_fd=-1 until then: bufDrain no-ops, credit is withheld, and the
+        // guest stays bounded by its accept window - nothing can be lost or overrun).
+        if (ev == .accept) {
+            if (self.egress_path == null) return false; // not ours: the agent's listener
+            if (self.vsdev.engine.conns[id].host_port != EGRESS_VSOCK_PORT) return false;
+            const slot = self.register(id, -1) orelse {
+                self.vsdev.engine.close(id); // pool full: refuse (direct - already under D3)
+                return true;
+            };
+            self.lock.lock();
+            self.conns[slot].state = .established; // guest-initiated: live at accept
+            self.conns[slot].egress = true;
+            self.lock.unlock();
+            if (std.Thread.spawn(.{}, egressPump, .{ self, slot, false })) |t| t.detach() else |_| {
+                self.unregister(slot);
+                self.vsdev.engine.close(id);
+            }
+            return true;
+        }
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.findId(id) orelse return false;
@@ -949,6 +1001,112 @@ pub const DataBridge = struct {
         self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = now, .last_ms = now, .buf = buf };
         if (self.meter) |m| _ = m.data_conns.fetchAdd(1, .release);
         return slot;
+    }
+
+    /// Total undelivered guest->consumer bytes buffered across all conns. Snapshot-time
+    /// honesty check: ring bytes are host memory, not captured - parking while non-zero
+    /// gaps the stream a restored fork resumes (see captureToFile).
+    pub fn bufferedBytes(self: *DataBridge) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        for (&self.conns) |*e| {
+            if (e.active) n += e.bc;
+        }
+        return n;
+    }
+
+    /// Free a slot that never got a pump thread (spawn/dial failure before any fd was
+    /// attached). Unlike teardown it touches no fds and no guest conn - callers handle those.
+    fn unregister(self: *DataBridge, slot: usize) void {
+        self.lock.lock();
+        const e = self.conns[slot];
+        self.conns[slot] = .{};
+        self.lock.unlock();
+        if (e.buf.len > 0) self.alloc.free(e.buf);
+    }
+
+    /// Dial the platform's egress unix listener and write the identifying preamble.
+    /// Returns the connected fd (non-blocking, sized send buffer), or null. The preamble
+    /// goes out BEFORE the fd is attached to the entry, so ring bytes can never precede it.
+    fn egressDial(path: [*:0]const u8, id: u16, resumed: bool) ?c_int {
+        const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return null;
+        var addr = SockaddrUn{};
+        const p = std.mem.span(path);
+        if (p.len + 1 > addr.path.len) {
+            _ = libc.close(fd);
+            return null;
+        }
+        @memcpy(addr.path[0..p.len], p);
+        const addr_len: u32 = @intCast(@offsetOf(SockaddrUn, "path") + p.len + 1);
+        if (@hasField(SockaddrUn, "len")) addr.len = @intCast(addr_len);
+        if (libc.connect(fd, &addr, addr_len) < 0) {
+            _ = libc.close(fd);
+            return null;
+        }
+        var pb: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&pb, "NETHER-EGRESS v1 conn={d} resume={d}\n", .{ id, @intFromBool(resumed) }) catch {
+            _ = libc.close(fd);
+            return null;
+        };
+        var off: usize = 0;
+        while (off < line.len) { // fd still blocking: a fresh conn's socket buffer takes this
+            const w = libc.send(fd, line[off..].ptr, line.len - off, 0);
+            if (w <= 0) {
+                _ = libc.close(fd);
+                return null;
+            }
+            off += @intCast(w);
+        }
+        hostutil.setNonblock(fd);
+        hostutil.setSendBuf(fd, 256 * 1024);
+        return fd;
+    }
+
+    /// Egress conn pump: dial the platform's egress listener, attach the unix fd to the
+    /// entry, then run the shared pump loop. Its own thread - the dial must never run on
+    /// the device thread. `resumed` marks a conn rehydrated after a snapshot restore (the
+    /// preamble tells the platform to re-splice its parked upstream, not start fresh).
+    fn egressPump(self: *DataBridge, slot: usize, resumed: bool) void {
+        self.lock.lock();
+        const id = self.conns[slot].vsock_id;
+        const alive = self.conns[slot].active and self.conns[slot].state != .dead;
+        self.lock.unlock();
+        if (!alive) return self.teardown(slot);
+        const fd = egressDial(self.egress_path.?, id, resumed) orelse {
+            std.debug.print("[bridge] egress dial failed (conn {d})\n", .{id});
+            return self.teardown(slot);
+        };
+        self.lock.lock();
+        // Only this thread tears the slot down before the pump runs, so the entry is still
+        // ours; but the guest may have closed (marked .dead) while we dialed.
+        if (!self.conns[slot].active or self.conns[slot].state == .dead) {
+            self.lock.unlock();
+            _ = libc.close(fd);
+            return self.teardown(slot);
+        }
+        self.conns[slot].unix_fd = fd;
+        self.lock.unlock();
+        self.pumpLoop(slot);
+    }
+
+    /// Restore rehydration: re-attach the host side of a parked egress conn that survived
+    /// a snapshot (the guest side is typically mid-recv(), awaiting its upstream reply).
+    /// Registers the surviving conn id and dials the egress socket with resume=1. Called
+    /// from the restore thread (NOT the device thread).
+    pub fn resumeEgress(self: *DataBridge, id: u16) bool {
+        const slot = self.register(id, -1) orelse return false;
+        self.lock.lock();
+        self.conns[slot].state = .established;
+        self.conns[slot].egress = true;
+        self.lock.unlock();
+        if (std.Thread.spawn(.{}, egressPump, .{ self, slot, true })) |t| t.detach() else |_| {
+            self.unregister(slot);
+            self.vsdev.hostClose(id);
+            return false;
+        }
+        return true;
     }
 
     /// Close both fds + free the slot. The pump thread is the single owner of this.

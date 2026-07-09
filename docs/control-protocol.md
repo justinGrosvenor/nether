@@ -342,6 +342,53 @@ idle-reclaimed. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
 instantly-serving VM. Verified live on HVF: concurrent host connections reach an ordinary
 `127.0.0.1:8080` guest server and back; the cap refuses excess; the meters advance.
 
+### Egress plane (guest outbound via the platform; park-while-awaiting-upstream)
+
+The data plane's mirror image, for the tenant's OUTBOUND requests. Two knobs:
+
+```
+egress_port = 9090              # in-guest loopback port the tenant's outbound conns hit
+egress_socket = /run/nether/<id>.egress.sock  # PLATFORM-owned unix listener nether DIALS
+```
+
+`egress_port` makes `/init` start the forwarder's **reverse mode**: it listens on
+`127.0.0.1:<egress_port>` in the guest, and each conn the tenant opens to it (ordinary
+blocking sockets, zero vsock awareness) becomes a guest->host vsock conn (port 5002).
+Nether bridges each one by **dialing** `egress_socket` - a listener the *platform* owns
+(note the inversion: `data_socket` is nether's listener, `egress_socket` is the
+platform's). The platform terminates the real upstream TCP there (proxy, allowlist,
+meter - egress policy is the platform's). Accepted egress conns get the same bounded
+window (256 KiB) + credit-on-delivery discipline as the data plane, share `max_data_conns`
+and `data_rate_kbps`, but are **exempt from `data_idle_ms`** - two-way idle is an egress
+conn's normal state while an upstream is slow; the platform ends one by closing its unix
+side. `__info__` reports `egress_plane=on/off`.
+
+**The preamble.** Every conn nether dials opens with one line before raw splicing begins:
+
+```
+NETHER-EGRESS v1 conn=<id> resume=<0|1>
+```
+
+`conn` is the vsock conn id - stable across snapshot/restore. `resume=0` is a fresh
+tenant conn; `resume=1` announces a conn REVIVED by a snapshot restore (below).
+
+**Park-while-awaiting-upstream.** Because a guest->host vsock conn is pure in-memory
+state, it SURVIVES a snapshot (unlike slirp NAT flows, which hold real host sockets and
+die with the process). So the platform can run this play: the guest issues an outbound
+request through the egress plane and blocks in `recv()`; the platform (holding the real
+upstream socket) notes the conn id from the preamble; it snapshots the VM (`__snapshot__`)
+and **kills it** - the guest now exists only as a snapshot file, costing nothing, while
+the upstream request stays alive in the platform's process. When the reply arrives, the
+platform restores the snapshot; nether enumerates the surviving egress conns and re-dials
+`egress_socket` with `resume=1 conn=<id>` for each; the platform splices the reply in,
+and the guest's ORIGINAL blocking `recv()` completes - ordinary code, never rewritten,
+that slept through its own death. Verified live on HVF: `scripts/park_await_proof.py`.
+
+Caveats: park when the conn is idle-awaiting (request fully delivered) - bytes still
+buffered in the bridge's host-side delivery ring at capture are NOT in the snapshot, and
+`__snapshot__` prints a loud NOTE if any are pending. Only vsock-proxied conns survive;
+anything over virtio-net/slirp still dies on restore and must re-establish at TCP level.
+
 ## Snapshot / fork (HVF)
 
 **Baking a base.** The platform pre-bakes a fork source by driving a control-mode sandbox

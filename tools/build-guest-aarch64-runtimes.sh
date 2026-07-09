@@ -88,10 +88,12 @@ echo "nameserver 10.0.2.3" > /etc/resolv.conf
 # agent/control mode.
 [ -x /agent ] && /agent &
 
-# The data-plane forwarder: when the host set nether.app_port=<n>, bridge host->guest
-# vsock (port 5001) to the tenant's loopback TCP server at 127.0.0.1:<n>, so the tenant
-# runs an ordinary TCP server (docs/park-concurrency-plan.md 3b). No-op otherwise.
-grep -q 'nether.app_port=' /proc/cmdline 2>/dev/null && [ -x /forwarder ] && /forwarder &
+# The data/egress forwarder: nether.app_port=<n> bridges host->guest vsock (port 5001)
+# to the tenant's loopback TCP server at 127.0.0.1:<n> (inbound data plane, 3b);
+# nether.egress_port=<n> listens on 127.0.0.1:<n> and bridges the tenant's ordinary
+# OUTBOUND conns to the host over vsock port 5002 (egress plane, park-while-awaiting).
+# No-op when neither is set.
+grep -qE 'nether\.(app_port|egress_port)=' /proc/cmdline 2>/dev/null && [ -x /forwarder ] && /forwarder &
 
 echo
 echo "  Nether - aarch64 Linux on Apple Hypervisor.framework"

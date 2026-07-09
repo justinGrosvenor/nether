@@ -62,6 +62,10 @@ pub const SnapCtx = struct {
     // sockets a fork cannot inherit, so the guest re-establishes its flows at the TCP
     // level). Null => the fork has no NIC.
     net_dev: ?*nether.virtio.Device = null,
+    // The data/egress bridge, when the sandbox runs one - snapshot-time honesty check
+    // only: bytes buffered in its delivery rings live in host memory and are NOT part
+    // of the snapshot, so a capture while any are pending is loudly flagged.
+    bridge: ?*control.DataBridge = null,
     // Serializes captures: the demo timer and the __snapshot__ control command both
     // drive captureToFile, and two captures must not quiesce at once.
     capturing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -93,6 +97,14 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
         std.debug.print("[nether] snapshot: guest not quiescent; refusing (set snapshot_allow_dirty=1 to override).\n", .{});
         sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
         return false;
+    }
+    // Bridge rings are host memory, NOT captured: guest->consumer bytes buffered there
+    // (received from the guest but not yet delivered/credited) would be a silent GAP in
+    // the stream a restored fork resumes. Park only conns that are idle-awaiting; flag
+    // loudly if anything is pending so a corrupt-forked stream is never a mystery.
+    if (ctx.bridge) |b| {
+        const pend = b.bufferedBytes();
+        if (pend > 0) std.debug.print("[nether] snapshot NOTE: {d} B undelivered in the data/egress bridge are NOT captured; a fork resuming those conns will see a gap in the stream.\n", .{pend});
     }
     const cpu_snap = sn.cpu; // vCPUs self-captured into sn.cpu[] while parking
     // Capture the GIC state, sized to the framework's actual state. If this fails (or is
@@ -829,6 +841,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var vs_router: control.VsockRouter = undefined;
     var data_bridge: control.DataBridge = undefined;
     var data_sock_buf: [256]u8 = undefined;
+    var egress_sock_buf: [256]u8 = undefined;
     var have_bridge = false;
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
@@ -854,17 +867,23 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         // (nether.app_port), the fork inherits a WARM tenant server over CoW RAM, so
         // standing up the host bridge makes it immediately reachable as a concurrent
         // upstream with no reboot - the product's cold-start path (park -> fork -> serve).
-        if (conf.confGet("data_socket", &data_sock_buf)) |ds| {
-            if (ds.len > 0) {
-                data_bridge = .{ .vsdev = &vsdev, .path = @ptrCast(&data_sock_buf), .meter = &core.meter, .alloc = allocator };
-                const mdc = conf.confGetInt("max_data_conns", 0);
-                if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
-                data_bridge.idle_ms = conf.confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
-                const drk = conf.confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
-                if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
-                vs_router.bridge = &data_bridge;
-                have_bridge = true;
+        const ds_conf: []const u8 = conf.confGet("data_socket", &data_sock_buf) orelse "";
+        const es_conf: []const u8 = conf.confGet("egress_socket", &egress_sock_buf) orelse "";
+        if (ds_conf.len > 0 or es_conf.len > 0) {
+            data_bridge = .{ .vsdev = &vsdev, .path = if (ds_conf.len > 0) @ptrCast(&data_sock_buf) else "", .meter = &core.meter, .alloc = allocator };
+            const mdc = conf.confGetInt("max_data_conns", 0);
+            if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
+            data_bridge.idle_ms = conf.confGetInt("data_idle_ms", 0); // per-conn idle reap (0 = off)
+            const drk = conf.confGetInt("data_rate_kbps", 0); // per-VM data-plane bandwidth cap (0 = off)
+            if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125; // kbps -> bytes/s
+            if (es_conf.len > 0) {
+                data_bridge.egress_path = @ptrCast(&egress_sock_buf);
+                // Re-apply the accept-window policy (host config, deliberately not in the
+                // snapshot) so NEW guest egress conns get the bounded window too.
+                _ = vsdev.hostListenWindow(control.EGRESS_VSOCK_PORT, data_bridge.window);
             }
+            vs_router.bridge = &data_bridge;
+            have_bridge = true;
         }
         vs.on_event = control.VsockRouter.dispatch;
         vs.on_event_ctx = &vs_router;
@@ -872,7 +891,21 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         core.agent.conn_id.store(saved_conn_id, .release); // the surviving connection drives immediately
         if (have_bridge) {
             data_bridge.start(); // spawn the fork's data-plane listener
-            std.debug.print("[nether] fork data plane ON at {s}: dials the inherited in-guest forwarder; warm tenant server is immediately serving.\n", .{@as([*:0]const u8, @ptrCast(&data_sock_buf))});
+            if (ds_conf.len > 0) std.debug.print("[nether] fork data plane ON at {s}: dials the inherited in-guest forwarder; warm tenant server is immediately serving.\n", .{@as([*:0]const u8, @ptrCast(&data_sock_buf))});
+            // Park-while-awaiting-upstream: egress conns are pure in-memory vsock state, so
+            // they SURVIVED the snapshot - the guest side is typically still blocked in
+            // recv() awaiting its upstream reply. Re-attach each one's host side: dial the
+            // platform's egress listener with resume=1 so it re-splices the parked upstream
+            // (which it held while this VM did not exist) into the surviving conn.
+            if (es_conf.len > 0) {
+                var ids: [64]u16 = undefined; // >= the engine's MAX_CONNS
+                const n = vsdev.hostConnsOnPort(control.EGRESS_VSOCK_PORT, &ids);
+                var revived: usize = 0;
+                for (ids[0..n]) |id| {
+                    if (data_bridge.resumeEgress(id)) revived += 1;
+                }
+                if (n > 0) std.debug.print("[nether] egress plane: revived {d}/{d} parked conn(s) -> {s}\n", .{ revived, n, @as([*:0]const u8, @ptrCast(&egress_sock_buf)) });
+            }
         }
 
         // Wire the (fresh) NAT engine into the meter + journal so __stats__ reports
@@ -913,6 +946,11 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 .max_data_conns = conf.confGetInt("max_data_conns", 0),
                 .data_idle_ms = conf.confGetInt("data_idle_ms", 0),
                 .data_rate_kbps = conf.confGetInt("data_rate_kbps", 0),
+                .egress = blk: {
+                    var b: [256]u8 = undefined;
+                    const v: []const u8 = conf.confGet("egress_socket", &b) orelse "";
+                    break :blk v.len > 0;
+                },
             },
         });
 
