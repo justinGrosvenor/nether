@@ -21,6 +21,8 @@
  */
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -166,6 +168,57 @@ static void run(int s, const char *cmd) {
     write_full(s, tr, (size_t)m);
 }
 
+/* Kernel entropy ioctls (<linux/random.h>). Defined by hand (guarded) so a host-SDK
+ * lint pass on macOS - which has no linux/random.h - still parses this file; both
+ * macOS and musl sys/ioctl.h provide _IO/_IOW. Layout matches struct rand_pool_info:
+ * { int entropy_count; int buf_size; __u32 buf[]; } with buf_size in BYTES. */
+#ifndef RNDADDENTROPY
+#define RNDADDENTROPY _IOW('R', 0x03, int[2])
+#endif
+#ifndef RNDRESEEDCRNG
+#define RNDRESEEDCRNG _IO('R', 0x07)
+#endif
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* __reseed__ <hex>: HOST-ONLY internal command, never passed to the shell. Nether
+ * queues it on the surviving agent conn at fork restore, before the guest resumes:
+ * sibling forks of one base restore IDENTICAL crng state, so this feeds up to 64
+ * bytes of fresh host entropy via RNDADDENTROPY with entropy_count = bits (the
+ * agent is root; the kernel CREDITS the entropy) and then forces an immediate crng
+ * reseed with RNDRESEEDCRNG so the very next getrandom()/urandom read draws from
+ * the new state (credited input-pool entropy alone waits for the next scheduled
+ * reseed - measured, not assumed).
+ *
+ * SILENT by contract: NO output and NO 0x1e trailer, on success OR failure. The
+ * host fires this before any control client attaches; a stray frame would desync
+ * the client's request/response framing (it never sent a command). Malformed hex,
+ * missing device, failed ioctl: silently ignored (fail-open - the fork is then
+ * merely no better than an unreseeded one). The agent has no log file; stderr goes
+ * to the console, so diagnostics are deliberately omitted too. */
+static void do_reseed(const char *hex) {
+    struct { int entropy_count; int buf_size; unsigned char buf[64]; } rpi;
+    int n = 0;
+    while (n < (int)sizeof rpi.buf) {
+        int hi = hexval((unsigned char)hex[2 * n]);
+        int lo = hi < 0 ? -1 : hexval((unsigned char)hex[2 * n + 1]);
+        if (lo < 0) break; /* end of hex (or malformed/odd tail: stop there) */
+        rpi.buf[n++] = (unsigned char)((hi << 4) | lo);
+    }
+    if (n == 0) return;
+    int fd = open("/dev/urandom", O_RDWR); /* same pool as /dev/random */
+    if (fd < 0) return;
+    rpi.entropy_count = n * 8;
+    rpi.buf_size = n;
+    if (ioctl(fd, RNDADDENTROPY, &rpi) == 0) ioctl(fd, RNDRESEEDCRNG);
+    close(fd);
+}
+
 /* __GET__ <path>: reply "OK <len>\n" + the file bytes, or "ERR\n". */
 static void do_get(int s, const char *path) {
     FILE *f = fopen(path, "rb");
@@ -254,6 +307,8 @@ int main(void) {
                 }
             } else if (strncmp(line, "__GET__ ", 8) == 0) {
                 do_get(s, line + 8);
+            } else if (strncmp(line, "__reseed__ ", 11) == 0) {
+                do_reseed(line + 11); /* host-internal; silent - no output, no trailer */
             } else {
                 run(s, line);
             }

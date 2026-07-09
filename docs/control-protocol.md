@@ -426,10 +426,32 @@ property (64 bytes of host entropy; omitted fail-closed if the host has none). W
 it a quiet microVM needs ~10s of jitter accumulation before `getrandom()` unblocks -
 which stalled the first `python3` (hash-seed) in every boot and in every fork whose base
 was baked before the crng self-initialized (measured: a fork's first python took 10.2s;
-with the seed, instant). Caveat inherent to ANY fork model: forks of one base restore
-identical crng state, so two sibling forks produce identical random streams until the
-guest reseeds - do not treat sibling forks as mutually secret. (A proper post-restore
-reseed - virtio-rng or vmgenid - is future work.)
+with the seed, instant).
+
+**Fork reseed.** Forks of one base restore identical crng state, so without intervention
+two sibling forks emit identical `getrandom()`/urandom streams until the guest reseeds
+on its own schedule. Nether closes this at every restore: it queues
+`__reseed__ <64 bytes of host entropy, hex>` on the surviving agent connection BEFORE
+the guest resumes (so it is the first input the woken agent reads, ahead of any control
+client), and the agent - never the shell - feeds it via `RNDADDENTROPY` with the bits
+credited, then forces `RNDRESEEDCRNG`. The forced reseed is required: credited
+input-pool entropy alone waits for the crng's next scheduled reseed (measured: siblings
+stayed identical with `RNDADDENTROPY` only; with `RNDRESEEDCRNG` they diverge on the
+FIRST post-wake read - `scripts/fork_entropy_proof.py`). The reseed is silent by
+contract: no output, no `0x1e` trailer, so client framing is untouched. The host log
+records `fork crng reseeded (64B via agent)`; failures print a NOTE and continue
+(fail-open - an unreseeded fork is no worse than the old behavior). Opt out with
+`fork_reseed=0` in `nether.conf`.
+
+Remaining window: guest code that reads randomness between resume and the agent
+consuming the reseed line (i.e. before any relayed command) still sees base-derived
+state; anything driven through the control protocol runs after the reseed. Old guest
+images whose agent predates the handler do not reseed - the line falls through to the
+shell, whose `not found` reply frame is discarded while no control client is attached,
+but a client that attaches before the guest drains it can see one stray frame
+(off-by-one until the next trailer). Re-bake the initramfs
+(`tools/build-guest-aarch64-runtimes.sh`) to get the handler, or set `fork_reseed=0`
+for fleets on old images.
 
 **Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
 
