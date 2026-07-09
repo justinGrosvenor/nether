@@ -39,16 +39,22 @@ pub const Stop = struct {
 };
 
 /// A backend-agnostic on-demand snapshot: quiesce the guest, capture full machine
-/// state, and write a fork-source base file to `path`, then resume - so the platform
+/// state, and write a fork-source base file to `fd`, then resume - so the platform
 /// can pre-bake base images by driving a sandbox to a ready state and issuing
 /// `__snapshot__`. Returns true on success. The `ctx` outlives the caller, so it must
 /// point at stable storage (the boot frame's SnapCtx). HVF only; the KVM path leaves
 /// this null until KVM snapshot lands.
+///
+/// The destination arrives as an ALREADY-OPEN fd (plus `path`, for log messages only):
+/// the control plane opens it via the pinned jail-root dirfd (hostutil.openJailedAt),
+/// so the snapshot write cannot be redirected out of the transfer jail by a path
+/// component swapped between the containment check and the open (TOCTOU). The caller
+/// owns the fd (closes it, and unlinks the file if the capture fails).
 pub const Snapshotter = struct {
     ctx: *anyopaque,
-    func: *const fn (*anyopaque, path: [*:0]const u8) bool,
-    pub fn call(self: Snapshotter, path: [*:0]const u8) bool {
-        return self.func(self.ctx, path);
+    func: *const fn (*anyopaque, fd: c_int, path: [*:0]const u8) bool,
+    pub fn call(self: Snapshotter, fd: c_int, path: [*:0]const u8) bool {
+        return self.func(self.ctx, fd, path);
     }
 };
 

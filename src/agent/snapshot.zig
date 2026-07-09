@@ -78,7 +78,7 @@ pub const SnapCtx = struct {
 /// write so the RAM image is consistent (unlike a live copy, which could tear). An
 /// in-progress guard rejects a concurrent capture. Returns true on success.
 pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
-    return captureImpl(ctx, path, true);
+    return captureImpl(ctx, -1, path, true);
 }
 
 /// `__park__`'s capture: identical to captureToFile except the guest is NOT resumed on
@@ -88,12 +88,15 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
 /// sending new ones) makes the live stream disagree with the parked snapshot, so a later
 /// wake would see duplicates or gaps. Park = the snapshot IS the guest's last live moment.
 /// On FAILURE the guest is resumed as usual (a failed park must leave a usable sandbox).
-pub fn parkCall(p: *anyopaque, path: [*:0]const u8) bool {
+pub fn parkCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
     const ctx: *SnapCtx = @ptrCast(@alignCast(p));
-    return captureImpl(ctx, path, false);
+    return captureImpl(ctx, fd, path, false);
 }
 
-fn captureImpl(ctx: *SnapCtx, path: [*:0]const u8, resume_after: bool) bool {
+/// `out_fd` >= 0 is a caller-opened destination (the control plane's jail-pinned fd:
+/// the TOCTOU-safe __snapshot__/__park__ path - the caller owns closing/unlinking it);
+/// -1 means open `path` here (the demo timer's legacy path-based capture).
+fn captureImpl(ctx: *SnapCtx, out_fd: c_int, path: [*:0]const u8, resume_after: bool) bool {
     const hvfb = @import("../hv/hvf_backend.zig");
     if (ctx.capturing.swap(true, .acq_rel)) {
         std.debug.print("[nether] snapshot: a capture is already in progress\n", .{});
@@ -155,7 +158,7 @@ fn captureImpl(ctx: *SnapCtx, path: [*:0]const u8, resume_after: bool) bool {
     // owning thread. Stored in the header so a restore resumes the guest count exactly
     // here (vtimer continuity: a parked guest does not observe the parked wall time).
     const cntvct_snap = sn.cntvct.load(.acquire);
-    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK, cntvct_snap);
+    const ok = writeSnapshotFile(out_fd, path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK, cntvct_snap);
     if (resume_after or !ok) {
         sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
         std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
@@ -166,9 +169,9 @@ fn captureImpl(ctx: *SnapCtx, path: [*:0]const u8, resume_after: bool) bool {
 }
 
 /// `platform.Snapshotter` adapter: cast the opaque ctx back to a SnapCtx and capture.
-pub fn snapshotCall(p: *anyopaque, path: [*:0]const u8) bool {
+pub fn snapshotCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
     const ctx: *SnapCtx = @ptrCast(@alignCast(p));
-    return captureToFile(ctx, path);
+    return captureImpl(ctx, fd, path, true);
 }
 
 fn countDiff(a: []const u8, b: []const u8) u64 {
@@ -387,6 +390,7 @@ fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_ca
 }
 
 fn writeSnapshotFile(
+    out_fd: c_int, // caller-opened destination (>= 0: caller owns close + failure unlink)
     path: [*:0]const u8,
     ram: []const u8,
     cpus: anytype, // []const hvf_backend.CpuState
@@ -402,15 +406,17 @@ fn writeSnapshotFile(
     kind: u32, // SNAP_KIND_BASE or SNAP_KIND_PARK (the file's lifecycle contract)
     cntvct: u64, // guest virtual-counter at capture (0 = unknown -> legacy restore)
 ) bool {
-    const ok = writeSnapshotBody(path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind, cntvct);
+    const ok = writeSnapshotBody(out_fd, path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind, cntvct);
     // Strict lifecycle: a failed write never leaves debris. A truncated snapshot would be
     // rejected on restore anyway, but a half-written full-RAM image (tenant secrets
-    // frozen inside) must not linger on disk either.
-    if (!ok) _ = libc.unlink(path);
+    // frozen inside) must not linger on disk either. With a caller-opened fd the caller
+    // does the unlink (via its jail-root dirfd, so the cleanup can't be re-pointed either).
+    if (!ok and out_fd < 0) _ = libc.unlink(path);
     return ok;
 }
 
 fn writeSnapshotBody(
+    out_fd: c_int,
     path: [*:0]const u8,
     ram: []const u8,
     cpus: anytype,
@@ -426,13 +432,17 @@ fn writeSnapshotBody(
     kind: u32,
     cntvct: u64,
 ) bool {
-    // O_NOFOLLOW: when the path comes from __snapshot__ it is jailed (parent resolved),
-    // so refuse a pre-existing symlink at the basename that would redirect the write
-    // outside the jail. For the demo's plain "nether.snap" this just refuses to clobber
-    // a symlink in cwd, which is the safe behavior anyway.
-    const fd = hostutil.createTruncNoFollow(path);
+    // __snapshot__/__park__ hand us an fd the control plane opened via its pinned
+    // jail-root dirfd (openJailedAt), so the destination provably sits inside the
+    // transfer jail with no path re-resolution here at all (TOCTOU-safe); the caller
+    // keeps ownership (close + failure unlink). The demo timer still passes a path:
+    // O_NOFOLLOW refuses a pre-existing symlink at the basename (refusing to clobber
+    // a symlink in cwd is the safe behavior anyway).
+    const fd = if (out_fd >= 0) out_fd else hostutil.createTruncNoFollow(path);
     if (fd < 0) return false;
-    defer _ = libc.close(fd);
+    defer if (out_fd < 0) {
+        _ = libc.close(fd);
+    };
 
     const ctl = vs_dev != null and vsock != null;
     const net = net_dev != null;

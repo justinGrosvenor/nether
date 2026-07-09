@@ -70,6 +70,17 @@ no timing heuristic. It matches the reference client `tools/nether-ctl.c` `is_fr
   so a raw `0x1e` only ever marks the trailer - see "Output framing" - and a `0x1e`/`0x1f` in a
   command is rejected fail-closed so an echoed argument can't forge a frame.)
 
+  **The relayed exit is clamped to `0..255` at the host.** The trailer digits of a shell
+  command's reply originate in the in-guest agent (untrusted), and negative codes are
+  reserved for the host - so a malformed/hostile agent must not be able to impersonate a
+  control-plane error (or desync a reader) by emitting `0x1e-1\n` or garbage. The relay
+  validates the trailer as it forwards it: a canonical exit (digits, value `0..255`) passes
+  through byte-identical; anything else (negative, `>255`, non-digits, overlong) reaches the
+  client rewritten as `255`. The same clamp applies where the host itself parses that exit
+  (`__cmdlog__`/`__events__` record `exit=255` for a malformed trailer, never a negative).
+  So for a consumer the sign test is airtight: a negative trailer exit can only ever have
+  been written by nether itself.
+
 - **Streamed (self-delimiting)** - no `0x1e` trailer; the reply is complete when the stream
   goes idle or the socket closes. A client reads these in a mode it chose for that command, so
   they are never subject to any framing ambiguity. Two sub-shapes:
@@ -168,10 +179,27 @@ should move over `__get__` (length-framed, binary-safe), not command stdout.
 ### Concurrency on the primary socket
 
 The primary socket carries both host-intercepted query replies and the streamed reply of
-a relayed command, written from different threads. Issue **one command at a time**: send a
-query (`__stats__`, etc.) only between commands, not while a command's reply is still
-streaming, or the byte streams interleave. The serial request/response model (send a
-line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
+a relayed command, written from different threads. Issue **one command at a time**: the
+serial request/response model (send a line, read to its `0x1e<exit>\n` trailer, then send
+the next) is the contract. Nether now also **enforces write integrity** underneath it: all
+writes to the primary fd are serialized behind a per-client interlock, and a
+host-intercepted reply is injected only at a frame boundary (between a completed
+`0x1e<exit>\n` trailer and the next command's output), waiting briefly (bounded, ~250 ms)
+for one if the relay is mid-frame. So a query reply can no longer splice bytes into the
+middle of a streaming frame. This is defense-in-depth, not license to pipeline: a client
+that sends a query mid-command still gets the replies in an order it must disentangle, and
+after the bounded wait a boundary-less stream is written anyway - stay serial.
+
+### Command arguments (strict single tokens)
+
+The arg-taking commands parse their arguments as **whitespace-delimited single tokens**,
+uniformly: `__snapshot__ [path]` and `__park__ [path]` take at most one token (absent ->
+the `nether.snap` default), `__put__`/`__get__` exactly two. Surrounding blanks and the
+line terminator are trimmed; an **embedded space/tab - i.e. an extra argument or trailing
+garbage - is rejected with a framed `ERR` (exit -1)** rather than silently folded into a
+path (`__snapshot__ a b` used to capture to a file literally named `a b`). Paths with
+spaces are therefore not expressible over this protocol - by design; every existing valid
+form is unchanged.
 
 ## Commands
 
@@ -198,6 +226,13 @@ line, read to its `0x1e<exit>\n` trailer, then send the next) is the contract.
 | `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a fork-source base snapshot on demand (HVF only): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply (framed, exit 0 on `OK` / -1 on `ERR`) blocks until the file is on disk, so the platform knows the base is ready to fork. **Fails closed if the guest is not quiescent** (a vCPU not parked at WFI): a base captured mid-instruction can bake inconsistent state into every fork, so it returns `ERR` and resumes rather than write a dirty base. Set `snapshot_allow_dirty=1` in `nether.conf` to opt into best-effort capture. `ERR snapshot not supported on this backend` on KVM. |
 | `__put__ <hostpath> <guestpath>` | framed `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
 | `__get__ <guestpath> <hostpath>` | framed `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
+
+The transfer jail (the launch directory, pinned at startup) is enforced **at open time**,
+not just at path-check time: host-side transfer targets (`__put__` source, `__get__`
+destination, `__snapshot__`/`__park__` output) are opened relative to a jail-root
+directory fd, component-by-component with `O_NOFOLLOW` - so a symlink swapped into the
+path between the check and the open cannot redirect the I/O outside the jail (TOCTOU;
+same-uid defense-in-depth).
 | *(anything else)* | framed | Run the line as a shell command in the guest; output streams back, then `0x1e<exit>\n`. Metered as a command. |
 
 ## Lifecycle and settlement

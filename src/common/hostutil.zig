@@ -23,6 +23,11 @@ pub const libc = struct {
     pub extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
     pub extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
     pub extern "c" fn unlink(path: [*:0]const u8) c_int;
+    // Jail-relative file access (openJailedAt): open/unlink RELATIVE to a pinned
+    // directory fd, so a transfer path cannot be re-pointed between its containment
+    // check and its open (the realpath-then-open TOCTOU; see control.zig jailedPath).
+    pub extern "c" fn openat(dirfd: c_int, path: [*:0]const u8, oflag: c_int, ...) c_int;
+    pub extern "c" fn unlinkat(dirfd: c_int, path: [*:0]const u8, flag: c_int) c_int;
     pub extern "c" fn pipe(fds: *[2]c_int) c_int;
     // Control-socket access control: tighten the bound socket to owner-only and
     // verify the connecting peer's uid (the socket grants full control of the VM).
@@ -250,6 +255,13 @@ pub fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
     const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
     if (fd < 0) return error.OpenFailed;
     defer _ = libc.close(fd);
+    return readFileFd(allocator, fd);
+}
+
+/// Read a whole ALREADY-OPEN file into a freshly allocated buffer (caller frees; the
+/// fd stays owned by the caller). Split out of readFileMac so a caller that opened via
+/// openJailedAt (a TOCTOU-safe open) can reuse the exact same read/short-read logic.
+pub fn readFileFd(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
     const size_i = libc.lseek(fd, 0, 2); // SEEK_END
     if (size_i <= 0) return error.OpenFailed;
     _ = libc.lseek(fd, 0, 0); // SEEK_SET
@@ -296,6 +308,67 @@ pub fn createTruncNoFollow(path: [*:0]const u8) c_int {
     return libc.open(path, flags.WRONLY | flags.CREAT | flags.TRUNC | flags.NOFOLLOW, @as(c_int, 0o600));
 }
 
+/// Open a path INSIDE a jail with no check-to-use gap: walk `rel` (a path relative to
+/// the pinned jail-root dirfd) component-by-component, opening every intermediate
+/// directory with O_NOFOLLOW|O_DIRECTORY relative to the previous component's fd, and
+/// the final component with O_NOFOLLOW (create+trunc-write when `create`, else read).
+///
+/// This closes the transfer-path TOCTOU (audit P2 #2): jailedPath realpath-resolves a
+/// path and the caller opens it LATER, so a same-uid attacker who swaps an intermediate
+/// directory for a symlink between the two escapes the jail. Here every step resolves
+/// relative to an fd of the directory actually opened - a swapped component is either
+/// not followed (symlink -> ELOOP via O_NOFOLLOW) or changes nothing (the dirfd already
+/// pins the real directory), so the returned fd is provably under the jail root.
+/// `rel` must be relative and canonical-ish: empty, absolute, "." or ".." components
+/// are rejected fail-closed (jailedPath output converted by the caller satisfies this).
+/// Files are created 0600 like createTruncNoFollow. Returns the fd, or -1.
+pub fn openJailedAt(root_fd: c_int, rel: []const u8, create: bool) c_int {
+    if (root_fd < 0 or rel.len == 0 or rel[0] == '/') return -1;
+    const flags = if (builtin.os.tag == .macos) .{
+        .WRONLY = 0x0001,
+        .CREAT = 0x0200,
+        .TRUNC = 0x0400,
+        .NOFOLLOW = 0x0100,
+        .DIRECTORY = 0x100000,
+    } else .{ // Linux (asm-generic)
+        .WRONLY = 0o000001,
+        .CREAT = 0o000100,
+        .TRUNC = 0o001000,
+        .NOFOLLOW = 0o400000,
+        .DIRECTORY = 0o200000,
+    };
+    var dirfd = root_fd;
+    var owned = false; // dirfd is ours to close (never the caller's root_fd)
+    var it = std.mem.splitScalar(u8, rel, '/');
+    var comp = it.next() orelse return -1;
+    while (true) {
+        const next = it.next();
+        var cb: [256]u8 = undefined; // one component; NAME_MAX is 255 on macOS and Linux
+        const bad = comp.len == 0 or std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..");
+        const compz = if (bad) null else cpath(&cb, comp);
+        if (compz == null) {
+            if (owned) _ = libc.close(dirfd);
+            return -1;
+        }
+        if (next == null) { // final component: the file itself
+            const oflag: c_int = if (create)
+                flags.WRONLY | flags.CREAT | flags.TRUNC | flags.NOFOLLOW
+            else
+                flags.NOFOLLOW; // O_RDONLY is 0
+            const fd = libc.openat(dirfd, compz.?, oflag, @as(c_int, 0o600));
+            if (owned) _ = libc.close(dirfd);
+            return fd;
+        }
+        // Intermediate: must be a real directory reached without following a symlink.
+        const nd = libc.openat(dirfd, compz.?, flags.NOFOLLOW | flags.DIRECTORY, @as(c_int, 0));
+        if (owned) _ = libc.close(dirfd);
+        if (nd < 0) return -1;
+        dirfd = nd;
+        owned = true;
+        comp = next.?;
+    }
+}
+
 /// Flush a MAP_SHARED mapping (a persistent virtio-blk disk) to its backing file, so a
 /// guest fsync -> virtio FLUSH is durable even against a hard guest poweroff. MS_SYNC
 /// differs by OS; the HVF host is macOS.
@@ -310,6 +383,71 @@ pub fn cpath(buf: []u8, p: []const u8) ?[*:0]const u8 {
     @memcpy(buf[0..p.len], p);
     buf[p.len] = 0;
     return @ptrCast(buf.ptr);
+}
+
+test "openJailedAt walks components openat/O_NOFOLLOW and rejects symlinked escapes" {
+    const c = struct {
+        extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+        extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
+        extern "c" fn rmdir(path: [*:0]const u8) c_int;
+        extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+    };
+    const jail = "/tmp/nether-openat-jail";
+    const outside = "/tmp/nether-openat-outside";
+    // Layout: jail/sub/file.txt (legit), outside/file.txt (the escape target),
+    // jail/evil -> /etc/hosts (symlink at the basename).
+    inline for (.{ jail ++ "/sub/file.txt", jail ++ "/evil", outside ++ "/file.txt" }) |f| _ = libc.unlink(f);
+    inline for (.{ jail ++ "/sub", jail, outside }) |d| _ = c.rmdir(d);
+    if (c.mkdir(jail, 0o700) != 0) return error.SkipZigTest;
+    if (c.mkdir(jail ++ "/sub", 0o700) != 0) return error.SkipZigTest;
+    if (c.mkdir(outside, 0o700) != 0) return error.SkipZigTest;
+    defer {
+        inline for (.{ jail ++ "/sub/file.txt", jail ++ "/evil", outside ++ "/file.txt" }) |f| _ = libc.unlink(f);
+        inline for (.{ jail ++ "/sub", jail, outside }) |d| _ = c.rmdir(d);
+    }
+    const O_DIRECTORY: c_int = if (builtin.os.tag == .macos) 0x100000 else 0o200000;
+    const root_fd = libc.open(jail, O_DIRECTORY, @as(c_int, 0));
+    try std.testing.expect(root_fd >= 0);
+    defer _ = libc.close(root_fd);
+
+    // Create through the walker, then read it back through the walker.
+    const wfd = openJailedAt(root_fd, "sub/file.txt", true);
+    try std.testing.expect(wfd >= 0);
+    try std.testing.expect(writeAll(wfd, "JAILDATA"));
+    _ = libc.close(wfd);
+    const rfd = openJailedAt(root_fd, "sub/file.txt", false);
+    try std.testing.expect(rfd >= 0);
+    const data = try readFileFd(std.testing.allocator, rfd);
+    defer std.testing.allocator.free(data);
+    _ = libc.close(rfd);
+    try std.testing.expectEqualStrings("JAILDATA", data);
+
+    // The TOCTOU move: swap the intermediate `sub` for a symlink to a directory
+    // OUTSIDE the jail (what an attacker does between realpath and open). The walker
+    // must refuse to traverse it (O_NOFOLLOW on the intermediate -> ELOOP).
+    try std.testing.expect(c.rename(jail ++ "/sub", jail ++ "/sub-real") == 0);
+    defer {
+        _ = libc.unlink(jail ++ "/sub");
+        _ = c.rename(jail ++ "/sub-real", jail ++ "/sub");
+    }
+    try std.testing.expect(c.symlink(outside, jail ++ "/sub") == 0);
+    try std.testing.expect(openJailedAt(root_fd, "sub/file.txt", false) < 0); // read escape refused
+    try std.testing.expect(openJailedAt(root_fd, "sub/file.txt", true) < 0); // create escape refused
+    try std.testing.expect(libc.open(outside ++ "/file.txt", 0, @as(c_int, 0)) < 0); // nothing was created outside
+
+    // A symlink at the BASENAME is refused in both modes (same O_NOFOLLOW discipline).
+    _ = c.symlink("/etc/hosts", jail ++ "/evil");
+    try std.testing.expect(openJailedAt(root_fd, "evil", false) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "evil", true) < 0);
+
+    // Malformed rel paths fail closed: empty, absolute, dot/dotdot, empty component.
+    try std.testing.expect(openJailedAt(root_fd, "", false) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "/etc/hosts", false) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "../escape.txt", true) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "sub-real/../file.txt", true) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "sub-real//file.txt", true) < 0);
+    try std.testing.expect(openJailedAt(root_fd, "./file.txt", true) < 0);
+    try std.testing.expect(openJailedAt(-1, "x", false) < 0); // no pinned root -> fail closed
 }
 
 test "processCpuMs is monotonic and advances under load" {
