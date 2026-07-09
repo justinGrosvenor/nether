@@ -8,6 +8,7 @@ const std = @import("std");
 const nether = @import("../root.zig");
 const platform = @import("platform.zig");
 const hostutil = @import("../common/hostutil.zig");
+const conf = @import("../common/conf.zig");
 const Lock = @import("../common/lock.zig").Lock;
 
 const libc = hostutil.libc;
@@ -1304,6 +1305,8 @@ pub const ControlCtx = struct {
     allocator: std.mem.Allocator,
     stop: platform.Stop, // backend-agnostic guest stop, for the __shutdown__ command
     snapshot: ?platform.Snapshotter = null, // on-demand base capture, for __snapshot__
+    park: ?platform.Snapshotter = null, // capture WITHOUT resume, for __park__
+    bridge: ?*DataBridge = null, // for __park__'s pending-ring gate (fail closed)
     gpu: ?*nether.VirtioGpu = null, // for the __frame__ render command
     journal: ?*nether.Journal = null, // unified event timeline, for __events__
     probe: ?*VsockProbe = null, // P0 data-plane spike, for __vsockprobe__ (HVF)
@@ -1564,6 +1567,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
             "# primary client only (drive the sandbox):\n" ++
             "__shutdown__     clean teardown\n" ++
             "__snapshot__ [p] capture a fork-source base snapshot (default nether.snap; HVF)\n" ++
+            "__park__ [p]     capture + bill + EXIT without resuming (wake = restore; HVF)\n" ++
             "__put__ <h> <g>  push host file -> guest path\n" ++
             "__get__ <g> <h>  pull guest file -> host path\n" ++
             "<other>          run as a shell command in the guest (framed reply + [exit N])\n" ++
@@ -1712,6 +1716,45 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         _ = ctx.meter.commands.fetchAdd(1, .release);
         return;
     }
+    // Lifecycle: PARK - one atomic command replacing the platform's snapshot+kill dance:
+    // quiesce, capture, bill, EXIT - the guest is NEVER resumed after the capture, so the
+    // snapshot IS its last live moment (resuming first would open a divergence window: any
+    // guest vsock activity between capture and death makes the live stream disagree with
+    // the parked state, and a later wake sees duplicates or gaps). Fail-closed gates: the
+    // quiesce (all vCPUs at WFI, from captureImpl) and the bridge's delivery rings (bytes
+    // still undelivered are host memory the snapshot cannot carry). The reply carries the
+    // teardown bill in-band, then the process exits 0. Wake = restore the snapshot.
+    if (std.mem.eql(u8, line, "__park__\n") or std.mem.eql(u8, line, "__park__") or std.mem.startsWith(u8, line, "__park__ ")) {
+        const parkr = ctx.park orelse return reply(c, "ERR park not supported on this backend\n");
+        const arg = if (std.mem.startsWith(u8, line, "__park__ ")) std.mem.trim(u8, line["__park__ ".len..], " \r\n") else "";
+        const req = if (arg.len == 0) "nether.snap" else arg;
+        var pbuf: [PATH_MAX]u8 = undefined;
+        const jailed = jailedPath(&pbuf, ctx.xferRoot(), req, true) orelse return reply(c, "ERR park path outside the transfer jail\n");
+        if (ctx.bridge) |b| {
+            // Give in-flight delivery a moment to drain, then refuse a dirty park unless
+            // the operator explicitly opted in (park_dirty=1 in nether.conf).
+            var waited: u32 = 0;
+            while (b.bufferedBytes() > 0 and waited < 1000) : (waited += 20) _ = usleep(20_000);
+            const pend = b.bufferedBytes();
+            if (pend > 0 and !conf.confBool("park_dirty")) {
+                var eb: [160]u8 = undefined;
+                return reply(c, std.fmt.bufPrint(&eb, "ERR park refused: {d} bytes undelivered in the data/egress bridge (drain, or set park_dirty=1)\n", .{pend}) catch "ERR park refused: bridge not drained\n");
+            }
+        }
+        if (ctx.journal) |j| j.emit(.life, "park requested");
+        if (!parkr.call(jailed)) return reply(c, "ERR park capture failed (guest resumed)\n");
+        // Captured and still quiesced: bill and exit. The teardown record goes to stdout
+        // (the same guaranteed shape as every session end) AND rides the OK reply, so the
+        // platform gets the bill on the same round-trip that confirms the park.
+        var bb: [256]u8 = undefined;
+        const bill = ctx.meter.summary(&bb);
+        const kind = if (ctx.info.x402) "x402 settlement" else "final usage";
+        std.debug.print("[nether] {s} (reason=park): {s}\n", .{ kind, bill });
+        if (ctx.journal) |j| j.emit(.life, "parked");
+        var rb: [384]u8 = undefined;
+        reply(c, std.fmt.bufPrint(&rb, "OK parked {s}\n", .{bill}) catch "OK parked\n");
+        std.process.exit(0);
+    }
     // Diagnostic (P0 spike, docs/park-concurrency-plan.md): prove host->guest vsock
     // connect on a LIVE guest, the go/no-go for the data-plane bridge. Dials
     // <guest_port> (a guest process must be listening on that vsock port), sends a
@@ -1810,6 +1853,8 @@ pub const ControlOpts = struct {
     gpu: ?*nether.VirtioGpu = null,
     stop: platform.Stop, // backend-agnostic guest stop for __shutdown__
     snapshot: ?platform.Snapshotter = null, // on-demand base capture for __snapshot__ (HVF)
+    park: ?platform.Snapshotter = null, // capture WITHOUT resume, for __park__ (HVF)
+    bridge: ?*DataBridge = null, // for __park__'s pending-ring gate (fail closed)
     info: SandboxInfo,
     path: [*:0]const u8,
     allocator: std.mem.Allocator,
@@ -1845,6 +1890,8 @@ pub fn startControl(ctl: *ControlCtx, o: ControlOpts) void {
         .allocator = o.allocator,
         .stop = o.stop,
         .snapshot = o.snapshot,
+        .park = o.park,
+        .bridge = o.bridge,
         .gpu = o.gpu,
         .journal = o.journal,
         .probe = o.probe,

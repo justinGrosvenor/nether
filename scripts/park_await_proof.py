@@ -170,12 +170,22 @@ def main():
         print("[park] guest awaiting upstream on conn=%d; /tmp/reply=%r (must be empty)" % (parked_id, cat(s, "/tmp/reply")))
         time.sleep(1.0)  # let the guest settle into recv()/WFI
 
-        # 4. Snapshot + KILL. The VM ceases to exist; the broker holds the upstream.
-        rep = cmd(s, "__snapshot__ park.snap", 90)
-        print("[snap] %s" % rep.strip().splitlines()[-1] if rep else "[snap] no reply")
-        if "OK" not in rep: fails.append("__snapshot__ failed: %r" % rep)
-        bp.terminate(); time.sleep(0.3); bp.kill()
-        print("[kill] VM process dead; guest exists only as park.snap + the broker's parked conn")
+        # 4. __park__: ONE command - quiesce, ring-gate, capture, bill, exit(0). The guest
+        #    is never resumed after the capture (no divergence window) and the process
+        #    exits itself: no snapshot+kill dance, no lost bill.
+        rep = cmd(s, "__park__ park.snap", 90)
+        print("[park] reply: %s" % rep.strip())
+        if not rep.startswith("OK parked"): fails.append("__park__ failed: %r" % rep)
+        if "uptime_ms=" not in rep: fails.append("__park__ reply missing the in-band bill: %r" % rep)
+        try:
+            rc = bp.wait(timeout=10)
+            print("[park] nether exited itself with code %s (no kill needed)" % rc)
+            if rc != 0: fails.append("park exit code %s != 0" % rc)
+        except subprocess.TimeoutExpired:
+            fails.append("nether did not exit after __park__"); bp.kill()
+        blog = open(os.path.join(base, "boot.log")).read()
+        if "(reason=park)" not in blog: fails.append("boot.log missing the reason=park teardown record")
+        if "guest left quiesced" not in blog: fails.append("boot.log missing the no-resume park line")
         t_parked = time.time()
 
         # 5. The upstream is slow... (nobody is paying for RAM/CPU right now)
@@ -210,6 +220,25 @@ def main():
         req_log = cat(fs, "/tmp/req.log")
         print("[wake] guest requester log: %r (blocking code ran to completion)" % req_log)
 
+        # 7. Strict lifecycle: the park is ONE-SHOT. The wake consumed the file (unlinked
+        #    at guest-resume; the fork's COW mapping keeps the inode alive), so a second
+        #    wake of the same park must fail cleanly - a parked conn can never revive twice.
+        snap_path = os.path.join(base, "park.snap")
+        if "park consumed" not in flog: fails.append("fork log missing 'park consumed'")
+        if os.path.exists(snap_path): fails.append("park.snap still exists after the wake (not consumed)")
+        else: print("[life] park.snap consumed by the wake (unlinked at guest-resume)")
+        fork2 = os.path.join(WORK, "f2"); os.makedirs(fork2)
+        open(os.path.join(fork2, "nether.conf"), "w").write(
+            "restore=1\nrestore_from=%s\ncontrol_socket=f2.sock\negress_socket=%s\n" % (snap_path, esock))
+        f2 = launch(fork2, "fork2.log")
+        try: rc2 = f2.wait(timeout=10)
+        except subprocess.TimeoutExpired: rc2 = None; f2.kill()
+        f2log = open(os.path.join(fork2, "fork2.log")).read()
+        if rc2 not in (None, 0) and "cannot open" in f2log:
+            print("[life] second wake refused (exit %s, 'cannot open'): one park = one wake, by construction" % rc2)
+        else:
+            fails.append("second wake of the consumed park did not fail cleanly (rc=%s, log=%r)" % (rc2, f2log[-200:]))
+
         try: cmd(fs, "__shutdown__", 5)
         except Exception: pass
     except SystemExit: pass
@@ -225,9 +254,10 @@ def main():
     print()
     if fails:
         print("RESULT: FAIL"); [print("  - " + f) for f in fails]; return 1
-    print("RESULT: PASS - ordinary blocking guest code parked mid-recv() (VM killed), upstream held by")
-    print("the platform, and a restored fork completed the SAME recv() with the reply. Park-while-")
-    print("awaiting-upstream is real.")
+    print("RESULT: PASS - ordinary blocking guest code parked mid-recv() via ONE __park__ command")
+    print("(quiesce, ring-gate, capture, bill in-band, self-exit 0, never resumed); upstream held by")
+    print("the platform; the wake completed the SAME recv() AND consumed the one-shot park file")
+    print("(second wake refused). Park-while-awaiting-upstream with a strict lifecycle.")
     return 0
 
 if __name__ == "__main__":

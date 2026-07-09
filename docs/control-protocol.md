@@ -376,18 +376,44 @@ tenant conn; `resume=1` announces a conn REVIVED by a snapshot restore (below).
 state, it SURVIVES a snapshot (unlike slirp NAT flows, which hold real host sockets and
 die with the process). So the platform can run this play: the guest issues an outbound
 request through the egress plane and blocks in `recv()`; the platform (holding the real
-upstream socket) notes the conn id from the preamble; it snapshots the VM (`__snapshot__`)
-and **kills it** - the guest now exists only as a snapshot file, costing nothing, while
-the upstream request stays alive in the platform's process. When the reply arrives, the
-platform restores the snapshot; nether enumerates the surviving egress conns and re-dials
-`egress_socket` with `resume=1 conn=<id>` for each; the platform splices the reply in,
-and the guest's ORIGINAL blocking `recv()` completes - ordinary code, never rewritten,
-that slept through its own death. Verified live on HVF: `scripts/park_await_proof.py`.
+upstream socket) notes the conn id from the preamble; it issues **`__park__ <path>`** -
+the guest now exists only as a park file, costing nothing, while the upstream request
+stays alive in the platform's process. When the reply arrives, the platform restores the
+park; nether enumerates the surviving egress conns and re-dials `egress_socket` with
+`resume=1 conn=<id>` for each; the platform splices the reply in, and the guest's
+ORIGINAL blocking `recv()` completes - ordinary code, never rewritten, that slept through
+its own death. Verified live on HVF: `scripts/park_await_proof.py` (~66ms restore ->
+reply delivered).
 
-Caveats: park when the conn is idle-awaiting (request fully delivered) - bytes still
-buffered in the bridge's host-side delivery ring at capture are NOT in the snapshot, and
-`__snapshot__` prints a loud NOTE if any are pending. Only vsock-proxied conns survive;
-anything over virtio-net/slirp still dies on restore and must re-establish at TCP level.
+Only vsock-proxied conns survive a park; anything over virtio-net/slirp still dies on
+restore and must re-establish at TCP level.
+
+### `__park__` and the snapshot lifecycle (strict)
+
+**`__park__ [path]`** is the atomic end of a session that intends to come back:
+quiesce (fail-closed at WFI, like `__snapshot__`) -> **ring gate** (refuse if the
+data/egress bridge still holds undelivered bytes - they are host memory a snapshot cannot
+carry; waits up to ~1s for drain, then `ERR` unless `park_dirty=1`) -> capture ->
+**bill** -> **exit 0**. The guest is NEVER resumed after the capture: resuming before
+exit would open a divergence window (any guest vsock activity between capture and death
+makes the live stream disagree with the parked state, so a wake would see duplicates or
+gaps). The `OK parked` reply carries the teardown bill in-band (same fields as
+`__stats__`), and the usual `final usage`/`x402 settlement` record still goes to stdout -
+one command, one exit code, no snapshot+kill dance, no lost bill.
+
+**Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
+
+- **base** (`__snapshot__`): durable; forks many; re-bake on version drift.
+- **park** (`__park__`): **one-shot**. A wake CONSUMES it - `macRestore` unlinks the
+  file at the moment the guest resumes (the fork's COW RAM mapping keeps the inode
+  alive), so a second wake of the same park fails with `cannot open`. One park = one
+  wake, enforced by the filesystem, not platform discipline - a parked conn can never be
+  revived into two forks. `validate_snapshot` reports `kind=base` or `kind=park
+  (one-shot)`; an unknown kind is rejected fail-closed.
+
+Strict hygiene, both kinds: a failed capture unlinks its partial file (a half-written
+full-RAM image - tenant secrets frozen inside - must not linger), and snapshot files are
+written 0600.
 
 ## Snapshot / fork (HVF)
 

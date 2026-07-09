@@ -78,6 +78,22 @@ pub const SnapCtx = struct {
 /// write so the RAM image is consistent (unlike a live copy, which could tear). An
 /// in-progress guard rejects a concurrent capture. Returns true on success.
 pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
+    return captureImpl(ctx, path, true);
+}
+
+/// `__park__`'s capture: identical to captureToFile except the guest is NOT resumed on
+/// success - the caller (the control plane) bills and exits the process with the vCPUs
+/// still quiesced. Resuming before a park-exit would open a divergence window: any guest
+/// vsock activity between the capture and the process death (consuming staged bytes,
+/// sending new ones) makes the live stream disagree with the parked snapshot, so a later
+/// wake would see duplicates or gaps. Park = the snapshot IS the guest's last live moment.
+/// On FAILURE the guest is resumed as usual (a failed park must leave a usable sandbox).
+pub fn parkCall(p: *anyopaque, path: [*:0]const u8) bool {
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    return captureImpl(ctx, path, false);
+}
+
+fn captureImpl(ctx: *SnapCtx, path: [*:0]const u8, resume_after: bool) bool {
     const hvfb = @import("../hv/hvf_backend.zig");
     if (ctx.capturing.swap(true, .acq_rel)) {
         std.debug.print("[nether] snapshot: a capture is already in progress\n", .{});
@@ -132,10 +148,16 @@ pub fn captureToFile(ctx: *SnapCtx, path: [*:0]const u8) bool {
     const vsock_snap: ?nether.Vsock.State = if (has_ctl) ctx.vsock.?.exportState() else null;
     const conn_id_snap: i32 = if (has_ctl) ctx.agent.?.conn_id.load(.acquire) else -1;
     const net_dev_snap: ?nether.virtio.Device.DeviceState = if (ctx.net_dev) |nd| nd.exportState() else null;
-    // Write while still quiesced (consistent image), then resume.
-    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap);
-    sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
-    std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
+    // Write while still quiesced (consistent image). Resume only when this is a live
+    // capture (or the write failed - a failed park must leave a usable sandbox); a PARK
+    // leaves the vCPUs quiesced so the snapshot is the guest's final live moment.
+    const ok = writeSnapshotFile(path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK);
+    if (resume_after or !ok) {
+        sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
+        std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
+    } else {
+        std.debug.print("[nether] parked to {s} ({d} MiB + state, control-plane={s}, net={s}); guest left quiesced (no resume).\n", .{ path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
+    }
     return ok;
 }
 
@@ -315,6 +337,16 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
 // only (raw struct layout, native endian).
 const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
 const SNAP_VERSION: u32 = 4; // bumped: header carries a control-plane flag + vsock state
+
+// Snapshot KIND (hdr[80..84]): the lifecycle contract, baked into the file itself.
+//   0 = BASE: durable, forks many (the platform re-bakes on version drift).
+//   1 = PARK: __park__'s one-shot capture of a killed VM's last live moment. A wake
+//       CONSUMES it - macRestore unlinks the file the moment the guest resumes, so a
+//       second wake of the same park (which would revive one parked conn into two
+//       forks) is impossible by construction, not by platform discipline.
+// Pre-kind v4 files carry 0 here (header zero padding), so they read as bases.
+const SNAP_KIND_BASE: u32 = 0;
+const SNAP_KIND_PARK: u32 = 1;
 const HDR_SIZE: usize = 128; // header bytes (grew from 64 for the control-plane fields)
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
 const GIC_STATE_MAX: u64 = 16 * 1024 * 1024; // sane cap for the GIC blob (~126 KiB in practice)
@@ -345,6 +377,9 @@ fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_ca
     // struct must match this build's layout, same as the cpu/dev/uart fingerprints.
     if (std.mem.readInt(u32, hdr[64..68], .little) == 1 and
         std.mem.readInt(u32, hdr[68..72], .little) != vsock_sz) return error.SnapshotLayoutMismatch;
+    // Lifecycle kind must be one this build understands (fail closed on garbage - an
+    // unknown kind means a newer format or corruption, either way don't guess).
+    if (std.mem.readInt(u32, hdr[80..84], .little) > SNAP_KIND_PARK) return error.BadSnapshot;
 }
 
 fn writeSnapshotFile(
@@ -360,6 +395,30 @@ fn writeSnapshotFile(
     vsock: ?nether.Vsock.State, // vsock engine state
     conn_id: i32, // surviving agent connection id (-1 if none)
     net_dev: ?nether.virtio.Device.DeviceState, // virtio-net transport state (null => no NIC)
+    kind: u32, // SNAP_KIND_BASE or SNAP_KIND_PARK (the file's lifecycle contract)
+) bool {
+    const ok = writeSnapshotBody(path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind);
+    // Strict lifecycle: a failed write never leaves debris. A truncated snapshot would be
+    // rejected on restore anyway, but a half-written full-RAM image (tenant secrets
+    // frozen inside) must not linger on disk either.
+    if (!ok) _ = libc.unlink(path);
+    return ok;
+}
+
+fn writeSnapshotBody(
+    path: [*:0]const u8,
+    ram: []const u8,
+    cpus: anytype,
+    con: anytype,
+    blk: anytype,
+    uart: anytype,
+    gic: []const u8,
+    disk: []const u8,
+    vs_dev: ?nether.virtio.Device.DeviceState,
+    vsock: ?nether.Vsock.State,
+    conn_id: i32,
+    net_dev: ?nether.virtio.Device.DeviceState,
+    kind: u32,
 ) bool {
     // O_NOFOLLOW: when the path comes from __snapshot__ it is jailed (parent resolved),
     // so refuse a pre-existing symlink at the basename that would redirect the write
@@ -403,6 +462,8 @@ fn writeSnapshotFile(
     // virtio-net transport present: a flag; the device-state reuses the dev_sz
     // fingerprint (same virtio.Device.DeviceState type as con/blk/vsock).
     std.mem.writeInt(u32, hdr[76..80], if (net) @as(u32, 1) else 0, .little);
+    // Lifecycle kind: BASE (durable, forks many) or PARK (one-shot, consumed by its wake).
+    std.mem.writeInt(u32, hdr[80..84], kind, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -555,7 +616,8 @@ pub fn validateSnapshotFile(path: [*:0]const u8) !void {
         }
     }
 
-    std.debug.print("[nether] validate: OK - format v{d}, {d} cpus, {d} MiB RAM, gic {d}B, disk {d}B, control-plane={s}, net={s}\n", .{ SNAP_VERSION, num_cpus, ram_size / (1024 * 1024), gic_size, disk_size, if (ctl) "on" else "off", if (net) "on" else "off" });
+    const kind = std.mem.readInt(u32, hdr[80..84], .little);
+    std.debug.print("[nether] validate: OK - format v{d}, kind={s}, {d} cpus, {d} MiB RAM, gic {d}B, disk {d}B, control-plane={s}, net={s}\n", .{ SNAP_VERSION, if (kind == SNAP_KIND_PARK) "park (one-shot)" else "base", num_cpus, ram_size / (1024 * 1024), gic_size, disk_size, if (ctl) "on" else "off", if (net) "on" else "off" });
 }
 
 /// Restore a guest from a snapshot file (a cross-process fork): rebuild the VM,
@@ -591,6 +653,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const ctl_present = std.mem.readInt(u32, hdr[64..68], .little) == 1;
     const saved_conn_id = std.mem.readInt(i32, hdr[72..76], .little);
     const net_present = std.mem.readInt(u32, hdr[76..80], .little) == 1;
+    const snap_kind = std.mem.readInt(u32, hdr[80..84], .little);
 
     // The RAM region is mapped copy-on-write by offset (not read), so a file that is
     // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
@@ -965,6 +1028,15 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     }
     defer if (ctl_present) render.deinit();
 
+    // A PARK is one-shot: consume it at the moment the guest resumes. The COW RAM mapping
+    // holds the inode alive for this fork's lifetime, so unlinking now is safe - and it
+    // makes a second wake of the same park impossible (ENOENT) by construction: one parked
+    // conn can never be revived into two forks. Bases (kind 0) stay durable and fork many.
+    if (snap_kind == SNAP_KIND_PARK) {
+        _ = libc.unlink(path);
+        std.debug.print("[nether] park consumed (one-shot): {s} unlinked; this wake is the only wake\n", .{path});
+    }
+
     go.store(true, .release); // release secondaries; run cpu0
     const reason = vcpu.runSmp(&bus, &power, null, null) catch |err| {
         std.debug.print("\n[nether] forked guest stopped: {s}\n", .{@errorName(err)});
@@ -999,6 +1071,14 @@ test "snapshot header validation gates version, layout, and oversized sizes" {
     std.mem.writeInt(u32, hdr[64..68], 1, .little); // control-plane present
     std.mem.writeInt(u32, hdr[68..72], VSOCK, .little); // vsock engine-state fingerprint
     try validateHeader(&hdr, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK); // accepts a good header
+
+    // Lifecycle kinds: base (0, the zero-padding default of pre-kind files) and park (1)
+    // are valid; anything else is fail-closed (newer format or corruption - don't guess).
+    var kh = hdr;
+    std.mem.writeInt(u32, kh[80..84], SNAP_KIND_PARK, .little);
+    try validateHeader(&kh, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK);
+    std.mem.writeInt(u32, kh[80..84], 2, .little); // unknown kind
+    try testing.expectError(error.BadSnapshot, validateHeader(&kh, 8, DISK_CAP, GIC_CAP, CPU, DEV, UART, VSOCK));
 
     var bad = hdr;
     std.mem.writeInt(u32, bad[0..4], 0xdead_beef, .little); // wrong magic
