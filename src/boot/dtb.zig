@@ -74,6 +74,14 @@ pub const Builder = struct {
         self.padTo4();
     }
 
+    /// A raw byte-array property (no NUL terminator), e.g. /chosen rng-seed.
+    pub fn propBytes(self: *Builder, name: []const u8, bytes: []const u8) void {
+        self.header(name, bytes.len);
+        @memcpy(self.sbuf[self.slen..][0..bytes.len], bytes);
+        self.slen += bytes.len;
+        self.padTo4();
+    }
+
     /// A <stringlist>: several NUL-terminated strings concatenated (e.g.
     /// compatible = "arm,pl011", "arm,primecell").
     pub fn propStrings(self: *Builder, name: []const u8, parts: []const []const u8) void {
@@ -202,6 +210,12 @@ pub const VirtConfig = struct {
     virtio: []const VirtioDev = &.{},
     pcie: ?PcieConfig = null,
     msi: ?MsiConfig = null,
+    // /chosen rng-seed: host-provided entropy the kernel mixes into (and, with
+    // CONFIG_RANDOM_TRUST_BOOTLOADER, credits to) its crng at boot. Without it a quiet
+    // microVM takes ~10s of jitter accumulation before getrandom() unblocks - which
+    // stalls the first python (hash-seed) in every fresh boot AND in every fork whose
+    // base was baked before the crng self-initialized. Empty = omit the property.
+    rng_seed: []const u8 = &.{},
 };
 
 /// Build the "virt" device tree into `out` and return its size. Uses two
@@ -230,6 +244,7 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.beginNode("chosen");
     b.propString("bootargs", cfg.cmdline);
     b.propString("stdout-path", "/pl011@9000000");
+    if (cfg.rng_seed.len > 0) b.propBytes("rng-seed", cfg.rng_seed);
     // Force the kernel out of PCI_PROBE_ONLY so it *assigns* (not just claims)
     // BARs. With a direct kernel boot there is no firmware to assign PCI
     // resources; without this the generic host bridge leaves BARs unassigned and
@@ -471,6 +486,19 @@ test "virt DTB carries the cmdline and key device nodes" {
     // Property names are interned once in the strings block.
     try testing.expect(std.mem.indexOf(u8, blob, "compatible") != null);
     try testing.expect(std.mem.indexOf(u8, blob, "interrupts") != null);
+}
+
+test "chosen rng-seed appears when provided and is omitted when empty" {
+    var out: [8192]u8 = undefined;
+    const seed = [_]u8{0xA5} ** 64; // recognizable non-zero payload
+    var n = buildVirt(&out, .{ .cmdline = "c", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000, .rng_seed = &seed });
+    var blob = out[0..n];
+    try testing.expect(std.mem.indexOf(u8, blob, "rng-seed") != null); // property name interned
+    try testing.expect(std.mem.indexOf(u8, blob, &seed) != null); // the 64 seed bytes verbatim
+    // Fail closed: no host entropy -> no property (never credit a predictable seed).
+    n = buildVirt(&out, .{ .cmdline = "c", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
+    blob = out[0..n];
+    try testing.expect(std.mem.indexOf(u8, blob, "rng-seed") == null);
 }
 
 test "v2m MSI frame and msi-parent appear when an MSI config is given" {

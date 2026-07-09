@@ -849,9 +849,30 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         egress_port,
     }) catch base_cmdline;
 
+    // Seed the guest crng from host entropy via /chosen rng-seed: without it a quiet
+    // microVM needs ~10s of jitter accumulation before getrandom() unblocks, which
+    // stalls the first python (hash-seed) in every boot - and in every FORK whose base
+    // was baked before the guest crng self-initialized (proven by the density probe).
+    // Fail closed: if host entropy is unavailable, OMIT the property (the kernel then
+    // self-initializes as before) rather than credit a predictable seed.
+    var rng_seed: [64]u8 = undefined;
+    const seed_ok = blk: {
+        const rf = libc.open("/dev/urandom", 0);
+        if (rf < 0) break :blk false;
+        defer _ = libc.close(rf);
+        var got: usize = 0;
+        while (got < rng_seed.len) {
+            const r = libc.read(rf, rng_seed[got..].ptr, rng_seed.len - got);
+            if (r <= 0) break :blk false;
+            got += @intCast(r);
+        }
+        break :blk true;
+    };
+
     var dtb_buf: [16 * 1024]u8 = undefined;
     const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
         .cmdline = cmdline,
+        .rng_seed = if (seed_ok) @as([]const u8, &rng_seed) else &.{},
         .mem_base = ARM_RAM_BASE,
         .mem_size = ram_size,
         .gicd_size = vm.hv.gicd_size,

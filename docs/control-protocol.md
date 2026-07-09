@@ -409,6 +409,16 @@ and consumes on wake like any park. Verified live: `scripts/park_await_proof.py`
 full generations - the woken fork re-parks mid-recv() and its second wake completes both
 that recv() and preserves the first generation's state.
 
+**Guest entropy.** Nether seeds the guest crng at boot via a `/chosen rng-seed` DTB
+property (64 bytes of host entropy; omitted fail-closed if the host has none). Without
+it a quiet microVM needs ~10s of jitter accumulation before `getrandom()` unblocks -
+which stalled the first `python3` (hash-seed) in every boot and in every fork whose base
+was baked before the crng self-initialized (measured: a fork's first python took 10.2s;
+with the seed, instant). Caveat inherent to ANY fork model: forks of one base restore
+identical crng state, so two sibling forks produce identical random streams until the
+guest reseeds - do not treat sibling forks as mutually secret. (A proper post-restore
+reseed - virtio-rng or vmgenid - is future work.)
+
 **Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
 
 - **base** (`__snapshot__`): durable; forks many; re-bake on version drift.
