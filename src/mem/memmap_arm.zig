@@ -52,5 +52,14 @@ pub const pci_intx_spi: u32 = 3; // legacy INTA -> SPI (INTID 35)
 /// Main RAM starts at 1 GiB (below it is the MMIO/device region).
 pub const ram_base: u64 = 0x4000_0000;
 
+/// vmgenid (VM Generation ID): the guest kernel's `microsoft,vmgenid` driver watches a
+/// 16-byte GUID and reseeds the crng when it changes, so a snapshot-forked guest gets a
+/// distinct random stream with no agent round-trip. The GUID lives in the TOP page of the
+/// mapped RAM, which the DTB `memory` node excludes (so the guest treats it as a device
+/// region it can ioremap, not System RAM). The host writes a fresh GUID + pulses this SPI
+/// on restore. SPI 8 (INTID 40) is clear of UART (33), virtio, and PCI INTx (35-38).
+pub const vmgenid_page: u64 = 0x4000; // 16 KiB reserved at the top of RAM (host-page sized)
+pub const vmgenid_spi: u32 = 8;
+
 /// The standard PL011 reference clock the DTB advertises (24 MHz).
 pub const apb_clock_hz: u32 = 24_000_000;

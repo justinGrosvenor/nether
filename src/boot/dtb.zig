@@ -216,6 +216,10 @@ pub const VirtConfig = struct {
     // stalls the first python (hash-seed) in every fresh boot AND in every fork whose
     // base was baked before the crng self-initialized. Empty = omit the property.
     rng_seed: []const u8 = &.{},
+    // vmgenid GUID guest-physical address (0 = omit the node). The caller places it in a
+    // page it reserved out of `mem_size` (the top page of RAM), so the region is not
+    // System RAM and the guest driver can ioremap it. See memmap_arm.vmgenid_page.
+    vmgenid_addr: u64 = 0,
 };
 
 /// Build the "virt" device tree into `out` and return its size. Uses two
@@ -327,6 +331,21 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.propString("device_type", "memory");
     b.propCells("reg", &.{ hi(cfg.mem_base), lo(cfg.mem_base), hi(cfg.mem_size), lo(cfg.mem_size) });
     b.endNode();
+
+    // vmgenid: the guest's microsoft,vmgenid driver ioremaps this 16-byte GUID region (a
+    // page the memory node excludes, so it is not System RAM) and reseeds the crng when the
+    // host changes the GUID and pulses the SPI on restore. Emitted only when the caller
+    // reserved the page (vmgenid_addr != 0). Edge-rising interrupt: the pulse is a one-shot
+    // generation-change notification.
+    if (cfg.vmgenid_addr != 0) {
+        var vgname: [40]u8 = undefined;
+        const vgn = std.fmt.bufPrint(&vgname, "vmgenid@{x}", .{cfg.vmgenid_addr}) catch unreachable;
+        b.beginNode(vgn);
+        b.propString("compatible", "microsoft,vmgenid");
+        b.propCells("reg", &.{ hi(cfg.vmgenid_addr), lo(cfg.vmgenid_addr), hi(arm.vmgenid_page), lo(arm.vmgenid_page) });
+        b.propCells("interrupts", &.{ 0, arm.vmgenid_spi, 0x01 }); // SPI, id, edge-rising
+        b.endNode();
+    }
 
     b.beginNode("pl011@9000000");
     b.propStrings("compatible", &.{ "arm,pl011", "arm,primecell" });
@@ -499,6 +518,18 @@ test "chosen rng-seed appears when provided and is omitted when empty" {
     n = buildVirt(&out, .{ .cmdline = "c", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
     blob = out[0..n];
     try testing.expect(std.mem.indexOf(u8, blob, "rng-seed") == null);
+}
+
+test "vmgenid node appears with reg + edge interrupt when an address is given, omitted otherwise" {
+    var out: [8192]u8 = undefined;
+    var n = buildVirt(&out, .{ .cmdline = "c", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000, .vmgenid_addr = 0x47ff_c000 });
+    var blob = out[0..n];
+    try testing.expect(std.mem.indexOf(u8, blob, "microsoft,vmgenid") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "vmgenid@47ffc000") != null);
+    // Absent when no address is reserved.
+    n = buildVirt(&out, .{ .cmdline = "c", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 });
+    blob = out[0..n];
+    try testing.expect(std.mem.indexOf(u8, blob, "microsoft,vmgenid") == null);
 }
 
 test "v2m MSI frame and msi-parent appear when an MSI config is given" {

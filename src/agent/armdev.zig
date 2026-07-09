@@ -110,6 +110,19 @@ pub fn armUartIrq(ctx: *anyopaque, level: bool) void {
     _ = hvf.hv_gic_set_spi(ARM_UART_INTID, level);
 }
 
+/// The vmgenid notification SPI (DTB: edge-rising).
+pub const ARM_VMGENID_INTID: u32 = 32 + nether.memmap_arm.vmgenid_spi;
+
+/// Pulse the vmgenid SPI so the guest's microsoft,vmgenid driver re-reads the generation
+/// GUID and reseeds the crng (add_vmfork_randomness). Host-side, on restore, AFTER a fresh
+/// GUID is written into the fork's COW RAM. The rising edge latches pending in the
+/// distributor, so cpu0 takes it as soon as it resumes with interrupts enabled.
+pub fn pulseVmgenid() void {
+    const hvf = @import("../hv/hvf.zig");
+    _ = hvf.hv_gic_set_spi(ARM_VMGENID_INTID, true);
+    _ = hvf.hv_gic_set_spi(ARM_VMGENID_INTID, false);
+}
+
 /// Routes accesses across the whole 64-bit PCI MMIO window to the virtio device
 /// whose *live* BAR0 contains the address. The kernel assigns each function's BAR
 /// somewhere in the window, so we can't bind fixed sub-regions up front; instead

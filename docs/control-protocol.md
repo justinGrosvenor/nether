@@ -463,30 +463,28 @@ which stalled the first `python3` (hash-seed) in every boot and in every fork wh
 was baked before the crng self-initialized (measured: a fork's first python took 10.2s;
 with the seed, instant).
 
-**Fork reseed.** Forks of one base restore identical crng state, so without intervention
-two sibling forks emit identical `getrandom()`/urandom streams until the guest reseeds
-on its own schedule. Nether closes this at every restore: it queues
-`__reseed__ <64 bytes of host entropy, hex>` on the surviving agent connection BEFORE
-the guest resumes (so it is the first input the woken agent reads, ahead of any control
-client), and the agent - never the shell - feeds it via `RNDADDENTROPY` with the bits
-credited, then forces `RNDRESEEDCRNG`. The forced reseed is required: credited
-input-pool entropy alone waits for the crng's next scheduled reseed (measured: siblings
-stayed identical with `RNDADDENTROPY` only; with `RNDRESEEDCRNG` they diverge on the
-FIRST post-wake read - `scripts/fork_entropy_proof.py`). The reseed is silent by
-contract: no output, no `0x1e` trailer, so client framing is untouched. The host log
-records `fork crng reseeded (64B via agent)`; failures print a NOTE and continue
-(fail-open - an unreseeded fork is no worse than the old behavior). Opt out with
-`fork_reseed=0` in `nether.conf`.
+**Fork reseed (vmgenid).** Forks of one base restore identical crng state, so without
+intervention two sibling forks emit identical `getrandom()`/urandom streams until the
+guest reseeds on its own schedule. Nether closes this natively with **vmgenid** (the
+kernel's standard VM-fork detection): every VM boots with a `microsoft,vmgenid` DT node
+whose stock guest driver ioremaps a 16-byte generation GUID (in the reserved top page of
+RAM, excluded from the `memory` node) and registers an edge interrupt. On each restore
+nether writes a FRESH host-random GUID into the fork's private COW copy and pulses that
+SPI; the guest driver sees the generation change and calls `add_vmfork_randomness()`,
+which reseeds the crng immediately. Distinct GUIDs per fork mean divergent streams from
+the **first** post-wake draw. This needs **no agent round-trip and no initramfs re-bake**
+(the driver is built into the stock kernel); the host log records `fork crng reseeded
+(vmgenid generation change + SPI pulse)`. Opt out with `fork_reseed=0` in `nether.conf`.
+Verified live (`scripts/vmgenid_proof.py`): with the gate off two siblings emit identical
+first reads; with it on they diverge and the guest's vmgenid IRQ count increments once per
+wake (the pulse landed).
 
-Remaining window: guest code that reads randomness between resume and the agent
-consuming the reseed line (i.e. before any relayed command) still sees base-derived
-state; anything driven through the control protocol runs after the reseed. Old guest
-images whose agent predates the handler do not reseed - the line falls through to the
-shell, whose `not found` reply frame is discarded while no control client is attached,
-but a client that attaches before the guest drains it can see one stray frame
-(off-by-one until the next trailer). Re-bake the initramfs
-(`tools/build-guest-aarch64-runtimes.sh`) to get the handler, or set `fork_reseed=0`
-for fleets on old images.
+Requirement: the BASE must have booted with the vmgenid DT node for its forks to reseed
+(any nether carrying this feature emits it) - re-bake bases captured by an older nether (a
+cheap base re-bake, not an initramfs re-bake). Remaining window: guest code that draws
+randomness in the instant between resume and the IRQ being taken is vanishingly small (the
+rising edge is latched pending before cpu0 runs, so the handler runs before userspace
+resumes), but is not formally zero.
 
 **Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
 

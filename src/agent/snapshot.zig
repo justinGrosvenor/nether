@@ -1014,37 +1014,6 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         vs.on_event_ctx = &vs_router;
         _ = vsdev.hostListen(5000); // idempotent (restored listen set already has it); enables future reconnects
         core.agent.conn_id.store(saved_conn_id, .release); // the surviving connection drives immediately
-        // Fork entropy divergence (post-park hardening T2): sibling forks of one base
-        // restore IDENTICAL crng state and would emit identical getrandom() streams.
-        // Queue an agent-mediated reseed (`__reseed__ <hex>`, parsed inside the agent,
-        // SILENT - no reply frame) on the surviving conn NOW: the guest has not resumed
-        // yet and no control client can have attached (the socket opens below), so the
-        // reseed is the first input the woken agent reads and the streams diverge from
-        // the first post-wake draw. Gate: fork_reseed=0 in nether.conf opts out
-        // (default ON). Fail-open on any failure - a NOTE, not an error: a fork
-        // without the reseed is no worse than the pre-T2 behavior. Old guest images
-        // (agent baked without the handler) need a re-bake; see docs/control-protocol.md
-        // "Guest entropy".
-        if (saved_conn_id >= 0 and conf.confGetInt("fork_reseed", 1) != 0) {
-            var ent: [64]u8 = undefined;
-            if (readHostEntropy(&ent)) {
-                var rl: [11 + 2 * ent.len + 1]u8 = undefined; // "__reseed__ " + hex + "\n"
-                @memcpy(rl[0..11], "__reseed__ ");
-                const hexd = "0123456789abcdef";
-                for (ent, 0..) |b, j| {
-                    rl[11 + 2 * j] = hexd[b >> 4];
-                    rl[11 + 2 * j + 1] = hexd[b & 0xf];
-                }
-                rl[rl.len - 1] = '\n';
-                if (vsdev.hostSend(@intCast(saved_conn_id), &rl) == rl.len) {
-                    std.debug.print("[nether] fork crng reseeded (64B via agent)\n", .{});
-                } else {
-                    std.debug.print("[nether] restore NOTE: reseed line not fully queued; fork crng NOT reseeded (siblings may share a random stream)\n", .{});
-                }
-            } else {
-                std.debug.print("[nether] restore NOTE: no host entropy; fork crng NOT reseeded (siblings may share a random stream)\n", .{});
-            }
-        }
         if (have_bridge) {
             data_bridge.start(); // spawn the fork's data-plane listener
             if (ds_conf.len > 0) std.debug.print("[nether] fork data plane ON at {s}: dials the inherited in-guest forwarder; warm tenant server is immediately serving.\n", .{@as([*:0]const u8, @ptrCast(&data_sock_buf))});
@@ -1156,6 +1125,26 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     if (snap_kind == SNAP_KIND_PARK) {
         _ = libc.unlink(path);
         std.debug.print("[nether] park consumed (one-shot): {s} unlinked; this wake is the only wake\n", .{path});
+    }
+
+    // Fork entropy divergence (vmgenid): the base booted with a `microsoft,vmgenid` DT node
+    // whose stock guest driver watches a 16-byte GUID in the reserved top RAM page. Write a
+    // FRESH host-random GUID into THIS fork's private COW copy and pulse the vmgenid SPI, so
+    // the guest sees a generation change and calls add_vmfork_randomness() - an immediate
+    // crng reseed. Two siblings get distinct GUIDs, so their streams diverge from the first
+    // post-wake draw, with NO agent round-trip and NO initramfs re-bake (the driver is stock
+    // in the guest kernel). Gate: fork_reseed=0 opts out. Fork of a pre-vmgenid base (no DT
+    // node) is a no-op here (nothing watches the page); re-bake such bases.
+    if (conf.confGetInt("fork_reseed", 1) != 0) {
+        const goff: usize = @intCast(ram_size - nether.memmap_arm.vmgenid_page);
+        var guid: [16]u8 = undefined;
+        if (goff + guid.len <= ram.len and readHostEntropy(guid[0..])) {
+            @memcpy(ram[goff..][0..guid.len], &guid);
+            armdev.pulseVmgenid();
+            std.debug.print("[nether] fork crng reseeded (vmgenid generation change + SPI pulse)\n", .{});
+        } else {
+            std.debug.print("[nether] restore NOTE: vmgenid reseed skipped (no host entropy or RAM too small); siblings may share a random stream\n", .{});
+        }
     }
 
     go.store(true, .release); // release secondaries; run cpu0

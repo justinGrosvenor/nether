@@ -869,12 +869,24 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         break :blk true;
     };
 
+    // vmgenid: reserve the TOP page of RAM for the 16-byte generation GUID and hide it from
+    // the guest's `memory` node (so the microsoft,vmgenid driver ioremaps it as a device
+    // region, not System RAM). Seed the initial GUID from host entropy so the driver caches
+    // a value at probe; on a snapshot restore the fork writes a FRESH GUID here + pulses the
+    // SPI, and the guest reseeds its crng (kernel-native, no agent round-trip). The page is
+    // still mapped/backed by Nether - only the guest's RAM view is one page shorter.
+    const vmgenid_page: usize = @intCast(nether.memmap_arm.vmgenid_page);
+    const guest_ram = ram_size - vmgenid_page;
+    const vmgenid_addr = ARM_RAM_BASE + guest_ram;
+    if (seed_ok) @memcpy(ram[guest_ram..][0..16], rng_seed[0..16]); // initial GUID (else stays zero)
+
     var dtb_buf: [16 * 1024]u8 = undefined;
     const dtb_len = nether.dtb.buildVirt(&dtb_buf, .{
         .cmdline = cmdline,
         .rng_seed = if (seed_ok) @as([]const u8, &rng_seed) else &.{},
         .mem_base = ARM_RAM_BASE,
-        .mem_size = ram_size,
+        .mem_size = guest_ram,
+        .vmgenid_addr = vmgenid_addr,
         .gicd_size = vm.hv.gicd_size,
         .gicr_base = gicr_base,
         .gicr_size = vm.hv.gicr_size,
