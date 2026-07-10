@@ -27,6 +27,11 @@ pub const Builder = struct {
     slen: usize = 0,
     strbuf: []u8, // strings block accumulator
     strlen: usize = 0,
+    /// Set if any write would have exceeded sbuf/strbuf. Once set, every further write is a
+    /// no-op and finish() fails closed (returns 0) rather than emitting a truncated or
+    /// out-of-bounds DTB. Guards the fixed scratch buffers against an over-long operator
+    /// cmdline (/chosen bootargs is the only variable-length input to the tree).
+    overflow: bool = false,
 
     pub fn init(struct_scratch: []u8, strings_scratch: []u8) Builder {
         return .{ .sbuf = struct_scratch, .strbuf = strings_scratch };
@@ -34,10 +39,8 @@ pub const Builder = struct {
 
     pub fn beginNode(self: *Builder, name: []const u8) void {
         self.put32(FDT_BEGIN_NODE);
-        @memcpy(self.sbuf[self.slen..][0..name.len], name);
-        self.slen += name.len;
-        self.sbuf[self.slen] = 0; // name NUL
-        self.slen += 1;
+        self.sput(name);
+        self.sput(&.{0}); // name NUL
         self.padTo4();
     }
 
@@ -67,18 +70,15 @@ pub const Builder = struct {
 
     pub fn propString(self: *Builder, name: []const u8, s: []const u8) void {
         self.header(name, s.len + 1);
-        @memcpy(self.sbuf[self.slen..][0..s.len], s);
-        self.slen += s.len;
-        self.sbuf[self.slen] = 0;
-        self.slen += 1;
+        self.sput(s);
+        self.sput(&.{0});
         self.padTo4();
     }
 
     /// A raw byte-array property (no NUL terminator), e.g. /chosen rng-seed.
     pub fn propBytes(self: *Builder, name: []const u8, bytes: []const u8) void {
         self.header(name, bytes.len);
-        @memcpy(self.sbuf[self.slen..][0..bytes.len], bytes);
-        self.slen += bytes.len;
+        self.sput(bytes);
         self.padTo4();
     }
 
@@ -89,10 +89,8 @@ pub const Builder = struct {
         for (parts) |p| total += p.len + 1;
         self.header(name, total);
         for (parts) |p| {
-            @memcpy(self.sbuf[self.slen..][0..p.len], p);
-            self.slen += p.len;
-            self.sbuf[self.slen] = 0;
-            self.slen += 1;
+            self.sput(p);
+            self.sput(&.{0});
         }
         self.padTo4();
     }
@@ -105,6 +103,11 @@ pub const Builder = struct {
         const struct_off = HEADER_SIZE + RSVMAP_SIZE;
         const strings_off = struct_off + self.slen;
         const total = strings_off + self.strlen;
+
+        // Fail closed: if any write overflowed the scratch buffers (over-long cmdline) or
+        // the assembled DTB would not fit `out`, emit nothing and signal failure with 0 -
+        // the caller aborts the boot rather than handing the guest a truncated/garbage tree.
+        if (self.overflow or total > out.len) return 0;
 
         // fdt_header (all big-endian).
         const h = [_]u32{
@@ -136,12 +139,33 @@ pub const Builder = struct {
     }
 
     fn put32(self: *Builder, v: u32) void {
+        if (self.slen + 4 > self.sbuf.len) {
+            self.overflow = true;
+            return;
+        }
         std.mem.writeInt(u32, self.sbuf[self.slen..][0..4], v, .big);
         self.slen += 4;
     }
 
+    /// Append raw bytes to the structure block, flagging overflow instead of overrunning.
+    fn sput(self: *Builder, bytes: []const u8) void {
+        if (self.slen + bytes.len > self.sbuf.len) {
+            self.overflow = true;
+            return;
+        }
+        @memcpy(self.sbuf[self.slen..][0..bytes.len], bytes);
+        self.slen += bytes.len;
+    }
+
     fn padTo4(self: *Builder) void {
-        while (self.slen % 4 != 0) : (self.slen += 1) self.sbuf[self.slen] = 0;
+        while (self.slen % 4 != 0) {
+            if (self.slen >= self.sbuf.len) {
+                self.overflow = true;
+                return;
+            }
+            self.sbuf[self.slen] = 0;
+            self.slen += 1;
+        }
     }
 
     /// Intern a property name into the strings block (deduplicated), returning
@@ -154,6 +178,10 @@ pub const Builder = struct {
             i = end + 1;
         }
         const off = self.strlen;
+        if (off + name.len + 1 > self.strbuf.len) {
+            self.overflow = true;
+            return off;
+        }
         @memcpy(self.strbuf[off..][0..name.len], name);
         self.strbuf[off + name.len] = 0;
         self.strlen += name.len + 1;
@@ -515,6 +543,17 @@ test "virt DTB carries the cmdline and key device nodes" {
     // Property names are interned once in the strings block.
     try testing.expect(std.mem.indexOf(u8, blob, "compatible") != null);
     try testing.expect(std.mem.indexOf(u8, blob, "interrupts") != null);
+}
+
+test "virt DTB fails closed on an over-long cmdline instead of overrunning scratch" {
+    // The Builder's sbuf is a fixed 4096 B; a cmdline longer than that (the only
+    // variable-length input) must set the overflow flag and make buildVirt return 0,
+    // never @memcpy past the stack scratch buffers.
+    var out: [16384]u8 = undefined;
+    const huge = [_]u8{'a'} ** 5000; // > sbuf (4096)
+    try testing.expectEqual(@as(usize, 0), buildVirt(&out, .{ .cmdline = &huge, .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 }));
+    // A normal cmdline still builds a non-empty tree.
+    try testing.expect(buildVirt(&out, .{ .cmdline = "console=ttyAMA0", .mem_base = 0x4000_0000, .mem_size = 0x0800_0000 }) > 0);
 }
 
 test "chosen rng-seed appears when provided and is omitted when empty" {

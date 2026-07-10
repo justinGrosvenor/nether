@@ -48,7 +48,14 @@ pub fn buildStartInfo(
     rsdp: u64,
     cmdline: []const u8,
     module: ?Module,
-) StartInfo {
+) error{CmdlineTooLong}!StartInfo {
+    // Bound every write up front: only `cmdline` is variable-length; the memmap (<= 2
+    // entries * 24 B), its NUL, the alignment padding, the optional module (32 B) and the
+    // start_info block (56 B) are all fixed. If the whole thing would not fit `buf`, fail
+    // instead of running the @memcpy below past the caller's buffer - on the boot path buf
+    // is a fixed [1024]u8, so a ~976+ byte cmdline would otherwise overrun the stack.
+    const fixed_max: usize = 2 * 24 + 1 + 7 + 32 + 7 + 56; // memmap + nul + align + module + align + si
+    if (cmdline.len + fixed_max > buf.len) return error.CmdlineTooLong;
     @memset(buf, 0);
     var pos: usize = 0;
 
@@ -143,7 +150,7 @@ pub fn boot(
 
     // start_info block.
     var si_buf: [1024]u8 = undefined;
-    const si = buildStartInfo(&si_buf, start_info_addr, layout, tables.rsdp_addr, cmdline, module);
+    const si = try buildStartInfo(&si_buf, start_info_addr, layout, tables.rsdp_addr, cmdline, module);
     try vm.guestWrite(start_info_addr, si_buf[0..si.len]);
 
     try vcpu.setProtectedMode(entry, si.addr, gdt_addr);
@@ -152,7 +159,7 @@ pub fn boot(
 test "start_info has the PVH magic and links its tables" {
     var buf: [512]u8 = undefined;
     const layout = memmap.Layout.compute(16 * memmap.mib);
-    const si = buildStartInfo(&buf, 0x2000, layout, 0x7abc, "console=ttyS0", null);
+    const si = try buildStartInfo(&buf, 0x2000, layout, 0x7abc, "console=ttyS0", null);
 
     const o = si.addr - 0x2000;
     try std.testing.expectEqual(@as(u32, magic), std.mem.readInt(u32, buf[o..][0..4], .little));
@@ -170,11 +177,23 @@ test "start_info has the PVH magic and links its tables" {
 test "start_info carries an initramfs module" {
     var buf: [512]u8 = undefined;
     const layout = memmap.Layout.compute(16 * memmap.mib);
-    const si = buildStartInfo(&buf, 0x2000, layout, 0x7abc, "x", .{ .addr = 0x123000, .size = 4096 });
+    const si = try buildStartInfo(&buf, 0x2000, layout, 0x7abc, "x", .{ .addr = 0x123000, .size = 4096 });
 
     const o = si.addr - 0x2000;
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[o + 12 ..][0..4], .little)); // nr_modules
     const ml = std.mem.readInt(u64, buf[o + 16 ..][0..8], .little) - 0x2000;
     try std.testing.expectEqual(@as(u64, 0x123000), std.mem.readInt(u64, buf[ml + 0 ..][0..8], .little));
     try std.testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, buf[ml + 8 ..][0..8], .little));
+}
+
+test "start_info rejects an over-long cmdline instead of overrunning buf" {
+    // A cmdline that (with the fixed fields) exceeds buf must fail closed, not @memcpy past
+    // the caller's stack buffer. Sized to overflow a small buffer but fit no smaller.
+    var buf: [256]u8 = undefined;
+    const layout = memmap.Layout.compute(16 * memmap.mib);
+    const long = [_]u8{'a'} ** 200; // 200 + 151 fixed_max > 256
+    try std.testing.expectError(error.CmdlineTooLong, buildStartInfo(&buf, 0x2000, layout, 0x7abc, &long, null));
+    // A cmdline that fits still succeeds.
+    const ok = try buildStartInfo(&buf, 0x2000, layout, 0x7abc, "console=ttyS0", null);
+    try std.testing.expect(ok.len > 0);
 }

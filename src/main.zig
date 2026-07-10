@@ -910,6 +910,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
             .spi_count = vm.hv.msi_spi_count,
         },
     });
+    if (dtb_len == 0) return error.DtbBuildFailed; // over-long cmdline overran the DTB scratch
     @memcpy(ram[ARM_DTB_OFF..][0..dtb_len], dtb_buf[0..dtb_len]);
 
     hvf.sys_icache_invalidate(ram.ptr, kernel.len); // host write -> guest I-fetch
