@@ -7,31 +7,33 @@
 #                                 (+ the guest agent and vsock test client, if `zig` is present)
 # so that `./zig-out/bin/nether` boots straight to a shell, and agent/vsock/net work.
 #
-# Idempotent: re-running rebuilds from scratch under a temp dir. Pass --force to refetch even
-# if kernels/Image already exists.
+# REPRODUCIBLE BY DEFAULT: the kernel + minirootfs are PINNED to an exact version AND verified
+# by SHA256, so every run produces a byte-identical guest and a tampered/substituted download
+# fails closed. This is the image the project is tested against.
 #
-# Requires: curl, tar, gunzip, cpio, gzip, od (all standard on macOS). `zig` (0.16.0) is
-# optional - without it the kernel + rootfs + modules are still built, just no agent binaries.
+#   --latest   Opt into fetching the newest kernel/minirootfs from the mirror instead of the
+#              pins. UNVERIFIED and NON-reproducible - use only to test a newer Alpine before
+#              bumping the pins below.
+#   --force    Rebuild even if kernels/Image already exists.
 #
-# The Alpine BRANCH is pinned; the kernel + minirootfs versions are auto-discovered from the
-# mirror (Alpine bumps the kernel within a stable branch, so pinning a patch version rots).
-# The pins below are only fallbacks if discovery fails. To move to a newer Alpine, bump
-# ALPINE_BRANCH to a current release under https://dl-cdn.alpinelinux.org/alpine/ and re-run.
+# Requires: curl, tar, gunzip, cpio, gzip, od, shasum (all standard on macOS). `zig` (0.16.0)
+# is optional - without it the kernel + rootfs + modules are still built, just no agent binaries.
+#
+# To move to a newer kernel: run with --latest, confirm it boots, then update the four PIN_*
+# values below (the script prints the SHA256 of whatever it fetched).
 set -eu
 
 ALPINE_BRANCH="v3.21"
-KVER_FALLBACK="6.12.95-r0"                                  # linux-virt apk (kernel + modules)
-MINIROOTFS_FALLBACK="alpine-minirootfs-3.21.7-aarch64.tar.gz"
 MIRROR="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}"
 
-# newest matching filename from a mirror directory listing (plain sort: patch versions within
-# a branch are same-width, so lexical order is correct). $1 = URL dir, $2 = grep pattern.
-latest() { curl -fsSL "$1" 2>/dev/null | grep -oE "$2" | sort | tail -1; }
+# --- PINS (reproducible default) -------------------------------------------------------------
+# Exact versions + SHA256. Bump together when moving to a newer kernel (see --latest above).
+PIN_KVER="6.12.95-r0"                                  # linux-virt apk (kernel + modules)
+PIN_KSHA="86e7609c39def4175da43a14e0999829d6090f15d1cb63b7c58aad56749544b1"
+PIN_ROOTFS="alpine-minirootfs-3.21.7-aarch64.tar.gz"
+PIN_RSHA="d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da"
 
-KVER=$(latest "${MIRROR}/main/aarch64/" 'linux-virt-[0-9][^"<]*\.apk' | sed -E 's/^linux-virt-(.*)\.apk$/\1/')
-[ -n "$KVER" ] || KVER="$KVER_FALLBACK"
-MINIROOTFS=$(latest "${MIRROR}/releases/aarch64/" 'alpine-minirootfs-[0-9][^"<]*-aarch64\.tar\.gz')
-[ -n "$MINIROOTFS" ] || MINIROOTFS="$MINIROOTFS_FALLBACK"
+latest() { curl -fsSL "$1" 2>/dev/null | grep -oE "$2" | sort | tail -1; }
 
 # Resolve repo root from this script's location, so it works from any cwd.
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -40,7 +42,15 @@ IMG="$OUT/Image"
 INITRAMFS="$OUT/initramfs.cpio.gz"
 
 force=0
-[ "${1:-}" = "--force" ] && force=1
+use_latest=0
+for a in "$@"; do
+  case "$a" in
+    --force) force=1 ;;
+    --latest) use_latest=1 ;;
+    *) echo "unknown arg: $a (use --force / --latest)" >&2; exit 2 ;;
+  esac
+done
+
 if [ -f "$IMG" ] && [ -f "$INITRAMFS" ] && [ "$force" -eq 0 ]; then
   echo "guest image already present:"
   echo "  $IMG"
@@ -49,9 +59,41 @@ if [ -f "$IMG" ] && [ -f "$INITRAMFS" ] && [ "$force" -eq 0 ]; then
   exit 0
 fi
 
-for tool in curl tar gunzip cpio gzip od; do
+for tool in curl tar gunzip cpio gzip od shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "error: '$tool' not found on PATH" >&2; exit 1; }
 done
+
+# Resolve the versions to use: pinned (default) or the mirror's latest (--latest opt-in).
+if [ "$use_latest" -eq 1 ]; then
+  KVER=$(latest "${MIRROR}/main/aarch64/" 'linux-virt-[0-9][^"<]*\.apk' | sed -E 's/^linux-virt-(.*)\.apk$/\1/')
+  ROOTFS=$(latest "${MIRROR}/releases/aarch64/" 'alpine-minirootfs-[0-9][^"<]*-aarch64\.tar\.gz')
+  [ -n "$KVER" ] && [ -n "$ROOTFS" ] || { echo "error: --latest discovery failed (mirror down?)" >&2; exit 1; }
+  KSHA="" ; RSHA=""   # unverified
+  echo "WARNING: --latest fetches UNVERIFIED, non-reproducible images (linux-virt $KVER, $ROOTFS)."
+else
+  KVER="$PIN_KVER" ; KSHA="$PIN_KSHA" ; ROOTFS="$PIN_ROOTFS" ; RSHA="$PIN_RSHA"
+fi
+
+# fetch $1 -> $2, then (if $3 non-empty) verify its SHA256 == $3, failing closed with guidance.
+fetch_verify() {
+  url="$1"; dst="$2"; want="$3"
+  if ! curl -fSL -o "$dst" "$url"; then
+    echo "error: fetch failed for $url" >&2
+    echo "       Alpine may have pruned this version from the branch. Run with --latest to test a" >&2
+    echo "       newer image, then update the PIN_* values in this script." >&2
+    exit 1
+  fi
+  [ -n "$want" ] || { echo "      sha256($(basename "$dst")) = $(shasum -a 256 "$dst" | cut -d' ' -f1)  [unverified --latest]"; return; }
+  got=$(shasum -a 256 "$dst" | cut -d' ' -f1)
+  if [ "$got" != "$want" ]; then
+    echo "error: SHA256 mismatch for $(basename "$dst")" >&2
+    echo "       expected $want" >&2
+    echo "       got      $got" >&2
+    echo "       The mirror content changed or the download was tampered with. If Alpine legitimately" >&2
+    echo "       re-rolled this version, verify the new artifact and update PIN_* in this script." >&2
+    exit 1
+  fi
+}
 
 mkdir -p "$OUT"
 work=$(mktemp -d "${TMPDIR:-/tmp}/nether-guest.XXXXXX")
@@ -66,27 +108,22 @@ unwrap_zboot() {
 }
 
 echo "[1/4] fetching kernel + modules (linux-virt ${KVER})..."
-curl -fSL -o linux-virt.apk "${MIRROR}/main/aarch64/linux-virt-${KVER}.apk"
+fetch_verify "${MIRROR}/main/aarch64/linux-virt-${KVER}.apk" linux-virt.apk "$KSHA"
 mkdir -p lv && tar -xzf linux-virt.apk -C lv 2>/dev/null || true
-[ -f lv/boot/vmlinuz-virt ] || { echo "error: vmlinuz-virt not in the apk - bump KVER" >&2; exit 1; }
+[ -f lv/boot/vmlinuz-virt ] || { echo "error: vmlinuz-virt not in the apk - bump the pin" >&2; exit 1; }
 unwrap_zboot lv/boot/vmlinuz-virt "$IMG"
 echo "      -> $IMG ($(wc -c < "$IMG") bytes)"
 
-echo "[2/4] fetching minirootfs (${MINIROOTFS})..."
-curl -fSL -o minirootfs.tar.gz "${MIRROR}/releases/aarch64/${MINIROOTFS}"
+echo "[2/4] fetching minirootfs (${ROOTFS})..."
+fetch_verify "${MIRROR}/releases/aarch64/${ROOTFS}" minirootfs.tar.gz "$RSHA"
 mkdir -p rootfs && tar -xzf minirootfs.tar.gz -C rootfs
 
 echo "[3/4] installing modules + bring-up /init..."
-# the module dir name (e.g. 6.12.95-0-virt) matches the kernel's vermagic; read it from the
-# extracted apk rather than deriving it, so it always matches the Image we just unwrapped.
 KMODVER=$(ls lv/lib/modules 2>/dev/null | head -1)
 [ -n "$KMODVER" ] || { echo "error: no modules dir in the apk" >&2; exit 1; }
-# whole modules tree (with modules.dep) so the guest can modprobe by name and resolve deps
 rm -rf rootfs/lib/modules && mkdir -p rootfs/lib/modules
 cp -R "lv/lib/modules/${KMODVER}" rootfs/lib/modules/
 
-# /init: mount pseudo-fs, load virtio net + vsock, static slirp IP, start the agent if baked,
-# otherwise drop to an interactive shell. Matches the documented default bring-up.
 cat > rootfs/init <<'INIT'
 #!/bin/sh
 mount -t proc proc /proc 2>/dev/null
@@ -94,7 +131,6 @@ mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 modprobe virtio_net 2>/dev/null
 modprobe vmw_vsock_virtio_transport 2>/dev/null
-# slirp default plan (host user-net): 10.0.2.15/24, gw 10.0.2.2, DNS 10.0.2.3
 IFACE=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -n1)
 if [ -n "$IFACE" ]; then
   ip addr add 10.0.2.15/24 dev "$IFACE" 2>/dev/null
@@ -104,15 +140,11 @@ if [ -n "$IFACE" ]; then
 fi
 echo; echo "  Nether - aarch64 Linux on Apple Hypervisor.framework"
 echo "  $(uname -srm)"; echo
-# In control/agent mode the host listens on the agent vsock port and /agent serves it;
-# with no host (a plain boot) /agent connects, fails, and exits at once. Either way, fall
-# through to an interactive shell as PID 1 - never `exec` /agent, or its exit panics init.
 [ -x /agent ] && /agent
 exec /bin/sh
 INIT
 chmod +x rootfs/init
 
-# Optional: build the static guest agent + vsock client (needs zig for cross-compile).
 if command -v zig >/dev/null 2>&1; then
   echo "      building guest agent + vsock_client (zig cc)..."
   zig cc -target aarch64-linux-musl -static -O2 "$ROOT/tools/agent.c"        -o rootfs/agent
@@ -126,7 +158,7 @@ echo "[4/4] packing initramfs..."
 echo "      -> $INITRAMFS ($(wc -c < "$INITRAMFS") bytes)"
 
 echo
-echo "done. Build, sign, and boot:"
+echo "done (reproducible pin: linux-virt ${KVER}, ${ROOTFS}). Build, sign, and boot:"
 echo "  zig build -Dtarget=native"
 echo "  codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether"
 echo "  ./zig-out/bin/nether"
