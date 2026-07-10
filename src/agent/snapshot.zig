@@ -820,6 +820,13 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     uart.importState(uart_state); // restore IMSC so RX interrupts reach the guest
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
+    // PL031 RTC: a fresh, host-clock-backed instance so the woken guest reads LIVE wall
+    // time here (advanced by the parked duration). CLOCK_REALTIME froze at the park moment;
+    // a guest `hwclock -s` reconciles it to real time - the wall-clock catch-up. Stateless
+    // by design (not snapshotted), so the fork never inherits the base's frozen clock.
+    var rtc_arm = nether.Pl031{};
+    try bus.addMmio(rtc_arm.device(nether.memmap_arm.rtc_base));
+
     var con = nether.VirtioConsole{};
     con.out_fn = consoleOut;
     con.out_ctx = &con;

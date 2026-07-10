@@ -355,6 +355,16 @@ pub fn buildVirt(out: []u8, cfg: VirtConfig) usize {
     b.propStrings("clock-names", &.{ "uartclk", "apb_pclk" });
     b.endNode();
 
+    // PL031 RTC: the guest's wall clock. rtc-pl031 binds via the AMBA id and, with
+    // rtc-hctosys, sets CLOCK_REALTIME from it at boot (else the guest starts at 1970).
+    b.beginNode("pl031@9010000");
+    b.propStrings("compatible", &.{ "arm,pl031", "arm,primecell" });
+    b.propCells("reg", &.{ hi(arm.rtc_base), lo(arm.rtc_base), hi(arm.rtc_size), lo(arm.rtc_size) });
+    b.propCells("interrupts", &.{ 0, arm.rtc_spi, 0x04 }); // SPI, id, level-high (alarm; never asserted)
+    b.propCells("clocks", &.{CLK_PHANDLE});
+    b.propStrings("clock-names", &.{"apb_pclk"});
+    b.endNode();
+
     for (cfg.virtio) |vd| {
         var namebuf: [40]u8 = undefined;
         const name = std.fmt.bufPrint(&namebuf, "virtio_mmio@{x}", .{vd.addr}) catch unreachable;

@@ -73,6 +73,7 @@ pub const PowerAction = power.Action;
 
 pub const Serial = @import("chipset/serial.zig").Serial;
 pub const Pl011 = @import("chipset/pl011.zig").Pl011;
+pub const Pl031 = @import("chipset/pl031.zig").Pl031;
 pub const Rtc = @import("chipset/rtc.zig").Rtc;
 pub const Pm = @import("chipset/pm.zig").Pm;
 pub const Reset = @import("chipset/reset.zig").Reset;

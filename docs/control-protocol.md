@@ -450,11 +450,24 @@ rebases every vCPU's vtimer offset so the count resumes exactly there. A parked 
 does not observe the parked wall time - `/proc/uptime` continues from its pre-park value,
 and a guest timer armed before the park fires with its REMAINING duration after wake
 (a `sleep 3` parked 1s in fires ~2s after wake, however long the park lasted). The same
-applies to a fork of a base: it resumes at the base's age. Wall-clock time (CLOCK_REALTIME)
-is a guest/NTP concern, not a counter concern - a woken guest that needs real time must be
-told it by the platform. Verified live: `scripts/park_timer_proof.py` (two generations).
-Legacy snapshots without the counter field restore with the old behavior (the guest clock
-jumps forward by the parked wall time).
+applies to a fork of a base: it resumes at the base's age. Verified live:
+`scripts/park_timer_proof.py` (two generations). Legacy snapshots without the counter field
+restore with the old behavior (the guest clock jumps forward by the parked wall time).
+
+**Guest wall clock (PL031 RTC + park catch-up).** Every VM exposes a PL031 RTC at
+`0x09010000` that serves LIVE host wall time; the guest's stock `rtc-pl031` driver plus
+`rtc-hctosys` set `CLOCK_REALTIME` from it at boot, so a guest starts at the real time
+instead of the 1970 epoch (Nether guests previously had no RTC at all). The device is
+host-clock-backed and carries no per-VM state, so it is not snapshotted - a fork reads
+live host time. That is the wall-clock CATCH-UP: unlike the monotonic clock (continuous,
+above), `CLOCK_REALTIME` FREEZES at the park moment - a guest parked for real minutes wakes
+believing no wall time passed. Because the RTC reads current host time, the platform (or
+the guest) reconciles on wake with one `hwclock -s` (`--hctosys`), which jumps the wall
+clock forward by exactly the parked duration while leaving the monotonic clock untouched -
+so token-expiry / scheduling logic that keys off wall time sees the real elapsed time. This
+is opt-in: a guest that never reconciles keeps its frozen (park-moment) wall clock. Verified
+live: `scripts/wallclock_proof.py` (real-time boot, a 12s park freezing the wall clock while
+monotonic stays continuous, and `hwclock -s` catching it up to real time).
 
 **Guest entropy.** Nether seeds the guest crng at boot via a `/chosen rng-seed` DTB
 property (64 bytes of host entropy; omitted fail-closed if the host has none). Without

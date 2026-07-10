@@ -921,6 +921,11 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     uart.irq_ctx = &uart;
     try bus.addMmio(uart.device(ARM_UART_BASE));
 
+    // PL031 RTC: the guest reads real wall time here (rtc-hctosys sets CLOCK_REALTIME at
+    // boot), instead of starting at the 1970 epoch. Host-clock-backed, no per-VM state.
+    var rtc_arm = nether.Pl031{};
+    try bus.addMmio(rtc_arm.device(nether.memmap_arm.rtc_base));
+
     // virtio-pci: a generic-ECAM PCIe host bridge carrying multiple virtio
     // functions, reusing the same PCI transport + backends + virtq as the x86
     // path. The guest RAM view (where the queues live) is `ram` based at

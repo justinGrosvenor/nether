@@ -26,6 +26,12 @@ pub const uart_base: u64 = 0x0900_0000;
 pub const uart_size: u64 = 0x0000_1000;
 pub const uart_spi: u32 = 1; // SPI 1 (GIC interrupt id 32 + 1)
 
+/// PL031 RTC (wall clock). Standard "virt" address, above the UART. The alarm SPI is
+/// declared for the DT binding but never asserted (the device serves live host time).
+pub const rtc_base: u64 = 0x0901_0000;
+pub const rtc_size: u64 = 0x0000_1000;
+pub const rtc_spi: u32 = 9; // SPI 9 (INTID 41), clear of UART/virtio/PCI-INTx/vmgenid(8)
+
 /// GIC MSI region (GITS-style doorbell), above the redistributor region.
 pub const msi_base: u64 = 0x0C00_0000;
 
