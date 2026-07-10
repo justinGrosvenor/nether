@@ -54,13 +54,15 @@ an Apple Silicon Mac. The HVF backend needs a hypervisor entitlement, or boots f
 ```sh
 zig build -Dtarget=native
 codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
-./zig-out/bin/nether
+./scripts/fetch-guest-image.sh    # fetch/build a bootable aarch64 Linux guest
+./zig-out/bin/nether              # boots kernels/Image to an interactive shell
 ```
 
-A guest kernel `Image` + rootfs is **not** checked in (it's gitignored). See
-[`docs/running-on-hvf.md`](docs/running-on-hvf.md) for how to fetch/build one and
-for a sample `nether.conf`. If `xcode-select` points into Xcode.app (e.g. during
-iOS work), prefix host-linking commands with
+The guest kernel `Image` + rootfs is **not** checked in (it's gitignored);
+`scripts/fetch-guest-image.sh` builds one from a pinned Alpine release into
+`kernels/`. See [`docs/running-on-hvf.md`](docs/running-on-hvf.md) for the manual
+steps and a sample `nether.conf`. If `xcode-select` points into Xcode.app (e.g.
+during iOS work), prefix host-linking commands with
 `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
 
 For the x86/KVM reference backend, see
