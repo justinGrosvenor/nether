@@ -1,8 +1,10 @@
 //! Deterministic fuzz-smoke for Nether's guest-facing parsers.
 //!
 //! Covered: the VT parser + screen grid, the virtqueue descriptor walk, the
-//! virtio-vsock / virtio-net / virtio-gpu device parsers (incl. the gpu control-queue
-//! commands and live framebuffer capture - the richest attacker-controlled input), the
+//! virtio-vsock / virtio-net / virtio-gpu / virtio-blk device parsers (incl. the gpu
+//! control-queue commands and live framebuffer capture - the richest attacker-controlled
+//! input, and the blk sector arithmetic against a canary-guarded disk), fw_cfg's
+//! guest-streamed selector/offset, the control-plane relay exit-trailer scanner, the
 //! snapshot vsock engine-state validator (an operator-supplied base file: validState must
 //! gate every byte pattern so import + drain stays in bounds), and
 //! the I/O access surfaces: PCI config space (ECAM) and the virtio BAR MMIO regions, at
@@ -34,6 +36,8 @@ const snapshot = @import("agent/snapshot.zig");
 const pl031 = @import("chipset/pl031.zig");
 const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
+const blk = @import("virtio/virtio_blk.zig");
+const fw_cfg = @import("chipset/fw_cfg.zig");
 const pci = @import("chipset/pci.zig");
 const elf = @import("boot/elf.zig");
 const slirp = @import("net/slirp.zig");
@@ -137,10 +141,15 @@ fn feedVirtq(ram: []u8) void {
     while (vq.next(m)) |head| {
         var it = vq.chain(m, head);
         var written: u32 = 0;
+        var bufs: usize = 0;
         while (it.next()) |buf| {
+            bufs += 1;
             // Simulate the device touching the buffer through the bounds check.
             if (m.slice(buf.addr, buf.len)) |s| written +%= @intCast(s.len);
         }
+        // Invariant: the circular-chain guard caps every walk at the queue size, so a
+        // self-referential or over-long descriptor chain can never iterate unbounded.
+        std.debug.assert(bufs <= vq.size);
         vq.complete(m, head, written);
         guard += 1;
         if (guard > 1 << 17) break;
@@ -180,10 +189,17 @@ test "virtqueue survives all-ones and all-zero memory" {
 // round so a flood of refusals cannot make peekOut/popOut diverge.
 fn feedVsock(vs: *vsock.Vsock, bytes: []const u8) void {
     vs.rx(bytes);
+    // Invariant: after processing any packet the staging ring stays within bounds - the
+    // same contract validState enforces on a restored engine (out_count/head/tail feed
+    // direct out[] access in peekOut/pushOut). A hostile packet stream must never push it
+    // out of range.
+    std.debug.assert(vs.out_count <= vs.out.len);
+    std.debug.assert(vs.out_head < vs.out.len and vs.out_tail < vs.out.len);
     while (vs.peekOut()) |pkt| {
         std.mem.doNotOptimizeAway(pkt.len);
         vs.popOut();
     }
+    std.debug.assert(!vs.pendingOut()); // fully drained: peekOut and popOut agree
 }
 
 test "vsock engine survives random packets" {
@@ -700,6 +716,182 @@ test "slirp survives structured-hostile IPv4 frames (random ihl/proto/doff)" {
     }
 }
 
+// --- virtio-blk device -----------------------------------------------------
+//
+// The block device serves guest requests (a header with type + sector, then data
+// segments, then a status byte) against a flat backing store, doing sector*512
+// arithmetic on a guest-controlled sector. The disk sits between canary guards, so the
+// invariant is direct: blk must NEVER write outside `disk`, whatever the request, and it
+// always leaves a defined status code.
+
+fn putDesc(ram: []u8, idx: usize, addr: u64, len: u32, flags: u16, next: u16) void {
+    const a = idx * 16;
+    std.mem.writeInt(u64, ram[a..][0..8], addr, .little);
+    std.mem.writeInt(u32, ram[a + 8 ..][0..4], len, .little);
+    std.mem.writeInt(u16, ram[a + 12 ..][0..2], flags, .little);
+    std.mem.writeInt(u16, ram[a + 14 ..][0..2], next, .little);
+}
+
+fn fbyte(bytes: []const u8, i: usize) u8 {
+    return if (i < bytes.len) bytes[i] else 0;
+}
+
+fn feedBlk(bytes: []const u8) void {
+    const GUARD = 64;
+    const DISK = 2048;
+    var backing = [_]u8{0xC5} ** (GUARD + DISK + GUARD); // 0xC5 canary either side of the disk
+    const disk = backing[GUARD..][0..DISK];
+    @memset(disk, 0);
+    var ram = [_]u8{0} ** 4096;
+
+    // Request shape from the fuzz bytes: type (biased to the real opcodes), a sector
+    // biased toward the u64-overflow boundary, and two data-segment lengths.
+    const TYPES = [_]u32{ 0, 1, 4, 8, 3, 0xdead_beef }; // IN/OUT/FLUSH/GET_ID/unsupported/garbage
+    const rtype = TYPES[fbyte(bytes, 0) % TYPES.len];
+    const sector: u64 = switch (fbyte(bytes, 1) & 3) {
+        0 => std.math.maxInt(u64), // sector*512 overflows u64: must reject, not wrap
+        1 => std.math.maxInt(u64) / 512, // just under the overflow boundary
+        2 => @as(u64, fbyte(bytes, 2)) << 3,
+        else => fbyte(bytes, 2),
+    };
+    const l0: u32 = @as(u32, fbyte(bytes, 3)) * 2; // 0..510, fits the 512-byte data buffer
+    const l1: u32 = @as(u32, fbyte(bytes, 4)) * 2;
+
+    var b = blk.Blk{ .disk = disk };
+    var dev = virtio.Device.init(b.backend(), .{ .bytes = &ram, .base = 0 });
+    dev.barWrite(0x16, 2, 0); // queue_select 0
+    dev.barWrite(0x18, 2, 8); // queue_size
+    dev.barWrite(0x20, 4, 0x000); // desc
+    dev.barWrite(0x28, 4, 0x100); // avail
+    dev.barWrite(0x30, 4, 0x200); // used
+    dev.barWrite(0x1c, 2, 1); // enable
+
+    // header(16) -> data0 -> data1 -> status(1)
+    putDesc(&ram, 0, 0x400, 16, virtq.DESC_F_NEXT, 1);
+    putDesc(&ram, 1, 0x600, l0, virtq.DESC_F_NEXT | virtq.DESC_F_WRITE, 2);
+    putDesc(&ram, 2, 0x800, l1, virtq.DESC_F_NEXT | virtq.DESC_F_WRITE, 3);
+    putDesc(&ram, 3, 0xA00, 1, virtq.DESC_F_WRITE, 0);
+    std.mem.writeInt(u32, ram[0x400..][0..4], rtype, .little);
+    std.mem.writeInt(u64, ram[0x408..][0..8], sector, .little);
+    for (ram[0x600..0xA00], 0..) |*d, i| d.* = fbyte(bytes, 8 + i); // T_OUT payload from the fuzz bytes
+    std.mem.writeInt(u16, ram[0x102..][0..2], 1, .little); // avail.idx
+    std.mem.writeInt(u16, ram[0x104..][0..2], 0, .little); // ring[0] = head 0
+
+    dev.barWrite(0x2000, 4, 0); // kick
+
+    // Invariants: a defined status code, and no write escaped the disk into the canary.
+    std.debug.assert(ram[0xA00] <= 2); // S_OK / S_IOERR / S_UNSUPP
+    for (backing[0..GUARD]) |c| std.debug.assert(c == 0xC5);
+    for (backing[GUARD + DISK ..]) |c| std.debug.assert(c == 0xC5);
+    std.mem.doNotOptimizeAway(dev.isr);
+}
+
+test "virtio-blk survives hostile requests and never writes past the disk" {
+    var prng = std.Random.DefaultPrng.init(0xB10C_C0DE);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 6000) : (i += 1) {
+        var buf: [1040]u8 = undefined; // header params + up to ~1 KiB of OUT payload
+        const n = 1 + rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        feedBlk(buf[0..n]);
+    }
+}
+
+// --- fw_cfg (guest-streamed selector/offset) -------------------------------
+//
+// The guest picks an item with the selector port and streams its bytes from the data
+// port; the offset increments per read and must stay bounded by the item length (a read
+// past the end returns 0, never OOB). Register a couple of files so the file + directory
+// paths run too.
+
+fn feedFwCfg(bytes: []const u8) void {
+    var fw = fw_cfg.FwCfg{};
+    fw.addFile("etc/a", "PAYLOAD-A") catch {};
+    fw.addFile("etc/table-loader", "XYZ") catch {};
+    const dev = fw.device();
+    const KEYS = [_]u16{ 0x0000, 0x0001, 0x0019, 0x0020, 0x0021, 0xffff }; // sig/id/dir/files/absent
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        dev.out_fn(dev.ptr, 0x510, 2, KEYS[bytes[i] % KEYS.len]); // select an item
+        const reads: usize = fbyte(bytes, i + 1); // 0..255 streamed reads: pushes offset past small items
+        var r: usize = 0;
+        while (r < reads) : (r += 1) {
+            const v = dev.in_fn(dev.ptr, 0x511, 1);
+            std.debug.assert(v <= 0xff); // the data register is a single byte
+            std.mem.doNotOptimizeAway(v);
+        }
+    }
+    std.debug.assert(fw.dir_len <= fw.dir.len); // the directory never overruns its buffer
+}
+
+test "fw_cfg survives arbitrary selector/stream sequences" {
+    var prng = std.Random.DefaultPrng.init(0xF00_C0FE);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 8000) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const n = 1 + rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        feedFwCfg(buf[0..n]);
+    }
+}
+
+// --- control-plane relay scanner (exit-trailer rewrite) --------------------
+//
+// The relay scans the guest agent's reply stream for the 0x1e<exit>\n trailer and clamps
+// a non-canonical exit to 255 (the R2b / exit-clamp audit code). It is stateful across
+// chunk boundaries, so feed the bytes in small guest-derived chunks. Two invariants: the
+// output never exceeds outBound(chunk.len) (a wrong bound would OOB out[]), and every
+// emitted trailer carries a canonical exit (<= 255).
+
+fn checkClamped(out: []const u8) void {
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        if (out[i] != 0x1e) continue; // OUT_DELIM (ASCII RS): starts an emitted trailer
+        var j = i + 1;
+        while (j < out.len and out[j] != '\n') : (j += 1) {}
+        if (j < out.len) { // a complete trailer: digits then '\n'
+            const v = std.fmt.parseInt(u32, out[i + 1 .. j], 10) catch {
+                std.debug.assert(false); // an emitted trailer is always numeric
+                return;
+            };
+            std.debug.assert(v <= 255); // ... and always clamped in range
+            i = j;
+        }
+    }
+}
+
+fn feedRelay(bytes: []const u8) void {
+    var sc = control.RelayScanner{};
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const step = 1 + (fbyte(bytes, i) % 7); // chunk 1..7, from the data
+        const end = @min(i + step, bytes.len);
+        const chunk = bytes[i..end];
+        var out: [control.RelayScanner.outBound(7)]u8 = undefined; // fits the max chunk
+        const n = sc.scan(chunk, &out);
+        std.debug.assert(n <= control.RelayScanner.outBound(chunk.len)); // the output bound holds
+        checkClamped(out[0..n]);
+        i = end;
+    }
+}
+
+test "relay scanner survives hostile agent output (bound + exit clamp hold)" {
+    // Bias toward the trailer delimiter and digits so the trailer state machine is driven
+    // deep (held trailers, overlong/garbage exits, split across chunks), not just copied.
+    const alphabet = [_]u8{ 0x1e, '\n', '0', '9', '2', '5', '6', '-', 'A', 0x1f };
+    var prng = std.Random.DefaultPrng.init(0x2E_11_A5);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 8000) : (i += 1) {
+        var buf: [128]u8 = undefined;
+        const n = rand.uintLessThan(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = if (rand.boolean()) alphabet[rand.uintLessThan(usize, alphabet.len)] else rand.int(u8);
+        feedRelay(buf[0..n]);
+    }
+}
+
 // --- coverage-guided fuzz entry points (zig build test --fuzz) -------------
 // The tests above are fixed-seed smoke (always-on, reproducible). These mirror them
 // through std.testing.fuzz, so `zig build fuzz` (-> test --fuzz) drives the same
@@ -841,6 +1033,42 @@ test "fuzz: ELF/PVH loader" {
             const n = smith.slice(&img);
             var sink = ElfSink{};
             _ = elf.loadPvh(img[0..n], &sink) catch {};
+        }
+    }.one, .{});
+}
+
+// virtio-blk request path: guest header (type/sector) + data segments + status, with
+// sector*512 arithmetic. The canary-guarded disk asserts no write ever escapes it.
+test "fuzz: virtio-blk" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [1040]u8 = undefined;
+            const n = smith.slice(&buf);
+            feedBlk(buf[0..n]);
+        }
+    }.one, .{});
+}
+
+// fw_cfg: guest-chosen selector + an unbounded stream of data reads; the per-read offset
+// must stay bounded by the item length and the directory must never overrun its buffer.
+test "fuzz: fw_cfg" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [64]u8 = undefined;
+            const n = smith.slice(&buf);
+            feedFwCfg(buf[0..n]);
+        }
+    }.one, .{});
+}
+
+// The relay exit-trailer scanner (R2b / exit-clamp): stateful over guest output, fed in
+// chunks. The output bound (outBound) and the exit clamp (<= 255) must both hold.
+test "fuzz: relay scanner" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [256]u8 = undefined;
+            const n = smith.slice(&buf);
+            feedRelay(buf[0..n]);
         }
     }.one, .{});
 }
