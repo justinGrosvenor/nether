@@ -89,9 +89,9 @@ pub const Pl011 = struct {
         }
     }
 
-    fn readThunk(ptr: *anyopaque, offset: u64, data: []const u8) void {
+    fn readThunk(ptr: *anyopaque, offset: u64, data: []u8) void {
         const self: *Pl011 = @ptrCast(@alignCast(ptr));
-        const out: []u8 = @constCast(data);
+        const out: []u8 = data;
         @memset(out, 0);
         const v: u32 = self.reg(offset);
         for (out, 0..) |*b, i| {
