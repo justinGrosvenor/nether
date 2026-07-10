@@ -11,6 +11,8 @@ nether type-checks on any host; it only **runs** on hardware virtualization: Lin
 | **Hardware virt** | `/dev/kvm` + `vmx` or `svm` in CPU flags | M-series SoC |
 | **Entitlements** | none | `com.apple.security.hypervisor` (ad-hoc codesign) |
 
+Get Zig 0.16.0 (stable) from [ziglang.org/download](https://ziglang.org/download).
+
 ## Build from source
 
 ```sh
@@ -78,7 +80,7 @@ In production, swerver owns the process: allocator-injected nether core, vsock a
 device eventfds registered into swerver's `IoRuntime`, per-VM-per-worker pinning.
 
 !!! note "Embedding API"
-    The library surface is still stabilizing. See [Platform thesis](../thesis.md) for the integration contract and [Decisions](../decisions.md) D2 for the device split.
+    The library surface is still stabilizing. See the [control protocol](../control-protocol.md) for the integration contract and [Decisions](../decisions.md) D2 for the device split.
 
 ## Next
 

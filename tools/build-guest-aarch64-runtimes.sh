@@ -30,7 +30,7 @@ command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
 ZIG="${ZIG:-zig}"
 echo "[guest-aarch64] building the agent (aarch64-linux-musl)"
 "$ZIG" cc -target aarch64-linux-musl -static -O2 tools/agent.c -o kernels/rootfs/agent
-# The data-plane forwarder (docs/park-concurrency-plan.md 3b): bridges host->guest vsock
+# The data-plane forwarder: bridges host->guest vsock
 # conns to the tenant's loopback TCP server, so a tenant runs an ordinary TCP server.
 echo "[guest-aarch64] building the forwarder (aarch64-linux-musl)"
 "$ZIG" cc -target aarch64-linux-musl -static -O2 tools/forwarder.c -o kernels/rootfs/forwarder

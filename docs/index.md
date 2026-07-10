@@ -2,10 +2,10 @@
 
 <div class="nether-tagline">the layer below</div>
 
-A **type-2 hypervisor** in pure [Zig](https://ziglang.org). Modern guests only: no SeaBIOS, no IDE, no legacy chipset emulation. Runs beneath the guest on hardware-assisted virtualization (KVM on Linux/x86-64, Apple Hypervisor.framework on aarch64).
+A **type-2 hypervisor** in pure [Zig](https://ziglang.org). Modern guests only: no SeaBIOS, no IDE, no legacy chipset emulation. Runs beneath the guest on hardware-assisted virtualization (Apple Hypervisor.framework on aarch64, KVM on Linux/x86-64).
 
 ```
-swerver (one binary, embeds nether) ──► KVM / HVF ──► microVM
+swerver (one binary, embeds nether) ──► HVF / KVM ──► microVM
               │
               ├── egress firewall + budgets (when net enabled)
               ├── control plane + virtio-vsock
@@ -16,14 +16,14 @@ The standalone `nether` executable in this repo is a dev/bringup wrapper around 
 embeddable core (`src/root.zig`). Production is swerver importing that library.
 
 !!! warning "Building"
-    nether is past Phase 3 on Apple Silicon (Linux boots, virtio works, snapshots fork). The x86/KVM platform layer is wired and **verified on metal** for PVH boot, control plane, vsock, and watchdogs; remaining KVM gaps are virtio-net bring-up, SMP, snapshot/restore, and GPU. See [Roadmap](roadmap.md), [Linux platform port](linux-platform-port.md), and [Limitations](about/limitations.md).
+    nether is past Phase 3 on Apple Silicon (Linux boots, virtio works, snapshots fork). The x86/KVM platform layer is wired and **verified on metal** for PVH boot, control plane, vsock, and watchdogs; remaining KVM gaps are virtio-net bring-up, SMP, snapshot/restore, and GPU. See [Roadmap](roadmap.md) and [Limitations](about/limitations.md).
 
 ## What it does today
 
 | Backend | Status |
 | --- | --- |
-| **KVM / x86-64** | PVH-boots Linux 6.12 to an interactive shell; virtio-blk R/W; userspace IOAPIC; control plane, vsock, metering, slirp egress firewall (when `net=1`); virtio-net enumerates but guest interface bring-up still failing on metal |
-| **HVF / aarch64** | Boots Alpine Linux to shell; full platform layer including snapshot-fork, egress firewall, control plane, metering, SMP, GPU |
+| **HVF / aarch64** (lead) | Boots Alpine Linux to shell; full platform layer including snapshot-fork, egress firewall, control plane, metering, SMP, GPU |
+| **KVM / x86-64** (reference) | PVH-boots Linux 6.12 to an interactive shell; virtio-blk R/W; userspace IOAPIC; control plane, vsock, metering, slirp egress firewall (when `net=1`); virtio-net enumerates but guest interface bring-up still failing on metal |
 
 Without a kernel in the working directory, the binary runs a comptime smoke-test guest that prints over serial and shuts down cleanly. The message depends on the backend:
 

@@ -98,7 +98,7 @@ pub const Vm = struct {
 // kick it out of a blocking KVM_RUN (the KVM analog of HVF's hv_vcpus_exit). The
 // handler is a no-op installed WITHOUT SA_RESTART, so the interrupted KVM_RUN ioctl
 // returns EINTR; the run loop then honors a pending power request. Compile-verified;
-// not yet exercised on real KVM (no x86 host) - see docs/linux-platform-port.md.
+// not yet exercised on real KVM (no x86 host).
 const FORCE_EXIT_SIG = std.posix.SIG.USR1;
 var fe_installed = std.atomic.Value(bool).init(false);
 fn forceExitHandler(_: std.posix.SIG) callconv(.c) void {}

@@ -1,143 +1,99 @@
-# Nether
+# nether
 
-A type-2 KVM-backed VMM in Zig. Modern guests only, no legacy hardware. Runs in
-the layer below the guest, hence the name.
+**Linux microVMs that fork like processes.** nether is a type-2 hypervisor (VMM)
+written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapshot
+into fresh VMs in **~70 ms** each — resuming exactly where the image froze, even
+mid-request. It runs in the layer below the guest, hence the name.
 
-**Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)). Design, roadmap, and bringup guides live there.
+**Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)).
 
-## Status
+## The idea
 
-**Verified on a bare-metal KVM host: Nether PVH-boots Linux 6.12 to an
-interactive shell over virtio-pci.** The Phase 1.5 substrate is in place (a
-VM/vCPU core with allocator injection, a single-source-of-truth memory map, a
-port + MMIO exit dispatcher, the firmware floor, the split irqchip with
-eventfd/MSI plumbing, fw_cfg, and a minimal static ACPI generator), and on top of
-it:
+A normal VM boots from cold every time. nether treats a running Linux VM as
+something you can snapshot, kill, and bring back — like `fork()` for a whole guest:
 
-- **PVH direct boot** end to end: loads a PVH-capable `vmlinux` (and optional
-  `initramfs`), places the ACPI tables and `hvm_start_info` in guest RAM, enters
-  the kernel in 32-bit protected mode.
-- **Userspace IOAPIC** routing serial IRQ4, so the `ttyS0` console runs
-  interactively instead of stalling at the 16550 FIFO.
-- **virtio-blk reads and writes** end to end: the guest enumerates the device
-  over the ACPI PCIe host bridge, claims its BAR, and reads/writes `/dev/vda`
-  with MSI-X completions; writes land on the host disk image.
-- **Continuous interactive stdin**: a host I/O thread feeds the serial RX and
-  raises IRQ4 so an idle shell still receives input (offline-built and
-  unit-tested; live verification pending the next box).
-- **virtio-vsock** (the swerver<->guest channel): a pure protocol engine
-  (header codec, connection state machine, credit flow control) plus the
-  three-queue device glue, wired behind a `nether-vsock` marker with a host echo
-  service on port 1234 (offline-built, unit- and fuzz-tested; live boot
-  verification pending).
-- **virtio-net** (the last Phase 3 datapath device): a tap-backed NIC with the
-  two-queue datapath (guest TX frames written to a host tap, a reader thread
-  pushing inbound frames to the guest RX), wired behind a `nether-net` marker
-  (offline-built, unit- and fuzz-tested; live boot verification pending).
+- **Cold boot once (~0.5 s)** to a ready, serving base image.
+- **Warm-fork it in ~70 ms**, copy-on-write: each fork shares the base's pages and
+  only copies what it writes, so a fork is cheap in both time and memory.
+- **Resume mid-flight.** Because the whole guest is captured, a fork wakes up
+  inside the exact system call the snapshot froze on. You can accept a request on
+  one VM, snapshot and kill it, and **complete the reply from a different VM** that
+  didn't exist when the request arrived — the upstream connection is held by the
+  host across the gap.
 
-The hypervisor is now a **compile-time backend seam** (KVM on Linux/x86-64, Apple
-Hypervisor.framework on macOS/aarch64), and the macOS/HVF path has reached **first
-light**: a tiny aarch64 guest runs natively on Apple Silicon, prints over an MMIO
-UART, and powers off - exercising `hv_vm_create`/`hv_vm_map`, the vCPU run loop,
-and the data-abort (MMIO) decode. The aarch64 substrate (GIC, PL011, timer, PSCI)
-and Linux boot are the next chunks. See [`docs/running-on-hvf.md`](docs/running-on-hvf.md).
+The monotonic clock stays continuous across a park; the wall clock catches up to
+real time on resume; forks reseed their CRNG so siblings don't share randomness.
 
-If no `vmlinux` is present the binary runs a comptime real-mode blob that prints
-over COM1 and triggers ACPI S5, as a smoke test. See
-[`docs/bringup-notes.md`](docs/bringup-notes.md) for the hard-won KVM/PVH/virtio
-gotchas behind all of the above.
+> Numbers are measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest. "~70 ms" is
+> a **warm fork / snapshot restore**, not a cold boot — bigger guests copy more
+> pages on resume, so treat it as an order of magnitude, not a guarantee.
 
-## Build & run
+## What it is
 
-Nether targets **Linux with `/dev/kvm`**. The build cross-compiles to
-`x86_64-linux` by default, so it type-checks on any host; it can only *run* on a
-Linux box with KVM and hardware virtualization enabled.
+- A **type-2 VMM in Zig**, modern guests only (no legacy hardware emulation).
+- **Primary backend: Apple Hypervisor.framework on macOS / aarch64.** This is the
+  developed path — it boots Linux, runs SMP, virtio-blk/net/rng/vsock, a control
+  plane, snapshot + COW fork + park/resume, an egress plane, and a read-only web
+  console.
+- **Reference backend: KVM on Linux / x86-64.** The original backend; PVH-boots
+  Linux 6.12 to an interactive shell over virtio-pci. It trails the HVF path.
+- The hypervisor is a **compile-time backend seam**, so the guest-facing device and
+  protocol code is shared across both.
+- **Optional, off by default:** per-VM usage metering with an x402 settlement
+  record on teardown. General (unmetered) workloads are the default path.
+
+The threat model treats **malformed guest input as the primary attacker surface**;
+the guest-facing parsers are continuously fuzzed.
+
+## Build & run (Apple Silicon)
+
+Requires **Zig 0.16.0** ([ziglang.org/download](https://ziglang.org/download/)) and
+an Apple Silicon Mac. The HVF backend needs a hypervisor entitlement, or boots fail
+`HV_DENIED`:
 
 ```sh
-zig build              # cross-compile (x86_64-linux by default)
-zig build run          # build + run (Linux host only)
-zig build test         # run the test suite on the host
-zig build -Dtarget=... # override the target
-```
-
-To PVH-boot a guest, place a PVH-capable `vmlinux` (and optionally an
-`initramfs`) in the working directory before `zig build run`.
-
-On a macOS host whose `xcode-select` points into Xcode.app (e.g. while doing iOS
-work), native linking cannot find the SDK. Prefix any command that links a host
-binary with the standalone Command Line Tools:
-
-```sh
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build test
-```
-
-Cross-compilation is unaffected, so plain `zig build` (and `zig build -Dtarget=`)
-still type-checks the Linux artifact without the prefix.
-
-On an Apple Silicon Mac the HVF backend is selected automatically; build natively,
-codesign with the hypervisor entitlement (ad-hoc is fine for local dev), and run:
-
-```sh
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=native
+zig build -Dtarget=native
 codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
 ./zig-out/bin/nether
 ```
 
-See [`docs/running-on-hvf.md`](docs/running-on-hvf.md) for the macOS/aarch64 path.
+A guest kernel `Image` + rootfs is **not** checked in (it's gitignored). See
+[`docs/running-on-hvf.md`](docs/running-on-hvf.md) for how to fetch/build one and
+for a sample `nether.conf`. If `xcode-select` points into Xcode.app (e.g. during
+iOS work), prefix host-linking commands with
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
 
-Expected smoke-test output (no `vmlinux` present) on a KVM host:
+For the x86/KVM reference backend, see
+[`docs/running-on-kvm.md`](docs/running-on-kvm.md).
 
-```
-Nether lives. Phase 0: real-mode guest over COM1.
-[nether] guest shutdown.
+```sh
+zig build test          # run the test suite (includes the always-on fuzz smoke)
 ```
 
 ## Layout
 
 ```
-build.zig          cross-compiles x86_64-linux; tests build for the host
-src/root.zig       library root the host (swerver) consumes
-src/vm.zig         Vm + Vcpu: hypervisor-agnostic wrapper (memory + region table)
-src/backend.zig    comptime hypervisor backend select (KVM on Linux, HVF on macOS)
-src/hvtypes.zig    backend-agnostic shared types (StopReason, Error, LE helpers)
-src/kvm_backend.zig KVM backend: KVM_RUN loop, x86 exit dispatch, boot entry
-src/hvf_backend.zig HVF backend: Apple Hypervisor.framework, aarch64 (scaffold)
-src/kvm.zig        hand-rolled KVM ABI: ioctl numbers, structs, wrapper
-src/io.zig         Bus: port + MMIO device dispatch spine
-src/memmap.zig     guest physical memory map (single source of truth)
-src/irqchip.zig    split irqchip: irqfd, ioeventfd, MSI injection
-src/ioapic.zig     userspace IOAPIC: redirection table -> MSI translation
-src/lock.zig       per-device spin lock (the D3 concurrency primitive)
-src/serial.zig     16550A UART (full register file, ttyS0, RX FIFO)
-src/rtc.zig        MC146818 RTC/CMOS
-src/pm.zig         ACPI PM block: S5 soft-off, PM timer
-src/reset.zig      0xCF9 reset control
-src/power.zig      power-transition signal (reset/shutdown)
-src/fw_cfg.zig     QEMU fw_cfg device (PIO)
-src/acpi.zig       minimal static ACPI table generator (+ dsdt.asl/.aml)
-src/pci.zig        PCIe ECAM host bridge + config space
-src/virtio.zig     virtio-pci-modern transport (config, BAR, MSI-X)
-src/virtq.zig      split virtqueue (bounds-checked descriptor walk)
-src/virtio_blk.zig virtio-blk backend (read/write/flush)
-src/virtio_rng.zig virtio-rng backend
-src/virtio_net.zig virtio-net backend (tap-backed NIC)
-src/virtio_vsock.zig virtio-vsock protocol engine (swerver<->guest channel)
-src/elf.zig        ELF64 loader + PVH entry note
-src/pvh.zig        PVH direct boot: start_info, modules, orchestration
-src/trace.zig      marker-file-gated device tracing
-src/vt/            VT subsystem: vendored parser + Nether-authored screen grid
-src/webconsole.zig read-only web console (renders the live grid to HTML)
-src/fuzz.zig       always-on fuzz-smoke for the guest-facing parsers
 src/main.zig       thin binary wrapper over the core
-docs/              thesis · design · roadmap · decisions · bringup-notes
-docs/references/   ghostty-patterns (embeddable-core / concurrency inspiration)
+src/root.zig       library root a host platform embeds
+src/hv/            hypervisor backends: HVF (Apple, aarch64) + KVM (Linux, x86-64) + shared seam
+src/agent/         control plane, metering, snapshot / fork / park lifecycle
+src/virtio/        virtio devices: blk, net, rng, vsock (protocol engine + device glue)
+src/chipset/       platform devices: GIC, PL011 UART, PL031 RTC, timer, PSCI
+src/boot/          guest boot: DTB, kernel/initramfs load, memory map
+src/mem/           guest physical memory map (single source of truth)
+src/net/           host networking (slirp-style egress)
+src/common/        shared helpers (config, host utils, locks)
+src/vt/            terminal subsystem: vendored parser + screen grid
+src/fuzz.zig       always-on fuzz-smoke for the guest-facing parsers
+docs/              design · roadmap · decisions · control protocol · runbooks
 ```
 
 ## Toolchain
 
-Targets **Zig 0.16.0 stable**, and also builds clean on recent 0.16 dev
-nightlies (verified on `0.16.0-dev.2135`) - the std-API churn that used to break
-nightlies (notably `std.atomic.Mutex`, which moved/disappeared) has been removed
-from the codebase: the per-device lock is now a plain `std.atomic.Value` spinlock
-(`src/lock.zig`). Pinning `zig` to a 0.16.0 stable install is still recommended for
-reproducibility. See [`docs/bringup-notes.md`](docs/bringup-notes.md).
+Targets **Zig 0.16.0 stable**. `build.zig.zon` pins `minimum_zig_version` and has
+no external dependencies, so the build is self-contained. See
+[`docs/bringup-notes.md`](docs/bringup-notes.md).
+
+## License
+
+[Apache-2.0](LICENSE).

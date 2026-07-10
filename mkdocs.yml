@@ -4,7 +4,7 @@ site_url: https://docs.nether.dev/
 repo_url: https://github.com/justinGrosvenor/nether
 repo_name: justinGrosvenor/nether
 edit_uri: edit/main/docs/
-copyright: Built in Zig. MIT licensed.
+copyright: Built in Zig. Apache-2.0 licensed.
 
 theme:
   name: material
@@ -76,7 +76,6 @@ extra:
       name: nether on GitHub
 
 exclude_docs: |
-  SESSION-HANDOFF.md
   references/
   README.md
 
@@ -84,16 +83,17 @@ nav:
   - Home: index.md
   - Getting started:
       - Installation: getting-started/installation.md
-      - Running on KVM: running-on-kvm.md
       - Running on HVF (Apple Silicon): running-on-hvf.md
+      - Running on KVM: running-on-kvm.md
+      - Code signing: codesigning.md
   - Guide:
       - Source layout: architecture.md
       - Sandbox policy: guide/sandbox-policy.md
+      - Control protocol: control-protocol.md
+      - Control protocol v2: control-protocol-v2.md
   - Operations:
       - Bringup notes: bringup-notes.md
-      - Linux platform port: linux-platform-port.md
   - About:
-      - Platform thesis: thesis.md
       - Design: design.md
       - Roadmap: roadmap.md
       - Decisions: decisions.md

@@ -9,7 +9,7 @@ Honest scope notes for the current tree. These are intentional cuts and sequenci
 | **HVF / aarch64** | Platform layer live: Linux boot, virtio (blk/net/vsock/gpu), snapshot-fork, control plane, govern, observe, meter, SMP |
 | **KVM / x86-64** | PVH Linux boot, virtio-blk, IOAPIC; platform layer wired and **run-verified on metal** for control plane, vsock, metering, watchdogs, and slirp (compile path). Remaining gaps: virtio-net guest interface, SMP AP boot, snapshot/restore, GPU |
 
-See [Linux platform port](../linux-platform-port.md) for the KVM parity checklist and box-session results.
+KVM parity is tracked in the [roadmap](../roadmap.md).
 
 ## Snapshot / restore
 

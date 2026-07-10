@@ -327,4 +327,4 @@ the datapaths by hand.
 - `zig build run` is not wired for codesigning; run the signed binary directly.
   Cross-compiling the Linux artifact with `zig build` is unaffected and unsigned.
 - Snapshot save/restore and COW fork are HVF-only today; KVM parity is tracked in
-  [linux-platform-port.md](linux-platform-port.md).
+  the [roadmap](roadmap.md).

@@ -15,7 +15,7 @@ interactive shell on bare metal, the userspace IOAPIC routes serial IRQ4 (no mor
 16-byte FIFO stall), and virtio-blk reads/writes work end to end; its network path
 now runs through the same slirp + egress firewall. The HVF-proven platform layer
 (control plane, metering, observe/govern) is **wired on KVM and run-verified on metal**
-(box session 1, 2026-06-27: steps 0–3 PASS). Remaining KVM gaps: virtio-net guest
+(bring-up steps 0–3 PASS). Remaining KVM gaps: virtio-net guest
 interface, SMP AP boot, snapshot/restore, and GPU. The bet is that what HVF proved
 about the device models and control protocol transfers largely intact; snapshot on KVM
 still needs `KVM_GET/SET_*` work.
@@ -35,7 +35,7 @@ Re-cut from the original six-phase plan. Two changes from the first draft:
 The win condition was **Phase 3**: a clean modern-only VMM that boots Linux over
 virtio-block/net with MSI-X. **That line is crossed** (on the aarch64/HVF
 backend), and rather than stop there the project ran forward into the platform
-track below - the agent surfaces (observe/govern/meter/run/render) and the
+track below - the agent-platform surfaces (observe/govern/meter/run/render) and the
 snapshot-fork primitive - built ahead of the general-VMM phases. Phases 4-6
 (Windows, passthrough/NUMA, live migration) remain real future scope, each its own
 project measured in months.
@@ -76,7 +76,7 @@ The real first hard milestone. None of this is glamorous; all of it is load-bear
   routing, PCI, MSI, PM timer and reports over serial); serial golden-output
   tests. See [decisions D5](decisions.md#d5-test-harness). (The *parser* side of D5
   is now in place: a `zig build fuzz` coverage-guided target over every guest-facing
-  parser, via std.testing.fuzz - see SESSION-HANDOFF; kvm-unit-tests on metal is the
+  parser, via std.testing.fuzz; kvm-unit-tests on metal is the
   remaining inner-loop piece.)
 
 **Done when:** kvm-unit-tests' core APIC/PCI suites pass, and the substrate can
@@ -141,10 +141,10 @@ The difficulty cliff. Windows is a brutal ACPI conformance test.
 
 ## Platform track (thesis-driven)
 
-These are not a seventh phase - they are reprioritizations the
-[thesis](thesis.md) imposes on the phases above, captured here so the edge
-product shapes the core instead of being bolted on. The principle: **build the
-edge path forward of the general-VMM path**, but never ahead of the Phase 3
+These are not a seventh phase - they are reprioritizations imposed on the phases
+above, captured here so the embeddable product shapes the core instead of being
+bolted on. The principle: **build the embeddable path forward of the general-VMM
+path**, but never ahead of the Phase 3
 done-line.
 
 - **Embeddable core from Phase 0.** Library + thin dev binary, allocator injected,
@@ -394,7 +394,7 @@ The build-out arc (offline-first chunks):
      is answered by the host without touching the guest, and is not itself counted.
      Proven live: after 3 commands, `__stats__` over the socket returns
      `commands=3 bytes_in=27 bytes_out=287` etc. Nether exposes the usage; the
-     billing plane (the platform/x402) settles on it.
+     optional x402 settlement plane can settle on it.
    - **Sandbox introspection (DONE) - `__info__`.** The companion to `__stats__`:
      where stats answers "how much has it used?", `__info__` answers "what IS this
      sandbox and what are its limits?" - a host-intercepted report of the static

@@ -20,3 +20,7 @@ nether-restore
 nether-agent
 nether-control
 nether.conf
+
+# Python
+__pycache__/
+*.pyc

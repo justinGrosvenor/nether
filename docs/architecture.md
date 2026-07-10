@@ -2,8 +2,7 @@
 
 How `src/` is organized after the flat-to-domains reorg, so the layout is a written
 contract and new files land in the right place. This is the *map of the code*; the
-*why* (the platform thesis) is in [thesis.md](thesis.md), the *what's-built* is in
-[roadmap.md](roadmap.md).
+*why* is in [design.md](design.md), the *what's-built* is in [roadmap.md](roadmap.md).
 
 ## Domain tree
 
@@ -68,7 +67,7 @@ the guest arch, and the two are never mixed in one binary. See
 HVF/aarch64 is the *lead* backend (where the full platform layer + SMP + snapshot were
 built and live-proven). KVM/x86 is the *reference* backend: the platform layer is
 wired there too and run-verified for control/vsock/watchdogs; it still trails on
-virtio-net, SMP, snapshot, and GPU — see [linux-platform-port.md](linux-platform-port.md).
+virtio-net, SMP, snapshot, and GPU — see the [roadmap](roadmap.md).
 
 ## Conventions (read before moving or adding a file)
 
@@ -91,7 +90,7 @@ virtio-net, SMP, snapshot, and GPU — see [linux-platform-port.md](linux-platfo
   DEVELOPER_DIR=/Library/Developer/CommandLineTools zig test -target aarch64-macos src/root.zig
   DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=x86_64-linux
   ```
-  then a native build + codesign before running on HVF (see SESSION-HANDOFF.md).
+  then a native build + codesign before running on HVF.
 
 ## Known follow-ups
 
@@ -99,4 +98,4 @@ virtio-net, SMP, snapshot, and GPU — see [linux-platform-port.md](linux-platfo
   dropping it is a trivial optional rename pass.
 - `main.zig` still holds both boot orchestrations; splitting `boot/linux_main.zig` +
   `boot/mac_main.zig` is a later option. The shared platform init that the Linux port
-  needs (`linux-platform-port.md` #3) would land as `agent/platform.zig`.
+  needs would land as `agent/platform.zig`.

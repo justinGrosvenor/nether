@@ -1,4 +1,4 @@
-/* nether in-guest data-plane forwarder (Phase 2 of docs/park-concurrency-plan.md, 3b).
+/* nether in-guest data-plane forwarder (Phase 2 data plane).
  *
  * INBOUND (data plane): the host dials this forwarder's vsock port (FWD_VSOCK_PORT); for
  * each accepted vsock connection the forwarder opens a TCP connection to the tenant's

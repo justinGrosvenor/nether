@@ -676,7 +676,7 @@ fn evConn(ev: nether.vsock.Event) ?u16 {
     };
 }
 
-/// P0 spike for the Phase-2 data-plane bridge (docs/park-concurrency-plan.md): drives
+/// P0 spike for the Phase-2 data-plane bridge: drives
 /// ONE host-initiated vsock connection to a guest-listening port and records its
 /// lifecycle, so `__vsockprobe__` can prove host->guest connect + RW + teardown on a
 /// live guest before the real bridge is built. Its own lock (NOT the vsock D3 lock)
@@ -744,7 +744,7 @@ pub const VsockProbe = struct {
 /// (the VsockProbe now; the Phase-2 bridge later); everything else - notably the
 /// guest-initiated agent conn - goes to the agent. Without this, a dialed conn's
 /// reset/shutdown would clobber the agent's conn-id tracking (agentEvent clears it on
-/// ANY reset). Seed of the data-plane bridge (docs/park-concurrency-plan.md).
+/// ANY reset). Seed of the data-plane bridge.
 pub const VsockRouter = struct {
     agent: *AgentCtx,
     probe: ?*VsockProbe = null,
@@ -775,7 +775,7 @@ const FWD_VSOCK_PORT: u32 = 5001;
 /// restored fork resumes the guest's blocked recv()). Must match tools/forwarder.c.
 pub const EGRESS_VSOCK_PORT: u32 = 5002;
 
-/// Host-side data-plane bridge (Phase 2 step 2b, docs/park-concurrency-plan.md 3b): a
+/// Host-side data-plane bridge (Phase 2 step 2b): a
 /// Unix-domain listener swerver connects to. Each accepted connection is spliced to a
 /// fresh host->guest vsock stream to the in-guest forwarder, which relays to the tenant's
 /// loopback server - so a tenant's ordinary TCP server is reachable as a concurrent
@@ -837,7 +837,7 @@ pub const DataBridge = struct {
         last_ms: i64 = 0, // last activity either direction, for the idle reaper
         // Delivery ring buffer (guest->consumer). onRw (device thread) buffers here; the
         // device thread and the pump drain it to the unix socket with NON-BLOCKING sends -
-        // so the vCPU/device thread NEVER blocks (the Medium finding) - and credit the guest
+        // so the vCPU/device thread NEVER blocks on a wedged consumer - and credit the guest
         // only for what actually drained. Capacity == the conn's window, so it never overflows.
         buf: []u8 = &.{},
         bh: usize = 0, // ring read head
@@ -1975,7 +1975,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
         reply(ctx, c, std.fmt.bufPrint(&rb, "OK parked {s}\n", .{bill}) catch "OK parked\n");
         std.process.exit(0);
     }
-    // Diagnostic (P0 spike, docs/park-concurrency-plan.md): prove host->guest vsock
+    // Diagnostic (P0 spike): prove host->guest vsock
     // connect on a LIVE guest, the go/no-go for the data-plane bridge. Dials
     // <guest_port> (a guest process must be listening on that vsock port), sends a
     // probe, reports the echo, and tears down. Events for this dialed conn are routed to

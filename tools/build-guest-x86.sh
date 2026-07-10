@@ -3,7 +3,7 @@
 # with the static agent + an /init that brings up vsock/net and starts it. The
 # x86 analog of the aarch64 recipe in docs/running-on-hvf.md, so a Linux/KVM
 # sandbox boots straight into the agent platform (control socket, agent,
-# metering, observe, govern, render) the same as the HVF path.
+# metering, render) the same as the HVF path.
 #
 # The CONFIG_PVH `vmlinux` is built separately on a Linux host (see
 # docs/running-on-kvm.md); it must enable the platform stack (=y so no modprobe):

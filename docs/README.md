@@ -18,10 +18,10 @@ Open http://127.0.0.1:8000
 | `index.md` | Home |
 | `getting-started/` | Install, KVM, HVF runbooks |
 | `guide/` | Source layout, sandbox policy |
-| `operations/` | (top-level bringup + platform port) |
+| `operations/` | (top-level bringup notes) |
 | `about/` | Limitations |
-| `thesis.md`, `design.md`, `roadmap.md`, `decisions.md` | About section |
+| `design.md`, `roadmap.md`, `decisions.md` | About section |
 
-Internal-only (excluded from the site): `SESSION-HANDOFF.md`, `references/`.
+Internal-only (excluded from the site): `references/`.
 
-Brand assets: copied from `the brand` into `assets/`. Styling: `stylesheets/nether.css`.
+Brand assets live in `assets/`. Styling: `stylesheets/nether.css`.

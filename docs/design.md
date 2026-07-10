@@ -3,24 +3,27 @@
 A type-2 virtual machine monitor written in Zig. Modern guests only, no legacy
 hardware. Runs in the layer below the guest, hence the name.
 
-> Nether is the **isolation layer** of a *govern · isolate · meter · edge*
-> platform - see [thesis.md](thesis.md) for the why. The thesis pulls the edge
-> path (embeddable core, vsock spine, snapshot-fork, PVH fast boot) forward of
-> the general-VMM path; the design below is the full envelope, the roadmap
-> sequences it.
+> Nether is an **isolation layer** designed to be embedded by a host platform. Its
+> design prioritizes the embeddable path (embeddable core, vsock spine, snapshot-fork,
+> fast boot) ahead of the general-VMM path; the design below is the full envelope, the
+> roadmap sequences it.
 
 ## Design point
 
 Past Firecracker, short of QEMU. The same envelope as Cloud Hypervisor:
 hardware-assisted virtualization only, paravirtual and modern-standard
 interfaces, arbitrary modern guests including Windows, and a deliberate refusal
-to emulate old hardware. No binary translation, no CPU emulation. KVM does the
-privileged work; Nether is a userspace VMM driving it over ioctls.
+to emulate old hardware. No binary translation, no CPU emulation. The host
+hypervisor does the privileged work (Apple HVF via the framework API, or KVM
+over ioctls); Nether is the userspace VMM driving it.
 
 ## Backend and targets
 
-- KVM (Linux). Hardware virtualization required: VT-x/AMD-V, EPT/NPT.
-- x86-64 first. aarch64 later (zvm proves the PCI path there).
+- Apple Hypervisor.framework (macOS/aarch64) is the **lead** backend; KVM
+  (Linux/x86-64) is the secondary/reference backend. Hardware virtualization
+  required either way (HVF on Apple Silicon; VT-x/AMD-V + EPT/NPT on x86).
+- aarch64 is the primary developed target (the Apple Silicon dev host, and a real
+  production target: Graviton/ARM servers); x86-64 is the reference path.
 - Type-2 only. Not building a vmkernel or a driver stack.
 
 ## In scope

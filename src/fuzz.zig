@@ -20,8 +20,8 @@
 //! Two layers: (1) always-on fixed-seed smoke (the `survives ...` tests) that runs
 //! with `zig build test` and surfaces panics under Debug/ReleaseSafe, reproducibly;
 //! (2) coverage-guided entry points (the `fuzz: ...` tests, via std.testing.fuzz) that
-//! `zig build fuzz --fuzz` drives over the same harnesses. Pattern borrowed from
-//! a private path tests/fuzz.zig.
+//! `zig build fuzz --fuzz` drives over the same harnesses, following the standard
+//! std.testing.fuzz layout.
 
 const std = @import("std");
 const Parser = @import("vt/Parser.zig");

@@ -16,7 +16,7 @@ inherit nothing signing-related, they are just new processes of the already-sign
 
 ```sh
 cd ~/nether
-ZIG=/Users/justin/Library/zig/0.16.0/zig      # 0.16.0 STABLE - see "Toolchain" below
+ZIG="${ZIG:-zig}"      # requires Zig 0.16.0 (https://ziglang.org/download) - see "Toolchain" below
 
 # 1. Build the NATIVE aarch64 macOS binary (NOT the default x86_64-linux target).
 $ZIG build -Dtarget=native
@@ -73,8 +73,8 @@ generic binary shows `Page size=none` / few slots.
 
 ## Toolchain
 
-Use **zig 0.16.0 stable** (`/Users/justin/Library/zig/0.16.0/zig`), not whatever `zig` is on
-`PATH`. On this machine the `PATH` zig is an older `0.16.0-dev` that (a) lacks
+Use **zig 0.16.0 stable** ([ziglang.org/download](https://ziglang.org/download)), not whatever
+`zig` happens to be on `PATH`. An older `0.16.0-dev` zig (a) lacks
 `std.testing.Smith` that the fuzz targets need, and (b) has a MachO linker that cannot parse the
 current Xcode SDK's `libSystem.tbd` (the Xcode 26.5 SDK dropped `arm64-macos` from its
 top-level `targets:`), so every `-lc` link resolves zero symbols

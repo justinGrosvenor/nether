@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Warm-VM POOL proof (park-concurrency 1c, nether side).
 #
-# The supervisor (a private path) pre-forks a buffer of warm Nether microVMs from a
+# A supervisor pre-forks a buffer of warm Nether microVMs from a
 # baked base and hands one out per tenant on demand. This harness proves the nether-side
 # mechanics that pool rests on, live on HVF: bake one base whose in-guest HTTP server is
 # running, pre-fork N warm VMs from it, and show that

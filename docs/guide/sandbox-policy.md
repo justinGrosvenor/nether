@@ -37,7 +37,7 @@ net_rate_kbps = 4000          # download cap in kbps (0 = unlimited)
 
 Denied attempts increment `net_blocked` in the `__stats__` report.
 
-Slirp + firewall is implemented on **both** KVM and HVF when `net=1` is enabled. On KVM, virtio-net guest interface bring-up is still under investigation (see [Linux platform port](../linux-platform-port.md)).
+Slirp + firewall is implemented on **both** KVM and HVF when `net=1` is enabled. On KVM, virtio-net guest interface bring-up is still under investigation.
 
 ## Runtime budgets
 
@@ -73,5 +73,3 @@ Full examples and formats are in [Running on HVF](../running-on-hvf.md#booting-l
 ## Can't not won't
 
 A sandbox **can't** reach host memory (EPT/IOMMU). With slirp and the firewall enabled it **can't** reach the metadata endpoint or your LAN. These are rules enforced in code, not terms of service.
-
-See [Platform thesis](../thesis.md) for how govern and isolate fit the edge runtime.

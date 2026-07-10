@@ -106,10 +106,9 @@ net=1
 
 and attach with `nc -U /tmp/nether.sock` (the same control protocol as HVF:
 `__info__`, `__stats__`, `__events__`, `__shutdown__`, command relay, `__put__`/
-`__get__`). **Verified on metal** (box session 1, 2026-06-27): PVH boot, idle
+`__get__`). **Verified on metal** (2026-06-27): PVH boot, idle
 shell, control plane over vsock, `__shutdown__`, and watchdogs all pass. virtio-net
-interface bring-up and SMP (`cpus>1`) still fail — see
-[Linux platform port](linux-platform-port.md).
+interface bring-up and SMP (`cpus>1`) still fail — see the [roadmap](roadmap.md).
 
 ### Boot
 

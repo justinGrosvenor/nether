@@ -47,8 +47,7 @@ the same core compiles unchanged as (a) a standalone exe with a default host, (b
 a lib swerver links (the `embedded` analog), (c) later a remote/headless target.
 No host-specific code (stdin threads, termios, fd wiring) should live in the
 device models; it belongs in a host implementation behind the seam. This is the
-[thesis](../thesis.md) "embeddable core, allocator-injected" consequence made
-structural.
+"embeddable core, allocator-injected" consequence made structural.
 
 **Adopt:** now, as framing. Cheap to set early, expensive to retrofit.
 
@@ -118,7 +117,7 @@ sharing locked state. Two direct fits:
 
 The single-threaded variant of the same union means the core does not care how
 the host threads it, which is exactly what "swerver decides the concurrency
-model" (per-VM-per-worker, [thesis](../thesis.md)) wants.
+model" (per-VM-per-worker) wants.
 
 **Adopt:** later, when lock contention or device count makes the lock model hurt.
 Until then, hold the D3 discipline (one lock order, no lock across a syscall).
@@ -181,7 +180,7 @@ bitmap pool allocator and ref-counted styles. The result serializes cleanly and
 can be shared copy-on-write.
 
 **Nether application.** Conceptual inspiration, not code to lift. Snapshot-fork
-(boot once, clone per request) is the edge product ([thesis](../thesis.md)), and
+(boot once, clone per request) is the embeddable product, and
 it wants device/guest state that is fixed-size, pool-allocated, ref-countable,
 and serializable by construction, from Phase 3 forward rather than retrofitted.
 Ghostty's storage layer is a worked example of that discipline. Nether's own

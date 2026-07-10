@@ -3,8 +3,8 @@
 Status: **IMPLEMENTED in nether** (2026-07-04). `proto_version` is now `2`; every command/ack
 reply is framed, with negative trailer exits for control-plane errors and a command-intake
 guard against forged frames. Reference client `tools/nether-ctl.c` speaks both v1 and v2.
-Proven live on HVF (`scripts/proto_v2.py`). **Consumers still to migrate:** swerver
-`control_client`, `a private path` codec, `a private path` - each reads `proto_version`
+Proven live on HVF (`scripts/proto_v2.py`). **Consumers still to migrate:** the swerver
+`control_client`, its console codec, and the supervisor - each reads `proto_version`
 from the `__info__` handshake, so they can adopt the uniform framed loop (and drop the settle
 timer) at their own pace; a v1 client still works against a v2 server (section 4). This doc is
 the design + migration reference; the live contract is in [control-protocol.md](control-protocol.md).
@@ -29,8 +29,8 @@ follows). That heuristic is the protocol's one real wart:
 - **It can truncate a real reply.** A framed shell reply whose body begins `OK `/`ERR ` and
   whose `0x1e` trailer lags >500 ms (a slow/streaming producer, or a deliberately malformed
   guest - the stated threat model) is mis-delivered as a *bare* reply: the true multi-line
-  output and exit code are silently discarded. (Found in the `the console` codec review,
-  2026-07-04, `connection.ts` settle path.)
+  output and exit code are silently discarded. (Found in a host-side codec review of the
+  client settle path.)
 - **It costs latency.** `__snapshot__` (socket stays open) forces every consumer to wait a
   full idle/settle window (~500 ms-2 s) before resolving, even though the `OK` line arrived
   immediately.
@@ -148,10 +148,10 @@ framed. This dual-path period ends when all deployed nether are v2.
 - **`tools/nether-ctl.c`** (reference): add v2 to `is_framed()` (shutdown/snapshot/put/get
   become framed); gate the `bare_status_line` settle path on `proto_version==1`. ~20 lines.
 - **swerver `control_client`**: same shape change; drop `SETTLE_MS` on v2.
-- **`a private path` codec** (`clients/nether/codec.ts`, `connection.ts`): `isFramed()`
+- **swerver console codec** (`clients/nether/codec.ts`, `connection.ts`): `isFramed()`
   returns true for the ack commands on v2; delete the settle timer on v2 (fixes the
   truncation bug found in review directly). `unescapeBody`/frame-finding are unchanged.
-- **`a private path`**: uses `__info__`/`__shutdown__`; gains the uniform loop.
+- **the supervisor**: uses `__info__`/`__shutdown__`; gains the uniform loop.
 
 All four already read `proto_version` from the `__info__` handshake, so the version gate has a
 home. Nether ships one version at a time (no per-client downgrade); consumers adapt off

@@ -830,7 +830,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     var runas_buf: [64]u8 = undefined;
     const runas: []const u8 = confGet("run_as", &runas_buf) orelse "";
     // `nether.app_port=<n>`: the tenant's loopback TCP port the in-guest forwarder bridges
-    // to the host data plane (docs/park-concurrency-plan.md 3b). /init starts /forwarder when set.
+    // to the host data plane. /init starts /forwarder when set.
     var appport_buf: [16]u8 = undefined;
     const app_port: []const u8 = confGet("app_port", &appport_buf) orelse "";
     // `nether.egress_port=<n>`: the loopback port the forwarder's REVERSE mode listens on

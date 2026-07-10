@@ -1,8 +1,8 @@
 //! Shared platform-layer wiring used by BOTH boot paths (macBootLinux on HVF,
 //! linuxMain on KVM), so the agent control plane is ported once and the two
 //! backends can't drift. First piece: the lifecycle watchdogs. As the Linux port
-//! lands (docs/linux-platform-port.md #2/#3), the rest of the platform init -
-//! control socket, metering, journal, render - joins this module.
+//! lands, the rest of the platform init - control socket, metering, journal,
+//! render - joins this module.
 //!
 //! Everything here is backend-agnostic by construction: the one thing that differs
 //! per backend - how you force the guest to stop - is injected as a `Stop`. On HVF
