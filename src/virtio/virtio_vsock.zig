@@ -555,6 +555,14 @@ pub const Vsock = struct {
         return true;
     }
 
+    /// Look up a LIVE connection by (host_port, guest_port). Returns only non-closed
+    /// slots, and that filter is LOAD-BEARING for the packet handlers: the teardown paths
+    /// (onShutdown/onRst) and credit paths (onCreditUpdate/onCreditRequest) carry no
+    /// explicit state guard and rely on it to never act twice on one conn - once the first
+    /// SHUTDOWN/RST sets .closed, a repeat finds nothing, so .shutdown/.reset (which FREE
+    /// the data-plane bridge entry) can never double-fire. Do NOT change this to return
+    /// closed conns without giving those handlers explicit state guards, or the
+    /// orphaned/double-teardown bug class (cf. the onRequest duplicate-REQUEST fix) returns.
     fn findConn(self: *Vsock, host_port: u32, guest_port: u32) ?u16 {
         for (&self.conns, 0..) |*c, i| {
             if (c.state != .closed and c.host_port == host_port and c.guest_port == guest_port)

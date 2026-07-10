@@ -599,6 +599,11 @@ pub const Slirp = struct {
             var room: u32 = c.guest_win - inflight;
             if (room > c.guest_mss) room = c.guest_mss;
             if (room > 1400) room = 1400;
+            // A guest that advertised MSS 0 clamps room to 0; recv(fd, .., 0) returns 0,
+            // which the EOF branch below would misread as a host close and FIN the guest's
+            // own connection. There is nothing to read into a zero window - wait for the
+            // guest to open it rather than tearing the flow down.
+            if (room == 0) return;
             const got = sock.recv(c.fd, self.poll_scratch[0..room].ptr, room, 0);
             if (got > 0) {
                 self.tcpSend(c, c.snd_nxt, TH_PSH | TH_ACK, self.poll_scratch[0..@intCast(got)], null);

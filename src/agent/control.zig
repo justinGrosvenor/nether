@@ -344,6 +344,13 @@ const Capture = struct {
 // scanned out of the agent's 0x1e<code>\n reply trailer. Read via __cmdlog__.
 const CMD_LOG_CAP = 128;
 const CMD_TEXT_MAX = 120;
+/// Upper bound on cmdLog's serialized output: a "CMDLOG <total>\n" header plus one
+/// "<ms> exit=<code> cpu_ms=<n> <text>\n" line per retained event. The fixed fields
+/// (ms/exit/cpu_ms decimals + separators) fit well under 72 bytes, so this bounds the
+/// worst case (128 full-length commands) - sizing the reader from the ring means a full
+/// log of long commands is never silently truncated (the newest entries were dropped
+/// when the buffer was a flat 16 KiB). Mirrors the __events__/SERIALIZE_MAX discipline.
+const CMD_LOG_SERIALIZE_MAX = CMD_LOG_CAP * (CMD_TEXT_MAX + 72) + 64;
 const CmdEvent = struct {
     ms: i64 = 0,
     exit: i32 = -1,
@@ -1819,7 +1826,7 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
     // Observe: the command audit log - every shell command the platform ran in the
     // sandbox and its exit code. Host-intercepted.
     if (std.mem.eql(u8, line, "__cmdlog__\n") or std.mem.eql(u8, line, "__cmdlog__")) {
-        var buf: [16384]u8 = undefined;
+        var buf: [CMD_LOG_SERIALIZE_MAX]u8 = undefined;
         const n = ctx.agent.cmdLog(&buf);
         hostWrite(ctx, c, buf[0..n]);
         _ = ctx.meter.bytes_out.fetchAdd(n, .release);
