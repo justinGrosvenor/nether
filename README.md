@@ -91,6 +91,9 @@ For the x86/KVM reference backend, see
 zig build test          # run the test suite (includes the always-on fuzz smoke)
 ```
 
+Every latency and behavior claim above has a live proof script under `scripts/`;
+[`docs/reproducing.md`](docs/reproducing.md) indexes what each proves and how to run it.
+
 ## Layout
 
 ```
