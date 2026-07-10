@@ -397,6 +397,13 @@ pub const AgentCtx = struct {
     /// When set, agent reply bytes are diverted into this capture (file transfer)
     /// instead of relayed/printed. Set/cleared by the control thread.
     capture: std.atomic.Value(?*Capture) = std.atomic.Value(?*Capture).init(null),
+    /// Serializes the device thread's capture feed (captureFeed) against the control
+    /// thread's teardown (captureClear). The capture buffer is a control-thread stack/heap
+    /// object; without this, the control thread could free it (on the ~10s waitCapture
+    /// timeout) WHILE the device thread is mid-feed on a guest that keeps streaming - a
+    /// guest-triggerable use-after-free. captureClear publishes null then barriers on this
+    /// lock, so no feed is in flight when the buffer is reclaimed.
+    capture_lock: Lock = .{},
     /// The render pillar: when set, each command's output is teed into its own VT screen
     /// (a bounded per-command history) so the platform can fetch a rendered snapshot via
     /// `__screen__ [id]` (default = the latest command's screen).
@@ -463,6 +470,31 @@ pub const AgentCtx = struct {
     /// values are the host's control-plane error convention (v2). Clamp to the POSIX
     /// range: anything unparseable or outside 0..255 records as 255, so a hostile
     /// agent cannot plant a host-looking `exit=-1` in the audit surfaces (P2 #1).
+    /// Device (vCPU) thread: divert reply bytes into an in-flight file-transfer capture.
+    /// Returns true iff a transfer is active (bytes consumed). Held under capture_lock so
+    /// the control thread's captureClear cannot free the buffer between the load and the
+    /// feed. feed() is a bounded memcpy + atomic store - it never blocks, so the lock is
+    /// released promptly and captureClear's barrier cannot stall the guest.
+    fn captureFeed(a: *AgentCtx, bytes: []const u8) bool {
+        a.capture_lock.lock();
+        defer a.capture_lock.unlock();
+        if (a.capture.load(.acquire)) |cap| {
+            cap.feed(bytes);
+            return true;
+        }
+        return false;
+    }
+
+    /// Control thread: end a capture. Publish null (so a subsequent captureFeed skips it),
+    /// then acquire+release capture_lock as a barrier - this returns only once any feed
+    /// already in progress has finished, making it safe for the caller to reclaim the
+    /// capture buffer (stack frame / heap free) on return.
+    fn captureClear(a: *AgentCtx) void {
+        a.capture.store(null, .release);
+        a.capture_lock.lock();
+        a.capture_lock.unlock();
+    }
+
     fn auditRecv(a: *AgentCtx, bytes: []const u8) void {
         for (bytes) |b| {
             if (a.audit_in_exit) {
@@ -647,9 +679,8 @@ pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
             if (a.journal) |j| j.emit(.life, "agent connected");
             std.debug.print("[agent] guest agent connected; type commands (they run in the sandbox)\n", .{});
         },
-        .recv => |r| if (a.capture.load(.acquire)) |cap| {
-            cap.feed(r.bytes); // file transfer in progress: divert the reply
-        } else {
+        .recv => |r| if (!a.captureFeed(r.bytes)) {
+            // No file transfer in flight: normal reply handling.
             if (a.meter) |m| m.touch(); // agent output: the sandbox is doing work
 
             if (a.renders) |rm| rm.feed(r.bytes); // tee output into the current command's screen
@@ -1072,6 +1103,12 @@ pub const DataBridge = struct {
     fn register(self: *DataBridge, id: u16, unix_fd: c_int) ?usize {
         self.lock.lock();
         defer self.lock.unlock();
+        // Invariant: at most one active entry per vsock id. The engine guarantees it -
+        // onRequest drops a duplicate REQUEST before firing .accept, and host-dialed conns
+        // get a freshly allocated id - so a given id is never registered twice. (If that
+        // ever broke, two slots would alias one engine conn; the guard lives at the source
+        // in virtio_vsock.onRequest, not here, because closing/reusing the shared id from
+        // this side would tear down the legitimate slot.)
         var active: usize = 0;
         var free: ?usize = null;
         for (&self.conns, 0..) |*e, i| {
@@ -1567,18 +1604,19 @@ fn controlPut(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     const rel = ctx.jailRel(std.mem.span(hp)) orelse return reply(ctx, c, "ERR host path outside transfer dir\n");
     const rfd = hostutil.openJailedAt(ctx.xfer_root_fd, rel, false);
     if (rfd < 0) return reply(ctx, c, "ERR cannot read host file\n");
-    const data = readFileFd(ctx.allocator, rfd) catch {
+    // Cap the read at MAX_XFER so an oversize jailed file is rejected BEFORE it is
+    // allocated (memory-DoS guard: the bound now gates the allocation, not just the send).
+    const data = readFileFd(ctx.allocator, rfd, MAX_XFER) catch |e| {
         _ = libc.close(rfd);
-        return reply(ctx, c, "ERR cannot read host file\n");
+        return reply(ctx, c, if (e == error.FileTooLarge) "ERR file too large\n" else "ERR cannot read host file\n");
     };
     _ = libc.close(rfd);
     defer ctx.allocator.free(data);
-    if (data.len > MAX_XFER) return reply(ctx, c, "ERR file too large\n");
 
     var rbuf: [8]u8 = undefined;
     var cap = Capture{ .is_get = false, .buf = &rbuf };
     ctx.agent.capture.store(&cap, .release);
-    defer ctx.agent.capture.store(null, .release);
+    defer ctx.agent.captureClear(); // barrier: no feed in flight before `cap`/`rbuf` leave scope
 
     var hdr: [4096]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "__PUT__ {s} {d}\n", .{ guestpath, data.len }) catch return reply(ctx, c, "ERR guest path too long\n");
@@ -1599,7 +1637,7 @@ fn controlGet(ctx: *ControlCtx, c: c_int, id: u16, args: []const u8) void {
     defer ctx.allocator.free(cbuf);
     var cap = Capture{ .is_get = true, .buf = cbuf };
     ctx.agent.capture.store(&cap, .release);
-    defer ctx.agent.capture.store(null, .release);
+    defer ctx.agent.captureClear(); // barrier: no feed in flight before `cbuf` is freed
 
     var hdr: [4096]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "__GET__ {s}\n", .{guestpath}) catch return reply(ctx, c, "ERR guest path too long\n");
@@ -2966,6 +3004,42 @@ test "Capture.feed survives hostile agent replies (GET + PUT, split chunks)" {
             try testing.expect(cap.expect <= gbuf.len);
             std.mem.doNotOptimizeAway(cap.buf[cap.body_off..cap.expect]);
         }
+    }
+}
+
+test "capture teardown barriers the device-thread feed (UAF regression)" {
+    // The file-transfer capture buffer lives on the CONTROL thread's stack/heap; the
+    // device (vCPU) thread diverts guest reply bytes into it via captureFeed. Before the
+    // fix, the control thread could reclaim that buffer (e.g. on the waitCapture timeout)
+    // while a feed was in flight on a guest that kept streaming - a guest-triggerable
+    // use-after-free. captureClear must barrier on capture_lock so no feed can touch the
+    // buffer once it returns. Hammer both sides: the run must not deadlock or crash, and a
+    // feed must never perturb a buffer whose capture has been cleared.
+    var a = AgentCtx{};
+    var stop = std.atomic.Value(bool).init(false);
+    const Feeder = struct {
+        fn run(ctx: *AgentCtx, s: *std.atomic.Value(bool)) void {
+            while (!s.load(.acquire)) _ = ctx.captureFeed("OK\n");
+        }
+    };
+    const th = std.Thread.spawn(.{}, Feeder.run, .{ &a, &stop }) catch return error.SkipZigTest;
+    defer {
+        stop.store(true, .release);
+        th.join();
+    }
+    const SENTINEL: u8 = 0xAB;
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) {
+        var buf: [8]u8 = undefined;
+        var cap = Capture{ .is_get = false, .buf = &buf };
+        a.capture.store(&cap, .release); // publish: the feeder may now divert into &buf
+        a.captureClear(); // must return only after any in-flight feed has finished
+        // Post-barrier: capture is null and no feed is running, so this buffer is now
+        // exclusively ours. A broken barrier would let an in-flight feed still be writing
+        // here, corrupting the sentinel we stamp and immediately re-read.
+        @memset(&buf, SENTINEL);
+        std.atomic.spinLoopHint();
+        for (buf) |b| try testing.expect(b == SENTINEL);
     }
 }
 

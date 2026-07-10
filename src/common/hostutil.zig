@@ -255,17 +255,22 @@ pub fn readFileMac(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
     const fd = libc.open(path, 0, @as(c_int, 0)); // O_RDONLY
     if (fd < 0) return error.OpenFailed;
     defer _ = libc.close(fd);
-    return readFileFd(allocator, fd);
+    return readFileFd(allocator, fd, std.math.maxInt(usize)); // unbounded: trusted host path
 }
 
 /// Read a whole ALREADY-OPEN file into a freshly allocated buffer (caller frees; the
 /// fd stays owned by the caller). Split out of readFileMac so a caller that opened via
 /// openJailedAt (a TOCTOU-safe open) can reuse the exact same read/short-read logic.
-pub fn readFileFd(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
+pub fn readFileFd(allocator: std.mem.Allocator, fd: c_int, max: usize) ![]u8 {
     const size_i = libc.lseek(fd, 0, 2); // SEEK_END
     if (size_i <= 0) return error.OpenFailed;
     _ = libc.lseek(fd, 0, 0); // SEEK_SET
     const size: usize = @intCast(size_i);
+    // Reject an oversize file BEFORE allocating: otherwise a caller's transfer cap (e.g.
+    // __put__'s MAX_XFER) is only consulted after the full file is already allocated, so a
+    // hostile same-uid client could point __put__ at a multi-GB jailed file and inflict
+    // host memory pressure ahead of the check. Caller passes maxInt for "no bound".
+    if (size > max) return error.FileTooLarge;
     const buf = try allocator.alloc(u8, size);
     errdefer allocator.free(buf);
     var off: usize = 0;
@@ -417,7 +422,7 @@ test "openJailedAt walks components openat/O_NOFOLLOW and rejects symlinked esca
     _ = libc.close(wfd);
     const rfd = openJailedAt(root_fd, "sub/file.txt", false);
     try std.testing.expect(rfd >= 0);
-    const data = try readFileFd(std.testing.allocator, rfd);
+    const data = try readFileFd(std.testing.allocator, rfd, std.math.maxInt(usize));
     defer std.testing.allocator.free(data);
     _ = libc.close(rfd);
     try std.testing.expectEqualStrings("JAILDATA", data);

@@ -249,11 +249,17 @@ pub const Vsock = struct {
             self.sendRst(h);
             return;
         }
-        const id = self.findConn(h.dst_port, h.src_port) orelse
-            self.allocConn() orelse {
-                self.sendRst(h);
-                return;
-            };
+        // A REQUEST whose (dst,src) pair already maps to a LIVE conn is a duplicate or a
+        // hostile repeat: findConn only ever returns non-closed slots, so re-establishing
+        // here would re-fire .accept and mint a SECOND data-plane bridge entry (orphaned
+        // pump thread + fd + delivery buffer) aliasing one engine conn. Ignore it - the
+        // connection already exists. A legitimate reconnect uses a fresh guest port and so
+        // allocates a new slot below. (Mirrors onResponse's guard against duplicate RESPONSE.)
+        if (self.findConn(h.dst_port, h.src_port) != null) return;
+        const id = self.allocConn() orelse {
+            self.sendRst(h);
+            return;
+        };
         const c = &self.conns[id];
         c.* = .{
             .state = .established,
