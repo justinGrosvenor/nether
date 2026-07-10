@@ -42,8 +42,27 @@ real time on resume; forks reseed their CRNG so siblings don't share randomness.
 - **Optional, off by default:** per-VM usage metering with an x402 settlement
   record on teardown. General (unmetered) workloads are the default path.
 
-The threat model treats **malformed guest input as the primary attacker surface**;
-the guest-facing parsers are continuously fuzzed.
+## Security
+
+The design assumes a **hostile guest**: malformed or malicious guest input is the
+primary attack surface, and the guest→host boundary is where correctness matters
+most. Two disciplines hold that line:
+
+- **One bounds-checked seam.** Every guest-physical memory access goes through a
+  single overflow-safe accessor that fails closed — an out-of-range address reads
+  as zero and drops the write, so a malicious descriptor ring can never steer the
+  VMM outside guest RAM. Guest-driven device state (virtqueues, snapshot headers)
+  is validated before it is trusted.
+- **Continuous fuzzing + adversarial review.** The guest-facing parsers — virtio
+  transport and devices, the vsock protocol engine, the terminal parser, the
+  snapshot-header decoder — run always-on fuzz smoke in the test suite, and the
+  guest→host surface is reviewed adversarially. The most recent pass fixed a
+  guest-triggerable use-after-free in the file-transfer path and closed several
+  resource-exhaustion edges (see the commit history).
+
+nether is pre-1.0 and has had **no external audit** — don't run untrusted guests in
+production yet. But "malformed guest input must never corrupt the host" is a
+first-class, tested invariant here, not an afterthought.
 
 ## Build & run (Apple Silicon)
 
@@ -95,6 +114,16 @@ docs/              design · roadmap · decisions · control protocol · runbook
 Targets **Zig 0.16.0 stable**. `build.zig.zon` pins `minimum_zig_version` and has
 no external dependencies, so the build is self-contained. See
 [`docs/bringup-notes.md`](docs/bringup-notes.md).
+
+## How it's built
+
+nether is developed with heavy AI assistance (Claude Code), and the commit cadence
+reflects that. That's stated plainly because the discipline is the point: velocity
+only counts if the result is correct, so correctness here is *demonstrated*, not
+asserted — a green test suite on every change, always-on fuzzing of the guest-facing
+parsers, proof scripts that reproduce the fork/park/boot latency claims, and
+adversarial review of the guest→host boundary. Authorship is owned openly; the
+verification is what earns the trust.
 
 ## License
 
