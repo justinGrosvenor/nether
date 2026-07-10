@@ -4,7 +4,7 @@
 
 **Linux microVMs that fork like processes.** nether is a type-2 hypervisor (VMM)
 written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapshot
-into fresh VMs in **~70 ms** each — resuming exactly where the image froze, even
+into fresh VMs in **~70 ms** each, resuming exactly where the image froze, even
 mid-request. It runs in the layer below the guest, hence the name.
 
 **Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)).
@@ -12,7 +12,7 @@ mid-request. It runs in the layer below the guest, hence the name.
 ## The idea
 
 A normal VM boots from cold every time. nether treats a running Linux VM as
-something you can snapshot, kill, and bring back — like `fork()` for a whole guest:
+something you can snapshot, kill, and bring back, like `fork()` for a whole guest:
 
 - **Cold boot once (~0.5 s)** to a ready, serving base image.
 - **Warm-fork it in ~70 ms**, copy-on-write: each fork shares the base's pages and
@@ -20,21 +20,21 @@ something you can snapshot, kill, and bring back — like `fork()` for a whole g
 - **Resume mid-flight.** Because the whole guest is captured, a fork wakes up
   inside the exact system call the snapshot froze on. You can accept a request on
   one VM, snapshot and kill it, and **complete the reply from a different VM** that
-  didn't exist when the request arrived — the upstream connection is held by the
+  didn't exist when the request arrived. The upstream connection is held by the
   host across the gap.
 
 The monotonic clock stays continuous across a park; the wall clock catches up to
 real time on resume; forks reseed their CRNG so siblings don't share randomness.
 
 > Numbers are measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest. "~70 ms" is
-> a **warm fork / snapshot restore**, not a cold boot — bigger guests copy more
+> a **warm fork / snapshot restore**, not a cold boot. Bigger guests copy more
 > pages on resume, so treat it as an order of magnitude, not a guarantee.
 
 ## What it is
 
 - A **type-2 VMM in Zig**, modern guests only (no legacy hardware emulation).
 - **Primary backend: Apple Hypervisor.framework on macOS / aarch64.** This is the
-  developed path — it boots Linux, runs SMP, virtio-blk/net/rng/vsock, a control
+  developed path: it boots Linux, runs SMP, virtio-blk/net/rng/vsock, a control
   plane, snapshot + COW fork + park/resume, an egress plane, and a read-only web
   console.
 - **Reference backend: KVM on Linux / x86-64.** The original backend; PVH-boots
@@ -51,18 +51,18 @@ primary attack surface, and the guest→host boundary is where correctness matte
 most. Two disciplines hold that line:
 
 - **One bounds-checked seam.** Every guest-physical memory access goes through a
-  single overflow-safe accessor that fails closed — an out-of-range address reads
+  single overflow-safe accessor that fails closed: an out-of-range address reads
   as zero and drops the write, so a malicious descriptor ring can never steer the
   VMM outside guest RAM. Guest-driven device state (virtqueues, snapshot headers)
   is validated before it is trusted.
-- **Continuous fuzzing + adversarial review.** The guest-facing parsers — virtio
+- **Continuous fuzzing + adversarial review.** The guest-facing parsers (virtio
   transport and devices, the vsock protocol engine, the terminal parser, the
-  snapshot-header decoder — run always-on fuzz smoke in the test suite, and the
+  snapshot-header decoder) run always-on fuzz smoke in the test suite, and the
   guest→host surface is reviewed adversarially. The most recent pass fixed a
   guest-triggerable use-after-free in the file-transfer path and closed several
   resource-exhaustion edges (see the commit history).
 
-nether is pre-1.0 and has had **no external audit** — don't run untrusted guests in
+nether is pre-1.0 and has had **no external audit**. Don't run untrusted guests in
 production yet. But "malformed guest input must never corrupt the host" is a
 first-class, tested invariant here, not an afterthought.
 
@@ -125,7 +125,7 @@ no external dependencies, so the build is self-contained. See
 nether is developed with heavy AI assistance (Claude Code), and the commit cadence
 reflects that. That's stated plainly because the discipline is the point: velocity
 only counts if the result is correct, so correctness here is *demonstrated*, not
-asserted — a green test suite on every change, always-on fuzzing of the guest-facing
+asserted: a green test suite on every change, always-on fuzzing of the guest-facing
 parsers, proof scripts that reproduce the fork/park/boot latency claims, and
 adversarial review of the guest→host boundary. Authorship is owned openly; the
 verification is what earns the trust.
