@@ -905,10 +905,90 @@ test "relay scanner survives hostile agent output (bound + exit clamp hold)" {
     }
 }
 
+// --- seed corpus -----------------------------------------------------------
+// Valid / deep-state inputs handed to std.testing.fuzz as starting points, so the
+// coverage-guided fuzzer reaches the interesting paths immediately instead of
+// rediscovering basic structure. Several are built at comptime from the real types /
+// wire encoders (Hdr.encode, @sizeOf fingerprints), so a seed can never drift out of
+// sync with the format it seeds. Harnesses that read via smith.bytes() consume a seed
+// verbatim (precise); those that read via smith.slice() use it as mutation fodder.
+
+// A valid 128-byte snapshot header (magic/version/sizes matching THIS build): drives the
+// validator straight to the accept path that fuzzHeader asserts.
+const snap_seed: [128]u8 = blk: {
+    const hvfb = @import("hv/hvf_backend.zig");
+    var h = [_]u8{0} ** 128;
+    std.mem.writeInt(u32, h[0..4], 0x4E455448, .little); // SNAP_MAGIC
+    std.mem.writeInt(u32, h[4..8], 4, .little); // SNAP_VERSION
+    std.mem.writeInt(u32, h[8..12], 2, .little); // num_cpus
+    std.mem.writeInt(u32, h[12..16], @sizeOf(hvfb.CpuState), .little);
+    std.mem.writeInt(u64, h[24..32], 512 * 1024 * 1024, .little); // ram_size
+    std.mem.writeInt(u32, h[56..60], @sizeOf(virtio.Device.DeviceState), .little);
+    std.mem.writeInt(u32, h[60..64], @sizeOf(@import("chipset/pl011.zig").Pl011.State), .little);
+    break :blk h;
+};
+
+// A valid virtqueue ring: one single-buffer descriptor the avail ring offers, at the
+// fixed geometry feedVirtq uses (desc 0, avail 0x100, used 0x200, size 8).
+const virtq_seed: [768]u8 = blk: {
+    var r = [_]u8{0} ** 768;
+    std.mem.writeInt(u64, r[0..8], 0x40, .little); // desc0.addr (in-bounds of the 1 KiB ram)
+    std.mem.writeInt(u32, r[8..12], 16, .little); // desc0.len
+    std.mem.writeInt(u16, r[0x102..0x104], 1, .little); // avail.idx = 1
+    std.mem.writeInt(u16, r[0x104..0x106], 0, .little); // avail.ring[0] = head 0
+    break :blk r;
+};
+
+// Two valid vsock packets to the port feedVsock listens on (1024): a REQUEST that opens a
+// connection and an RW that carries payload, built through the real Hdr encoder.
+fn vsockSeed(op: u16, len: u32) [vsock.HDR_LEN]u8 {
+    var b = [_]u8{0} ** vsock.HDR_LEN;
+    const h = vsock.Hdr{
+        .src_cid = 3,
+        .dst_cid = vsock.HOST_CID,
+        .src_port = 5,
+        .dst_port = 1024,
+        .len = len,
+        .op = op,
+        .flags = 0,
+        .buf_alloc = 4096,
+        .fwd_cnt = 0,
+    };
+    h.encode(&b);
+    return b;
+}
+const vsock_req_seed = vsockSeed(1, 0); // Op.REQUEST
+const vsock_rw_seed = vsockSeed(5, 0); // Op.RW
+
+// A minimal valid ELF64 with one PT_LOAD program header: reaches the phdr loop and the
+// PT_LOAD segment path, not just the early header rejects.
+const elf_seed: [120]u8 = blk: {
+    var e = [_]u8{0} ** 120;
+    e[0] = 0x7f;
+    e[1] = 'E';
+    e[2] = 'L';
+    e[3] = 'F';
+    e[4] = 2; // ELFCLASS64
+    e[5] = 1; // little-endian
+    std.mem.writeInt(u16, e[18..20], 62, .little); // EM_X86_64
+    std.mem.writeInt(u64, e[32..40], 64, .little); // e_phoff
+    std.mem.writeInt(u16, e[54..56], 56, .little); // e_phentsize
+    std.mem.writeInt(u16, e[56..58], 1, .little); // e_phnum
+    std.mem.writeInt(u32, e[64..68], 1, .little); // phdr[0].p_type = PT_LOAD (rest of the phdr zero)
+    break :blk e;
+};
+
+// Relay exit-trailer streams: a canonical exit, an overlong/garbage exit that must clamp
+// to 255, and a bare-trailer edge. The scanner mutates these to explore the state machine.
+const relay_ok_seed = "hello\x1e0\n";
+const relay_clamp_seed = "out\x1e99999\nmore";
+const relay_bare_seed = "\x1e\n";
+
 // --- coverage-guided fuzz entry points (zig build test --fuzz) -------------
 // The tests above are fixed-seed smoke (always-on, reproducible). These mirror them
 // through std.testing.fuzz, so `zig build fuzz` (-> test --fuzz) drives the same
 // parsers coverage-guided. Under a plain `zig build test` they run a quick smoke pass.
+// Each carries a seed corpus (above) so the fuzzer starts from valid, deep-state inputs.
 test "fuzz: vt parser" {
     try std.testing.fuzz({}, struct {
         fn one(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -938,7 +1018,7 @@ test "fuzz: virtqueue" {
             smith.bytes(&ram);
             feedVirtq(&ram);
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{&virtq_seed} });
 }
 
 test "fuzz: vsock engine" {
@@ -950,7 +1030,7 @@ test "fuzz: vsock engine" {
             _ = vs.listen(1024);
             feedVsock(&vs, buf[0..n]);
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{ &vsock_req_seed, &vsock_rw_seed } });
 }
 
 test "fuzz: vsock snapshot state" {
@@ -974,7 +1054,7 @@ test "fuzz: snapshot header" {
             smith.bytes(&hdr);
             snapshot.fuzzHeader(&hdr);
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{&snap_seed} });
 }
 
 // PL031 RTC MMIO: the guest can issue any-offset/any-width accesses; the decode must
@@ -1047,7 +1127,7 @@ test "fuzz: ELF/PVH loader" {
             var sink = ElfSink{};
             _ = elf.loadPvh(img[0..n], &sink) catch {};
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{&elf_seed} });
 }
 
 // virtio-blk request path: guest header (type/sector) + data segments + status, with
@@ -1083,5 +1163,5 @@ test "fuzz: relay scanner" {
             const n = smith.slice(&buf);
             feedRelay(buf[0..n]);
         }
-    }.one, .{});
+    }.one, .{ .corpus = &.{ relay_ok_seed, relay_clamp_seed, relay_bare_seed } });
 }
