@@ -16,17 +16,25 @@ concurrency:
 
 jobs:
   test:
-    name: test (macOS arm64, HVF backend)
+    # Run the suite under all three optimize modes. Debug alone hid a real bug: a
+    # const-cast-write UB in the PL011 MMIO read path passed in Debug but made register
+    # reads return 0 under ReleaseSafe/ReleaseFast (broken guest serial console in a
+    # release build). Testing every mode catches that whole class on every push.
+    name: test (macOS arm64, ${{ matrix.optimize }})
     runs-on: macos-latest # Apple Silicon
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Build (native / HVF)
-        run: zig build -Dtarget=native
-      - name: Test (unit + always-on fuzz smoke)
-        run: zig build test
+      - name: Build (native / HVF, ${{ matrix.optimize }})
+        run: zig build -Dtarget=native -Doptimize=${{ matrix.optimize }}
+      - name: Test (unit + always-on fuzz smoke, ${{ matrix.optimize }})
+        run: zig build test -Doptimize=${{ matrix.optimize }}
 
   cross-kvm:
     name: cross-compile (x86_64-linux, KVM backend)
