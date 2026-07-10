@@ -1,5 +1,7 @@
 # nether
 
+[![CI](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml/badge.svg)](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml)
+
 **Linux microVMs that fork like processes.** nether is a type-2 hypervisor (VMM)
 written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapshot
 into fresh VMs in **~70 ms** each — resuming exactly where the image froze, even

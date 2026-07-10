@@ -1,0 +1,40 @@
+name: CI
+
+# Backs the README's "green test suite on every change" claim. Scope is what a hosted
+# runner can actually do: build both backends and run the host-side unit + always-on fuzz
+# suite. The HVF VM-boot proofs (scripts/*.py) need a real hypervisor and are run locally,
+# not here - GitHub's macOS runners are VMs with no nested virtualization.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (macOS arm64, HVF backend)
+    runs-on: macos-latest # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build (native / HVF)
+        run: zig build -Dtarget=native
+      - name: Test (unit + always-on fuzz smoke)
+        run: zig build test
+
+  cross-kvm:
+    name: cross-compile (x86_64-linux, KVM backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build (x86_64-linux / KVM reference backend)
+        run: zig build -Dtarget=x86_64-linux
