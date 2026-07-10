@@ -1159,6 +1159,12 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
         snap_ctx.bridge = &data_bridge; // snapshot-time honesty: flag undelivered ring bytes
         data_bridge.start();
     }
+    // Quiesce the bridge's detached threads BEFORE the run loop's teardown frees the vsock
+    // engine (`destroy(vs_engine)` defer above) and unwinds this stack: a pump still in
+    // teardown->hostClose would otherwise dereference the freed engine (use-after-free).
+    // Function-scope defer, registered after the engine-destroy defer, so it runs FIRST at
+    // return (LIFO), ahead of the engine destroy and vm.deinit.
+    defer if (have_bridge) data_bridge.stop();
 
     // Control plane: in nether-control mode a Unix-domain socket drives the agent
     // (the platform attaches without owning this process's stdio). Shared setup -

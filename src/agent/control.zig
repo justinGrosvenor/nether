@@ -814,6 +814,15 @@ pub const DataBridge = struct {
     // `NETHER-EGRESS v1 conn=<id> resume=<0|1>\n` so the platform can correlate a parked
     // conn across a snapshot restore (resume=1 = re-splice the parked upstream).
     egress_path: ?[*:0]const u8 = null,
+    // Shutdown quiescence. At process teardown (__shutdown__ / run-loop exit) the caller frees
+    // the vsock engine and unwinds the stack that backs this bridge and `vsdev`. The detached
+    // pump/listener/reaper threads must STOP touching that memory FIRST, or a pump still in
+    // teardown -> hostClose -> engine.close() dereferences the freed engine (use-after-free,
+    // the observed crash). `stop()` sets `stopping`, wakes every thread, and waits for `live`
+    // to fall to 0 before returning. Threads are detached (not joinable), so we join by count:
+    // each is registered BEFORE spawn (spawnTracked) and deregisters via `defer threadExit()`.
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    live: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub const MAX_BRIDGE = 48; // < vsock MAX_CONNS (64): headroom for the agent + probe conns
     pub const WINDOW: u32 = 256 * 1024; // guest in-flight bound == per-conn delivery buffer size
@@ -905,17 +914,57 @@ pub const DataBridge = struct {
         return delivered;
     }
 
+    /// Spawn a tracked, detached bridge thread. Registers it (increment BEFORE spawn, so
+    /// stop() can never observe a not-yet-counted thread) and detaches; the thread itself
+    /// deregisters via `defer self.threadExit()`. Returns false if the spawn failed (already
+    /// deregistered) so the caller can clean up the slot.
+    fn spawnTracked(self: *DataBridge, comptime f: anytype, a: anytype) bool {
+        _ = self.live.fetchAdd(1, .acq_rel);
+        if (std.Thread.spawn(.{}, f, a)) |t| {
+            t.detach();
+            return true;
+        } else |_| {
+            _ = self.live.fetchSub(1, .acq_rel);
+            return false;
+        }
+    }
+
+    /// A tracked bridge thread deregisters here on exit (via defer at the top of each loop).
+    fn threadExit(self: *DataBridge) void {
+        _ = self.live.fetchSub(1, .acq_rel);
+    }
+
+    /// Quiesce every bridge thread before the caller frees the vsock engine / unwinds the
+    /// stack backing this bridge. Sets `stopping` (the listener and reaper re-check it on
+    /// their poll/sleep timeouts; pumps break out of pollRW), wakes every blocked pump by
+    /// shutting down its unix fd, then waits (bounded) for the live-thread count to reach 0.
+    /// In-flight data-plane bytes are dropped, which is correct on an explicit teardown (the
+    /// guest is being killed). Idempotent.
+    pub fn stop(self: *DataBridge) void {
+        if (self.stopping.swap(true, .acq_rel)) return; // already stopping
+        self.lock.lock();
+        for (&self.conns) |*e| {
+            if (e.active and e.unix_fd >= 0) hostutil.shutdownRdwr(e.unix_fd);
+        }
+        self.lock.unlock();
+        // Poll/sleep timeouts are <= 1s and teardown's own flush is bounded, so this settles
+        // fast; cap at ~8s so a wedged consumer can never hang process exit.
+        var waited: u32 = 0;
+        while (self.live.load(.acquire) > 0 and waited < 1600) : (waited += 1) _ = usleep(5_000);
+        const stragglers = self.live.load(.acquire);
+        if (stragglers > 0) std.debug.print("[bridge] warning: {d} thread(s) still live at stop\n", .{stragglers});
+    }
+
     pub fn start(self: *DataBridge) void {
         // The unix listener serves the inbound data plane only; egress-only bridges
         // (egress_socket set, data_socket not) run just the reaper - egress conns arrive
         // via tryEvent(.accept) and dial out from egressPump.
         if (std.mem.span(self.path).len > 0) {
-            if (std.Thread.spawn(.{}, listenerLoop, .{self})) |t| t.detach() else |_| {
+            if (!self.spawnTracked(listenerLoop, .{self}))
                 std.debug.print("[bridge] failed to start data-plane listener\n", .{});
-            }
         }
         if (self.egress_path) |ep| std.debug.print("[bridge] egress plane -> {s} (guest vsock:{d})\n", .{ ep, EGRESS_VSOCK_PORT });
-        if (std.Thread.spawn(.{}, reaperLoop, .{self})) |t| t.detach() else |_| {}
+        _ = self.spawnTracked(reaperLoop, .{self});
     }
 
     /// Reap conns idle in BOTH directions for longer than `idle_ms` - so a slow or wedged
@@ -926,7 +975,8 @@ pub const DataBridge = struct {
     /// upstream (the park-while-awaiting case). Their lifecycle belongs to the platform,
     /// which closes its side of the unix socket to end one.
     fn reaperLoop(self: *DataBridge) void {
-        while (true) {
+        defer self.threadExit();
+        while (!self.stopping.load(.acquire)) {
             _ = usleep(500_000); // 2 Hz
             if (self.idle_ms == 0) continue;
             const cutoff: i64 = @intCast(self.idle_ms);
@@ -968,7 +1018,7 @@ pub const DataBridge = struct {
             self.conns[slot].state = .established; // guest-initiated: live at accept
             self.conns[slot].egress = true;
             self.lock.unlock();
-            if (std.Thread.spawn(.{}, egressPump, .{ self, slot, false })) |t| t.detach() else |_| {
+            if (!self.spawnTracked(egressPump, .{ self, slot, false })) {
                 self.unregister(slot);
                 self.vsdev.engine.close(id);
             }
@@ -1102,11 +1152,12 @@ pub const DataBridge = struct {
     /// the device thread. `resumed` marks a conn rehydrated after a snapshot restore (the
     /// preamble tells the platform to re-splice its parked upstream, not start fresh).
     fn egressPump(self: *DataBridge, slot: usize, resumed: bool) void {
+        defer self.threadExit();
         self.lock.lock();
         const id = self.conns[slot].vsock_id;
         const alive = self.conns[slot].active and self.conns[slot].state != .dead;
         self.lock.unlock();
-        if (!alive) return self.teardown(slot);
+        if (!alive or self.stopping.load(.acquire)) return self.teardown(slot);
         const fd = egressDial(self.egress_path.?, id, resumed) orelse {
             std.debug.print("[bridge] egress dial failed (conn {d})\n", .{id});
             return self.teardown(slot);
@@ -1134,7 +1185,7 @@ pub const DataBridge = struct {
         self.conns[slot].state = .established;
         self.conns[slot].egress = true;
         self.lock.unlock();
-        if (std.Thread.spawn(.{}, egressPump, .{ self, slot, true })) |t| t.detach() else |_| {
+        if (!self.spawnTracked(egressPump, .{ self, slot, true })) {
             self.unregister(slot);
             self.vsdev.hostClose(id);
             return false;
@@ -1166,6 +1217,7 @@ pub const DataBridge = struct {
     }
 
     fn listenerLoop(self: *DataBridge) void {
+        defer self.threadExit();
         const fd = libc.socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return;
         _ = libc.unlink(self.path);
@@ -1185,7 +1237,12 @@ pub const DataBridge = struct {
         if (libc.fchmod(fd, 0o600) != 0) std.debug.print("[bridge] warning: fchmod 0600 failed\n", .{});
         const owner_uid = libc.getuid();
         std.debug.print("[bridge] data plane on {s} -> guest vsock:{d}\n", .{ self.path, FWD_VSOCK_PORT });
-        while (true) {
+        // Non-blocking + poll so a blocked accept() cannot pin this thread past stop(): the
+        // 200ms poll timeout re-checks `stopping`, and we close the listener fd on exit.
+        hostutil.setNonblock(fd);
+        defer _ = libc.close(fd);
+        while (!self.stopping.load(.acquire)) {
+            if (hostutil.pollRW(fd, false, 200) <= 0) continue; // no pending conn (or timeout)
             const c = libc.accept(fd, null, null);
             if (c < 0) continue;
             // Owner-uid gate, like the control socket (same trust: it reaches into the guest).
@@ -1211,14 +1268,23 @@ pub const DataBridge = struct {
                 _ = libc.close(c); // bridge pool full
                 continue;
             };
-            if (std.Thread.spawn(.{}, pumpLoop, .{ self, slot })) |t| t.detach() else |_| self.teardown(slot);
+            if (!self.spawnTracked(pumpThread, .{ self, slot })) self.teardown(slot);
         }
+    }
+
+    /// Direct-spawn entry for a data-plane pump (listenerLoop). Egress conns instead reach
+    /// pumpLoop as a tail call from egressPump, which owns the thread-exit accounting - so the
+    /// deregistration lives here, in the wrapper, not in pumpLoop (else egress double-counts).
+    fn pumpThread(self: *DataBridge, slot: usize) void {
+        defer self.threadExit();
+        self.pumpLoop(slot);
     }
 
     fn pumpLoop(self: *DataBridge, slot: usize) void {
         // Wait (bounded) for the host->guest connect to establish (the guest forwarder accepts).
         var waited: u32 = 0;
         while (waited < 3000) : (waited += 10) {
+            if (self.stopping.load(.acquire)) return self.teardown(slot);
             self.lock.lock();
             const st = self.conns[slot].state;
             self.lock.unlock();
@@ -1235,7 +1301,7 @@ pub const DataBridge = struct {
         // shutdown()s the fd -> pollRW reports a hangup (-1) -> we break. Lock order is safe:
         // we take the bridge lock and the D3 lock (hostSendAll/hostCredit) but NEVER both at once.
         var buf: [16384]u8 = undefined;
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             self.lock.lock();
             const has_buf = self.conns[slot].active and self.conns[slot].bc > 0;
             self.lock.unlock();

@@ -974,6 +974,12 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var data_sock_buf: [256]u8 = undefined;
     var egress_sock_buf: [256]u8 = undefined;
     var have_bridge = false;
+    // Quiesce the bridge's detached threads before the engine-destroy defer (above) frees the
+    // vsock engine and this stack unwinds: a pump still in teardown->hostClose would otherwise
+    // dereference the freed engine (use-after-free). Registered after that defer, so it runs
+    // FIRST at return (LIFO). `have_bridge` is read at return time, so the guard is correct
+    // even though it is set later.
+    defer if (have_bridge) data_bridge.stop();
     var fork_snap_ctx: SnapCtx = undefined; // fork re-park capture context (control-mode only)
     var hvf_stop = RestoreStop{ .power = &power, .handles = handles[0..num_cpus], .num_cpus = num_cpus };
     var watchdogs: platform.Watchdogs = undefined;
