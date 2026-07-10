@@ -389,6 +389,49 @@ fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_ca
     if (std.mem.readInt(u32, hdr[80..84], .little) > SNAP_KIND_PARK) return error.BadSnapshot;
 }
 
+/// Fuzz entry (src/fuzz.zig): drive an ATTACKER-CONTROLLED snapshot header through
+/// validateHeader. A snapshot file is operator/same-uid input (restore_from,
+/// validate_snapshot), so a hostile or corrupt header must (a) never crash the validator
+/// and (b) never be ACCEPTED unless every guarded field is in bounds - because the
+/// post-validation section arithmetic in validateSnapshotFile/macRestore trusts those
+/// bounds (num_cpus/gic/disk cap the `meta` sum, so a bypass there would overflow the
+/// offset math into an OOB file/RAM access). This asserts that contract on every accept.
+pub fn fuzzHeader(bytes: []const u8) void {
+    const hvfb = @import("../hv/hvf_backend.zig");
+    const max_cpus: u32 = hvfb.MAX_SNAP_CPUS;
+    const disk_cap: u64 = armdev.blk_disk_storage.len;
+    const gic_cap: u64 = GIC_STATE_MAX;
+    const cpu_sz: u32 = @sizeOf(hvfb.CpuState);
+    const dev_sz: u32 = @sizeOf(nether.virtio.Device.DeviceState);
+    const uart_sz: u32 = @sizeOf(nether.Pl011.State);
+    const eng_sz: u32 = @sizeOf(nether.Vsock.State);
+
+    var hdr = [_]u8{0} ** HDR_SIZE;
+    const n = @min(bytes.len, HDR_SIZE);
+    @memcpy(hdr[0..n], bytes[0..n]);
+
+    validateHeader(&hdr, max_cpus, disk_cap, gic_cap, cpu_sz, dev_sz, uart_sz, eng_sz) catch return; // rejection is the safe outcome
+    // ACCEPTED: every field the downstream offset math trusts must satisfy its invariant.
+    std.debug.assert(std.mem.readInt(u32, hdr[0..4], .little) == SNAP_MAGIC);
+    std.debug.assert(std.mem.readInt(u32, hdr[4..8], .little) == SNAP_VERSION);
+    const ncpu = std.mem.readInt(u32, hdr[8..12], .little);
+    std.debug.assert(ncpu != 0 and ncpu <= max_cpus);
+    std.debug.assert(std.mem.readInt(u64, hdr[24..32], .little) != 0); // ram_size
+    std.debug.assert(std.mem.readInt(u64, hdr[40..48], .little) <= disk_cap);
+    std.debug.assert(std.mem.readInt(u64, hdr[32..40], .little) <= gic_cap);
+    std.debug.assert(std.mem.readInt(u32, hdr[12..16], .little) == cpu_sz);
+    std.debug.assert(std.mem.readInt(u32, hdr[56..60], .little) == dev_sz);
+    std.debug.assert(std.mem.readInt(u32, hdr[60..64], .little) == uart_sz);
+    if (std.mem.readInt(u32, hdr[64..68], .little) == 1)
+        std.debug.assert(std.mem.readInt(u32, hdr[68..72], .little) == eng_sz);
+    std.debug.assert(std.mem.readInt(u32, hdr[80..84], .little) <= SNAP_KIND_PARK);
+    // The `meta` sum that gates the RAM offset must not overflow on an accepted header
+    // (the bounds above are exactly what keeps it from doing so - assert that ordering holds).
+    const meta: u64 = HDR_SIZE + @as(u64, ncpu) * cpu_sz + 2 * @as(u64, dev_sz) + uart_sz +
+        std.mem.readInt(u64, hdr[32..40], .little) + std.mem.readInt(u64, hdr[40..48], .little);
+    std.mem.doNotOptimizeAway(meta);
+}
+
 fn writeSnapshotFile(
     out_fd: c_int, // caller-opened destination (>= 0: caller owns close + failure unlink)
     path: [*:0]const u8,

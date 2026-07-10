@@ -30,6 +30,8 @@ const virtq = @import("virtio/virtq.zig");
 const virtio = @import("virtio/virtio.zig");
 const vsock = @import("virtio/virtio_vsock.zig");
 const control = @import("agent/control.zig");
+const snapshot = @import("agent/snapshot.zig");
+const pl031 = @import("chipset/pl031.zig");
 const net = @import("virtio/virtio_net.zig");
 const gpu = @import("virtio/virtio_gpu.zig");
 const pci = @import("chipset/pci.zig");
@@ -268,6 +270,87 @@ test "vsock snapshot state import stays in bounds under validState" {
         st.out_count = rand.uintLessThan(usize, 128);
         for (&st.out) |*p| p.len = rand.uintLessThan(u32, 8192); // spans valid (<=PKT_CAP) and over
         feedVsockState(&st);
+    }
+}
+
+// --- snapshot header (restore-file parser) ---------------------------------
+//
+// A snapshot file is operator/same-uid input (restore_from, validate_snapshot). The
+// header gates all the section-offset arithmetic, so a hostile/corrupt header must never
+// crash the validator nor be accepted with an out-of-bounds field (snapshot.fuzzHeader
+// asserts that contract). Feed fully random headers plus near-valid ones (a real header
+// with a few bytes flipped) so the accept path is actually reached, not just rejects.
+
+fn goodHeader(hdr: *[128]u8) void {
+    const hvfb = @import("hv/hvf_backend.zig");
+    @memset(hdr, 0);
+    std.mem.writeInt(u32, hdr[0..4], 0x4E455448, .little); // "NETH" magic (SNAP_MAGIC)
+    std.mem.writeInt(u32, hdr[4..8], 4, .little); // SNAP_VERSION
+    std.mem.writeInt(u32, hdr[8..12], 2, .little); // num_cpus
+    std.mem.writeInt(u32, hdr[12..16], @sizeOf(hvfb.CpuState), .little);
+    std.mem.writeInt(u64, hdr[24..32], 512 * 1024 * 1024, .little); // ram_size
+    std.mem.writeInt(u32, hdr[56..60], @sizeOf(virtio.Device.DeviceState), .little);
+    std.mem.writeInt(u32, hdr[60..64], @sizeOf(@import("chipset/pl011.zig").Pl011.State), .little);
+}
+
+test "snapshot header validation survives random + near-valid headers" {
+    var prng = std.Random.DefaultPrng.init(0x5417_4A11);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        var hdr: [128]u8 = undefined;
+        if (i & 1 == 0) {
+            rand.bytes(&hdr); // fully random
+        } else {
+            goodHeader(&hdr); // a valid header with a few bytes corrupted -> reach the accept path
+            var f: usize = 0;
+            const flips = rand.uintLessThan(usize, 6);
+            while (f < flips) : (f += 1) hdr[rand.uintLessThan(usize, 128)] = rand.int(u8);
+        }
+        snapshot.fuzzHeader(&hdr);
+    }
+}
+
+// --- PL031 RTC MMIO --------------------------------------------------------
+//
+// The guest drives arbitrary MMIO accesses to the RTC: any offset, any width. The
+// register decode must never OOB or panic (the data register is a bounded read of host
+// time; writes only store). Interpret the fuzz bytes as a stream of {offset, len, data}.
+
+fn feedPl031(bytes: []const u8) void {
+    var rtc = pl031.Pl031{};
+    const dev = rtc.device(0x0901_0000);
+    var i: usize = 0;
+    while (i + 2 <= bytes.len) {
+        const off: u64 = (@as(u64, bytes[i]) | (@as(u64, bytes[i + 1]) << 8)) & 0xFFF; // in-page offset
+        i += 2;
+        const len: usize = @min(1 + (@as(usize, if (i < bytes.len) bytes[i] else 0) % 8), bytes.len - i + 1);
+        if (i < bytes.len) i += 1;
+        var buf: [8]u8 = undefined;
+        const take = @min(len, buf.len);
+        var j: usize = 0;
+        while (j < take and i < bytes.len) : (j += 1) {
+            buf[j] = bytes[i];
+            i += 1;
+        }
+        if (off & 1 == 0) {
+            dev.write_fn(dev.ptr, off, buf[0..take]);
+        } else {
+            dev.read_fn(dev.ptr, off, buf[0..take]);
+            std.mem.doNotOptimizeAway(buf);
+        }
+    }
+}
+
+test "pl031 mmio survives arbitrary guest accesses" {
+    var prng = std.Random.DefaultPrng.init(0x9013_1FDC);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const n = 1 + rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        feedPl031(buf[0..n]);
     }
 }
 
@@ -673,6 +756,30 @@ test "fuzz: vsock snapshot state" {
             var st: vsock.Vsock.State = undefined;
             smith.bytes(std.mem.asBytes(&st));
             feedVsockState(&st);
+        }
+    }.one, .{});
+}
+
+// The snapshot header parser: a corrupt/hostile restore file must never crash the
+// validator nor pass an out-of-bounds field to the section-offset arithmetic.
+test "fuzz: snapshot header" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var hdr: [128]u8 = undefined;
+            smith.bytes(&hdr);
+            snapshot.fuzzHeader(&hdr);
+        }
+    }.one, .{});
+}
+
+// PL031 RTC MMIO: the guest can issue any-offset/any-width accesses; the decode must
+// stay memory-safe.
+test "fuzz: pl031 rtc mmio" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [128]u8 = undefined;
+            const n = smith.slice(&buf);
+            feedPl031(buf[0..n]);
         }
     }.one, .{});
 }
