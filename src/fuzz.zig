@@ -42,6 +42,19 @@ const pci = @import("chipset/pci.zig");
 const elf = @import("boot/elf.zig");
 const slirp = @import("net/slirp.zig");
 
+const Prng = std.Random.DefaultPrng;
+
+/// Seed a fixed-seed smoke harness. With no environment override this returns the exact
+/// `default` seed, so `zig build test` stays fully deterministic and reproducible. When
+/// NETHER_FUZZ_SEED is set (the random pass of scripts/fuzz.sh) the base seed is mixed in,
+/// so every harness explores a fresh input stream each run while staying distinct per
+/// target. A failing random run reproduces by re-exporting the same NETHER_FUZZ_SEED.
+fn fuzzPrng(default: u64) Prng {
+    const raw = std.c.getenv("NETHER_FUZZ_SEED") orelse return Prng.init(default);
+    const salt = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 0) catch 0; // base 0: 0x.. or decimal
+    return Prng.init(default ^ salt);
+}
+
 // --- VT parser -------------------------------------------------------------
 
 /// Drive every byte through the parser. The parser is zero-alloc (fixed param
@@ -58,7 +71,7 @@ fn feedParser(bytes: []const u8) void {
 }
 
 test "vt parser survives random bytes" {
-    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    var prng = fuzzPrng(0xC0FFEE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -74,7 +87,7 @@ test "vt parser survives random escape-heavy tokens" {
     // introducers, params, separators) so we exercise deep parser states, not
     // just the ground-state print path.
     const alphabet = "\x1b[]P;:0123456789?$ \x07\x9b\x9d\x90mHABCcqp\\";
-    var prng = std.Random.DefaultPrng.init(0xBADC0DE);
+    var prng = fuzzPrng(0xBADC0DE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -95,7 +108,7 @@ test "screen grid survives random escape-heavy bytes" {
     var s = try Screen.init(std.testing.allocator, 24, 80);
     defer s.deinit();
     const alphabet = "\x1b[]P;:0123456789?$ \r\n\x08\x09\x07Hmfcd ABCDJKsuhlABCXYZabcxyz";
-    var prng = std.Random.DefaultPrng.init(0xD15EA5E);
+    var prng = fuzzPrng(0xD15EA5E);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -115,7 +128,7 @@ test "screen grid survives random escape-heavy bytes" {
 test "screen grid survives fully random bytes" {
     var s = try Screen.init(std.testing.allocator, 8, 16);
     defer s.deinit();
-    var prng = std.Random.DefaultPrng.init(0xF00DBABE);
+    var prng = fuzzPrng(0xF00DBABE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -160,7 +173,7 @@ fn feedVirtq(ram: []u8) void {
 test "virtqueue survives hostile rings and descriptors" {
     // 1 KiB covers the fixed geometry: desc table (8*16), avail ring (0x100),
     // used ring (0x200). Filling it with random bytes is a hostile driver.
-    var prng = std.Random.DefaultPrng.init(0x5CA1AB1E);
+    var prng = fuzzPrng(0x5CA1AB1E);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 4000) : (i += 1) {
@@ -205,7 +218,7 @@ fn feedVsock(vs: *vsock.Vsock, bytes: []const u8) void {
 test "vsock engine survives random packets" {
     var vs = vsock.Vsock{ .guest_cid = 3 };
     _ = vs.listen(1024);
-    var prng = std.Random.DefaultPrng.init(0x5E550CC);
+    var prng = fuzzPrng(0x5E550CC);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -222,7 +235,7 @@ test "vsock engine survives header-shaped fuzz" {
     // not just rejected at decode.
     var vs = vsock.Vsock{ .guest_cid = 3 };
     _ = vs.listen(7);
-    var prng = std.Random.DefaultPrng.init(0xACED5E5);
+    var prng = fuzzPrng(0xACED5E5);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
@@ -276,7 +289,7 @@ test "vsock snapshot state import stays in bounds under validState" {
     // packet lengths), spanning valid AND invalid ranges, so both the reject path and
     // the accept-then-drain path are exercised cheaply (the full State is ~200 KiB; we
     // don't randomize all of it here - the coverage-guided entry below does that).
-    var prng = std.Random.DefaultPrng.init(0x5A_AF_11_5E);
+    var prng = fuzzPrng(0x5A_AF_11_5E);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 20000) : (i += 1) {
@@ -310,7 +323,7 @@ fn goodHeader(hdr: *[128]u8) void {
 }
 
 test "snapshot header validation survives random + near-valid headers" {
-    var prng = std.Random.DefaultPrng.init(0x5417_4A11);
+    var prng = fuzzPrng(0x5417_4A11);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 20000) : (i += 1) {
@@ -359,7 +372,7 @@ fn feedPl031(bytes: []const u8) void {
 }
 
 test "pl031 mmio survives arbitrary guest accesses" {
-    var prng = std.Random.DefaultPrng.init(0x9013_1FDC);
+    var prng = fuzzPrng(0x9013_1FDC);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 20000) : (i += 1) {
@@ -407,7 +420,7 @@ fn feedNet(ram: []u8, frame: []const u8) void {
 }
 
 test "virtio-net survives hostile rings and frames" {
-    var prng = std.Random.DefaultPrng.init(0x4E700FF);
+    var prng = fuzzPrng(0x4E700FF);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 4000) : (i += 1) {
@@ -474,7 +487,7 @@ fn feedGpuCmd(ram: []u8, cmd: []const u8) void {
 const GPU_CMDS = [_]u32{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x0300, 0x0301, 0xdead_beef };
 
 test "virtio-gpu survives header-shaped hostile commands + capture" {
-    var prng = std.Random.DefaultPrng.init(0x69_70_75);
+    var prng = fuzzPrng(0x69_70_75);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 6000) : (i += 1) {
@@ -493,7 +506,7 @@ test "virtio-gpu survives header-shaped hostile commands + capture" {
 test "virtio-gpu survives fully hostile control/cursor rings" {
     // Pure-random rings on BOTH queues (the control + cursor drain paths), exercising
     // the descriptor walk + dispatch with no structure at all.
-    var prng = std.Random.DefaultPrng.init(0x6_C0_FF_EE);
+    var prng = fuzzPrng(0x6_C0_FF_EE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 4000) : (i += 1) {
@@ -541,7 +554,7 @@ test "pci config space survives oversized and odd-width accesses" {
     try host.addFunction(dev.function(3, 0));
     const mm = host.mmioDevice();
 
-    var prng = std.Random.DefaultPrng.init(0xC0FFEE_11);
+    var prng = fuzzPrng(0xC0FFEE_11);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 20000) : (i += 1) {
@@ -573,7 +586,7 @@ test "virtio BAR MMIO reads survive every offset and width" {
     var nb = net.Net{ .on_tx = netSink };
     var dev = virtio.Device.init(nb.backend(), .{ .bytes = &ram, .base = 0 });
     nb.attach(&dev);
-    var prng = std.Random.DefaultPrng.init(0xBA12_EAD);
+    var prng = fuzzPrng(0xBA12_EAD);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 30000) : (i += 1) {
@@ -613,7 +626,7 @@ const ElfSink = struct {
 };
 
 test "ELF/PVH loader survives malformed and hostile images" {
-    var prng = std.Random.DefaultPrng.init(0xE1F_F022);
+    var prng = fuzzPrng(0xE1F_F022);
     const rand = prng.random();
     var sink = ElfSink{};
     var i: usize = 0;
@@ -677,7 +690,7 @@ test "slirp survives fully random guest frames" {
     _ = s.addBlock("0.0.0.0/0"); // deny all egress -> no host sockets are opened
     s.out_fn = slirpSink;
     s.out_ctx = &s;
-    var prng = std.Random.DefaultPrng.init(0x5117_F0FF);
+    var prng = fuzzPrng(0x5117_F0FF);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 8000) : (i += 1) {
@@ -693,7 +706,7 @@ test "slirp survives structured-hostile IPv4 frames (random ihl/proto/doff)" {
     _ = s.addBlock("0.0.0.0/0");
     s.out_fn = slirpSink;
     s.out_ctx = &s;
-    var prng = std.Random.DefaultPrng.init(0x14_BADD_11);
+    var prng = fuzzPrng(0x14_BADD_11);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 12000) : (i += 1) {
@@ -787,7 +800,7 @@ fn feedBlk(bytes: []const u8) void {
 }
 
 test "virtio-blk survives hostile requests and never writes past the disk" {
-    var prng = std.Random.DefaultPrng.init(0xB10C_C0DE);
+    var prng = fuzzPrng(0xB10C_C0DE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 6000) : (i += 1) {
@@ -826,7 +839,7 @@ fn feedFwCfg(bytes: []const u8) void {
 }
 
 test "fw_cfg survives arbitrary selector/stream sequences" {
-    var prng = std.Random.DefaultPrng.init(0xF00_C0FE);
+    var prng = fuzzPrng(0xF00_C0FE);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 8000) : (i += 1) {
@@ -881,7 +894,7 @@ test "relay scanner survives hostile agent output (bound + exit clamp hold)" {
     // Bias toward the trailer delimiter and digits so the trailer state machine is driven
     // deep (held trailers, overlong/garbage exits, split across chunks), not just copied.
     const alphabet = [_]u8{ 0x1e, '\n', '0', '9', '2', '5', '6', '-', 'A', 0x1f };
-    var prng = std.Random.DefaultPrng.init(0x2E_11_A5);
+    var prng = fuzzPrng(0x2E_11_A5);
     const rand = prng.random();
     var i: usize = 0;
     while (i < 8000) : (i += 1) {
