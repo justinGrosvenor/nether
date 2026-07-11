@@ -1,0 +1,65 @@
+# base.nether.toml - a declarative nether base recipe.
+#
+# A base is a WARM memory snapshot: this recipe boots a guest, drives it to a running
+# state, and freezes it so forks resume in ~10 ms. Bake it with:
+#
+#   ./scripts/bake.py bake examples/base.nether.toml
+#   ./scripts/bake.py fork base.snap --name tenant-1
+#
+# See docs/provisioning.md for the annotated field reference.
+
+[image]
+# The capability layer (what the guest CAN do). Build it however you like - a Dockerfile
+# you export, Packer, Ansible against a chroot, or scripts/fetch-guest-image.sh. nether
+# only needs a kernel + initramfs; it does not reinvent image building.
+kernel = "kernels/Image"
+initramfs = "kernels/initramfs.cpio.gz"
+
+[resources]
+ram_mb = 512
+cpus = 2
+
+[resources.disk]
+# In-memory disk: CAPTURED in the snapshot and COW-forked (cheap to share, adds size_mb
+# to the snapshot). Use a file-backed disk instead for per-tenant persistent state:
+#   file = "app.img"   # persistent, NOT captured, and skips the eager read on restore
+size_mb = 256
+
+[network]
+egress = "deny"   # deny | allow | <policy>. Default-deny is the safe base.
+
+run_as = "app"    # run guest commands as a non-root user (defense in depth).
+
+# Your code, pushed over the control socket before warm-up. NOTE: each file must be
+# <= 16 MiB (the __put__ transfer cap). Bake large assets (models, node_modules) into the
+# initramfs or a file-backed disk instead - the recipe runner will refuse an oversize file.
+[[files]]
+host = "./app"
+guest = "/app"
+
+# Warm-up: commands run in the guest, in order. `run` awaits completion; `start` launches
+# a long-running process and moves on.
+[[warmup]]
+run = "/app/install-deps.sh"
+
+[[warmup]]
+start = "/app/server --port 8080"
+
+# The base is warm when this gate passes. A declared condition, polled finely - NOT a fixed
+# sleep (fixed sleeps are how you get latency numbers wrong by 5x). Use `port` or `command`.
+[ready]
+port = 8080
+# command = "curl -sf localhost:8080/health"
+
+[snapshot]
+out = "base.snap"
+kind = "base"     # base = durable, forks many. (park = one-shot, host-managed.)
+
+# --- storage policy (the recipe is where policy lives; the VMM implements the mechanism) ---
+# These are RESERVED for the sparse-storage / incremental-build work landing separately.
+# Shaped now so they can be honored later without a recipe-format break:
+# sparse    = true            # write the snapshot sparse (holes for zero pages)
+# compress  = false           # compress cold pages
+# diff_from = "parent.snap"   # incremental base: store only the delta from a parent
+# retain    = 3               # keep N generations of this base before reaping
+# ttl       = "7d"            # reap a base unused for this long
