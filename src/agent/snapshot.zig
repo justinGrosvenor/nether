@@ -386,6 +386,11 @@ const SNAP_KIND_PARK: u32 = 1;
 // diverged from a base; restore COW-maps the base and overlays these. DIFF is PARK-only.
 const RAM_FULL: u32 = 0;
 const RAM_DIFF: u32 = 1;
+// COMPRESSED: the region is a raw-deflate stream of the ram_size-byte RAM. A stored/shipped form
+// for durable bases only - it is NOT directly forkable (a compressed region cannot be COW-mmap'd);
+// rehydrateSnapshot expands it back to a sparse RAM_FULL base first, so the fork path stays the
+// fast COW-mmap restore. Header + metadata stay plaintext so tooling still reads the geometry.
+const RAM_COMPRESSED: u32 = 2;
 const DIFF_PAGE: usize = 16384; // diff granularity (== HOST_PAGE)
 const HDR_SIZE: usize = 128; // header bytes (grew from 64 for the control-plane fields)
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
@@ -421,7 +426,7 @@ fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_ca
     // unknown kind means a newer format or corruption, either way don't guess).
     if (std.mem.readInt(u32, hdr[80..84], .little) > SNAP_KIND_PARK) return error.BadSnapshot;
     // RAM encoding must be one this build understands (unknown -> newer format or corruption).
-    if (std.mem.readInt(u32, hdr[84..88], .little) > RAM_DIFF) return error.BadSnapshot;
+    if (std.mem.readInt(u32, hdr[84..88], .little) > RAM_COMPRESSED) return error.BadSnapshot;
 }
 
 /// Fuzz entry (src/fuzz.zig): drive an ATTACKER-CONTROLLED snapshot header through
@@ -460,7 +465,7 @@ pub fn fuzzHeader(bytes: []const u8) void {
     if (std.mem.readInt(u32, hdr[64..68], .little) == 1)
         std.debug.assert(std.mem.readInt(u32, hdr[68..72], .little) == eng_sz);
     std.debug.assert(std.mem.readInt(u32, hdr[80..84], .little) <= SNAP_KIND_PARK);
-    std.debug.assert(std.mem.readInt(u32, hdr[84..88], .little) <= RAM_DIFF); // known RAM encoding
+    std.debug.assert(std.mem.readInt(u32, hdr[84..88], .little) <= RAM_COMPRESSED); // known RAM encoding
     // The `meta` sum that gates the RAM offset must not overflow on an accepted header
     // (the bounds above are exactly what keeps it from doing so - assert that ordering holds).
     const meta: u64 = HDR_SIZE + @as(u64, ncpu) * cpu_sz + 2 * @as(u64, dev_sz) + uart_sz +
@@ -800,6 +805,184 @@ test "materializeDiff clones a base and overlays the diff into a standalone full
     try std.testing.expectEqualSlices(u8, &want, &oram);
 }
 
+/// Copy `nbytes` from `src_fd` to `dst_fd` at their current offsets (chunked, no full-file alloc).
+fn copyRange(src_fd: c_int, dst_fd: c_int, nbytes: u64) bool {
+    var buf: [64 * 1024]u8 = undefined;
+    var rem = nbytes;
+    while (rem > 0) {
+        const chunk = @min(rem, buf.len);
+        if (!readExact(src_fd, buf[0..chunk]) or !writeAll(dst_fd, buf[0..chunk])) return false;
+        rem -= chunk;
+    }
+    return true;
+}
+
+/// Compress a full (sparse) base snapshot's RAM region with raw deflate, producing a smaller
+/// stored artifact at `out_path`. Header + metadata are copied verbatim (plaintext, so `validate`
+/// and the reaper still read the geometry); only the RAM region is compressed and the encoding is
+/// stamped RAM_COMPRESSED. A compressed base is NOT directly forkable - rehydrate it first. Bases
+/// only: refuses a diff or an already-compressed input. Off the hot path (a provisioning step).
+pub fn compressSnapshot(in_path: [*:0]const u8, out_path: [*:0]const u8, allocator: std.mem.Allocator) bool {
+    const flate = std.compress.flate;
+    const ifd = libc.open(in_path, 0, @as(c_int, 0)); // O_RDONLY
+    if (ifd < 0) return false;
+    defer _ = libc.close(ifd);
+
+    var hdr: [HDR_SIZE]u8 = undefined;
+    if (!readExact(ifd, &hdr)) return false;
+    if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return false;
+    if (std.mem.readInt(u32, hdr[4..8], .little) != SNAP_VERSION) return false;
+    if (std.mem.readInt(u32, hdr[84..88], .little) != RAM_FULL) return false; // only a full base compresses
+    const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
+    const ram_size = std.mem.readInt(u64, hdr[24..32], .little);
+    if (ram_off < HDR_SIZE) return false;
+    const fsz = libc.lseek(ifd, 0, 2); // SEEK_END
+    if (fsz < 0 or @as(u64, @intCast(fsz)) < ram_off or ram_size > @as(u64, @intCast(fsz)) - ram_off) return false;
+
+    // Read the RAM region (holes read back as zero, which deflate crushes), then compress it.
+    const ram = allocator.alloc(u8, ram_size) catch return false;
+    defer allocator.free(ram);
+    if (libc.lseek(ifd, @intCast(ram_off), 0) < 0 or !readExact(ifd, ram)) return false;
+    var sink = std.Io.Writer.Allocating.initCapacity(allocator, 1 << 16) catch return false;
+    defer sink.deinit();
+    var window: [flate.max_window_len]u8 = undefined;
+    var comp = flate.Compress.init(&sink.writer, &window, .raw, .default) catch return false;
+    comp.writer.writeAll(ram) catch return false;
+    comp.finish() catch return false;
+    const compressed = sink.written();
+
+    // Write out: patched header + verbatim metadata/pad + the deflate stream.
+    std.mem.writeInt(u32, hdr[84..88], RAM_COMPRESSED, .little);
+    const ofd = hostutil.createTruncNoFollow(out_path);
+    if (ofd < 0) return false;
+    var ok = false;
+    defer {
+        _ = libc.close(ofd);
+        if (!ok) _ = libc.unlink(out_path);
+    }
+    if (libc.lseek(ifd, @intCast(HDR_SIZE), 0) < 0) return false;
+    if (!writeAll(ofd, &hdr)) return false;
+    if (!copyRange(ifd, ofd, ram_off - HDR_SIZE)) return false; // metadata + pad, verbatim
+    if (!writeAll(ofd, compressed)) return false;
+    ok = true;
+    return true;
+}
+
+/// Expand a RAM_COMPRESSED base back to a full, sparse, directly-forkable base at `out_path` (the
+/// inverse of compressSnapshot). Header + metadata are copied verbatim (encoding reset to
+/// RAM_FULL); the deflate stream is inflated to the exact RAM size and sparse-written, so the
+/// result forks on the normal fast COW-mmap path. Fails closed on a short/corrupt stream.
+pub fn rehydrateSnapshot(in_path: [*:0]const u8, out_path: [*:0]const u8, allocator: std.mem.Allocator) bool {
+    const flate = std.compress.flate;
+    const ifd = libc.open(in_path, 0, @as(c_int, 0)); // O_RDONLY
+    if (ifd < 0) return false;
+    defer _ = libc.close(ifd);
+
+    var hdr: [HDR_SIZE]u8 = undefined;
+    if (!readExact(ifd, &hdr)) return false;
+    if (std.mem.readInt(u32, hdr[0..4], .little) != SNAP_MAGIC) return false;
+    if (std.mem.readInt(u32, hdr[4..8], .little) != SNAP_VERSION) return false;
+    if (std.mem.readInt(u32, hdr[84..88], .little) != RAM_COMPRESSED) return false;
+    const ram_off = std.mem.readInt(u64, hdr[48..56], .little);
+    const ram_size = std.mem.readInt(u64, hdr[24..32], .little);
+    if (ram_off < HDR_SIZE or ram_size % HOST_PAGE != 0) return false;
+    const fsz = libc.lseek(ifd, 0, 2); // SEEK_END
+    if (fsz < 0 or @as(u64, @intCast(fsz)) < ram_off) return false;
+    const comp_len = @as(u64, @intCast(fsz)) - ram_off;
+
+    // Read the compressed stream, inflate exactly ram_size bytes (a short/corrupt stream errors).
+    const comp_buf = allocator.alloc(u8, comp_len) catch return false;
+    defer allocator.free(comp_buf);
+    if (libc.lseek(ifd, @intCast(ram_off), 0) < 0 or !readExact(ifd, comp_buf)) return false;
+    const ram = allocator.alloc(u8, ram_size) catch return false;
+    defer allocator.free(ram);
+    var in = std.Io.Reader.fixed(comp_buf);
+    var dwin: [flate.max_window_len]u8 = undefined;
+    var dec = flate.Decompress.init(&in, .raw, &dwin);
+    dec.reader.readSliceAll(ram) catch return false;
+
+    // Write out: header reset to RAM_FULL + verbatim metadata + sparse RAM.
+    std.mem.writeInt(u32, hdr[84..88], RAM_FULL, .little);
+    const ofd = hostutil.createTruncNoFollow(out_path);
+    if (ofd < 0) return false;
+    var ok = false;
+    defer {
+        _ = libc.close(ofd);
+        if (!ok) _ = libc.unlink(out_path);
+    }
+    if (libc.lseek(ifd, @intCast(HDR_SIZE), 0) < 0) return false;
+    if (!writeAll(ofd, &hdr)) return false;
+    if (!copyRange(ifd, ofd, ram_off - HDR_SIZE)) return false; // metadata + pad, verbatim
+    if (!writeRamSparse(ofd, ram, ram_off + ram_size)) return false;
+    ok = true;
+    return true;
+}
+
+test "compressSnapshot + rehydrateSnapshot round-trip a full base through deflate" {
+    const builtin = @import("builtin");
+    const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+    const O_TRUNC: c_int = if (builtin.os.tag == .macos) 0x0400 else 0o1000;
+    const MOFF: u64 = 256;
+    const ram_off: u64 = HDR_SIZE + MOFF;
+    const ram_size: u64 = 4 * HOST_PAGE;
+    const a = std.testing.allocator;
+
+    const in_p = "/tmp/nether-cz-in.snap";
+    const z_p = "/tmp/nether-cz-z.snap";
+    const out_p = "/tmp/nether-cz-out.snap";
+    defer {
+        _ = libc.unlink(in_p);
+        _ = libc.unlink(z_p);
+        _ = libc.unlink(out_p);
+    }
+
+    // A full base: header + 0xBB metadata + mostly-zero RAM with two patterned pages.
+    var h = [_]u8{0} ** HDR_SIZE;
+    std.mem.writeInt(u32, h[0..4], SNAP_MAGIC, .little);
+    std.mem.writeInt(u32, h[4..8], SNAP_VERSION, .little);
+    std.mem.writeInt(u64, h[24..32], ram_size, .little);
+    std.mem.writeInt(u64, h[48..56], ram_off, .little);
+    std.mem.writeInt(u32, h[84..88], RAM_FULL, .little);
+    var ram = [_]u8{0} ** ram_size;
+    @memset(ram[0..HOST_PAGE], 0xAB);
+    @memset(ram[2 * HOST_PAGE .. 3 * HOST_PAGE], 0xCD);
+    {
+        const fd = libc.open(in_p, 2 | O_CREAT | O_TRUNC, @as(c_int, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = libc.close(fd);
+        var meta = [_]u8{0xBB} ** MOFF;
+        try std.testing.expect(writeAll(fd, &h) and writeAll(fd, &meta) and writeAll(fd, &ram));
+    }
+
+    try std.testing.expect(compressSnapshot(in_p, z_p, a));
+    // The compressed artifact is smaller and self-identifies as RAM_COMPRESSED with plaintext meta.
+    {
+        const fd = libc.open(z_p, 0, @as(c_int, 0));
+        try std.testing.expect(fd >= 0);
+        defer _ = libc.close(fd);
+        var zh: [HDR_SIZE]u8 = undefined;
+        try std.testing.expect(readExact(fd, &zh));
+        try std.testing.expectEqual(RAM_COMPRESSED, std.mem.readInt(u32, zh[84..88], .little));
+        try std.testing.expect(libc.lseek(fd, 0, 2) < @as(i64, @intCast(ram_off + ram_size))); // shrank
+    }
+
+    try std.testing.expect(rehydrateSnapshot(z_p, out_p, a));
+    // Rehydrated base is byte-identical to the original (header FULL, metadata, RAM).
+    const fd = libc.open(out_p, 0, @as(c_int, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = libc.close(fd);
+    var oh: [HDR_SIZE]u8 = undefined;
+    try std.testing.expect(readExact(fd, &oh));
+    try std.testing.expectEqual(RAM_FULL, std.mem.readInt(u32, oh[84..88], .little));
+    try std.testing.expectEqual(ram_size, std.mem.readInt(u64, oh[24..32], .little));
+    var ometa: [MOFF]u8 = undefined;
+    try std.testing.expect(readExact(fd, &ometa));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xBB} ** MOFF, &ometa);
+    var oram: [ram_size]u8 = undefined;
+    try std.testing.expect(readExact(fd, &oram));
+    try std.testing.expectEqualSlices(u8, &ram, &oram);
+}
+
 fn writeSnapshotBody(
     out_fd: c_int,
     path: [*:0]const u8,
@@ -1024,12 +1207,14 @@ pub fn validateSnapshotFile(path: [*:0]const u8) !void {
     }
     // And the file must actually hold the RAM region (overflow-safe). A FULL snapshot stores
     // ram_size bytes; a DIFF stores only diff_pages records (index + page), and its full RAM is
-    // reconstructed from a base at wake -- so the on-disk region is the diff, not ram_size.
+    // reconstructed from a base at wake; a COMPRESSED base stores an opaque deflate stream that
+    // runs to EOF -- so the on-disk region is that stream, verifiable only as ram_off <= file_size.
     const ram_encoding = std.mem.readInt(u32, hdr[84..88], .little);
-    const ram_bytes: u64 = if (ram_encoding == RAM_DIFF)
-        @as(u64, std.mem.readInt(u32, hdr[96..100], .little)) * (4 + DIFF_PAGE)
-    else
-        ram_size;
+    const ram_bytes: u64 = switch (ram_encoding) {
+        RAM_DIFF => @as(u64, std.mem.readInt(u32, hdr[96..100], .little)) * (4 + DIFF_PAGE),
+        RAM_COMPRESSED => 0, // the stream occupies [ram_off .. EOF]; only ram_off is bounded here
+        else => ram_size,
+    };
     if (ram_off > file_size or ram_bytes > file_size - ram_off) {
         std.debug.print("[nether] validate: truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_bytes, file_size });
         return error.BadSnapshot;
@@ -1115,6 +1300,12 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     // holds the RAM region up front (overflow-safe), then rewind to the metadata.
     const ram_encoding = std.mem.readInt(u32, hdr[84..88], .little);
     const diff_pages = std.mem.readInt(u32, hdr[96..100], .little);
+    // A compressed base is a stored artifact, not directly forkable (its RAM cannot be COW-mmap'd).
+    // Fail closed with the fix rather than mapping the deflate stream as if it were RAM.
+    if (ram_encoding == RAM_COMPRESSED) {
+        std.debug.print("[nether] restore: base is compressed; rehydrate it first (rehydrate_in=/rehydrate_out=)\n", .{});
+        return error.BadSnapshot;
+    }
     const fsize = libc.lseek(fd, 0, 2); // SEEK_END
     _ = libc.lseek(fd, @intCast(HDR_SIZE), 0); // SEEK_SET back to just after the header
     if (fsize < 0) return error.BadSnapshot;

@@ -47,6 +47,9 @@ SNAP_VERSION = 5
 SNAP_HDR_SIZE = 128
 SNAP_KIND_BASE = 0
 SNAP_KIND_PARK = 1
+RAM_FULL = 0
+RAM_DIFF = 1
+RAM_COMPRESSED = 2  # a stored/shipped base; rehydrate before forking
 
 # --- hashing / manifest (host-independent: the GC root) ---------------------
 
@@ -140,8 +143,13 @@ def validate_recipe(r):
             "the content-diff is a __park__-only optimization (kind=park, the platform's parked-fork "
             "flow); a durable base (kind=base) always writes a full snapshot. Drop it; use sparse "
             "(on by default) for base size reduction.")
-    if snap.get("compress", "none") not in ("none", "zstd"):
-        die('[snapshot].compress must be "none" or "zstd"')
+    comp = snap.get("compress", "none")
+    if comp == "zstd":
+        die('[snapshot].compress = "zstd" needs an external library nether deliberately avoids '
+            '(zero-dependency, self-contained build). Use "deflate" (pure-Zig std.compress.flate, '
+            "same CPU-for-disk trade on durable bases).")
+    if comp not in ("none", "deflate"):
+        die('[snapshot].compress must be "none" or "deflate"')
     # files: must fit the __put__ cap; large assets belong in the initramfs or a disk file.
     for f in r.get("files", []):
         h = f.get("host")
@@ -276,6 +284,8 @@ def do_bake(recipe_path, force=False, work=None):
         os.makedirs(os.path.dirname(snap) or ".", exist_ok=True)
         shutil.move(produced, snap)
         print("[bake] snapshot -> %s (%d bytes)" % (snap, os.path.getsize(snap)))
+        if r["snapshot"].get("compress", "none") == "deflate":
+            compress_base(snap)  # durable base: trade CPU for a smaller stored/shipped artifact
 
         try: meta(s, "__shutdown__", 5)
         except Exception: pass
@@ -322,13 +332,14 @@ def do_fork(snap, name, work=None):
     if m and m["key"].get("nether_build") not in (nether_build_id(), "unknown"):
         print("[fork] WARNING: base was baked by a different nether build; restore may be "
               "refused. Re-bake: ./scripts/bake.py bake %s" % m.get("recipe", "<recipe>"))
+    forkable = ensure_forkable(os.path.abspath(snap))  # rehydrate a compressed base first (cached)
     work = work or os.path.join(os.environ.get("NETHER_WORK", "/tmp/nether-fork"), name)
     shutil.rmtree(work, ignore_errors=True); os.makedirs(work)
     kdir = os.path.join(NB, "kernels")
     if os.path.exists(kdir):
         os.symlink(kdir, os.path.join(work, "kernels"))
     open(os.path.join(work, "nether.conf"), "w").write(
-        "restore=1\nrestore_from=%s\ncontrol_socket=f.sock\ndata_socket=f.data\n" % os.path.abspath(snap))
+        "restore=1\nrestore_from=%s\ncontrol_socket=f.sock\ndata_socket=f.data\n" % forkable)
     t0 = time.time()
     proc = launch(work, "fork.log")
     fsk = os.path.join(work, "f.sock")
@@ -412,6 +423,59 @@ def read_snap_kind(path):
         return None
     return struct.unpack_from("<I", h, 80)[0]
 
+def read_snap_encoding(path):
+    """Return a valid v5 snapshot's RAM encoding (0=full, 1=diff, 2=compressed), or None if `path`
+    is not a recognizable snapshot of this format. Used to decide whether a base must be rehydrated
+    before it can be forked."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(SNAP_HDR_SIZE)
+    except OSError:
+        return None
+    if len(h) < SNAP_HDR_SIZE:
+        return None
+    if struct.unpack_from("<I", h, 0)[0] != SNAP_MAGIC or struct.unpack_from("<I", h, 4)[0] != SNAP_VERSION:
+        return None
+    return struct.unpack_from("<I", h, 84)[0]
+
+def _nether_transform(key_in, key_out, src, dst):
+    """Run a nether file-transform CLI mode (compress/rehydrate) in a scratch dir: it reads the
+    key_in/key_out paths from nether.conf, does the transform, and exits (no VM). True on success."""
+    import tempfile
+    wd = tempfile.mkdtemp(prefix="nether-xf.")
+    try:
+        with open(os.path.join(wd, "nether.conf"), "w") as f:
+            f.write("%s=%s\n%s=%s\n" % (key_in, os.path.abspath(src), key_out, os.path.abspath(dst)))
+        r = subprocess.run([BIN], cwd=wd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            print("[bake] nether transform failed (rc=%d): %s%s" % (r.returncode, r.stdout, r.stderr))
+        return r.returncode == 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+def compress_base(snap):
+    """Deflate a full base's RAM region in place: the durable artifact keeps its name but becomes
+    RAM_COMPRESSED (self-identifying), smaller to store and ship. do_fork rehydrates it on demand."""
+    tmp = snap + ".ztmp"
+    if not _nether_transform("compress_in", "compress_out", snap, tmp):
+        die("compress failed for %s" % snap)
+    before = os.path.getsize(snap); os.replace(tmp, snap)
+    print("[bake] compressed base -> %s (%d -> %d bytes, %.1f%%)" %
+          (snap, before, os.path.getsize(snap), 100.0 * os.path.getsize(snap) / before))
+
+def ensure_forkable(snap):
+    """A compressed base cannot be COW-mmap'd, so it is not directly forkable. Rehydrate it to a
+    full, sparse, fast-forkable base cached next to it (<base>.hydrated, reused while newer than the
+    base) and return that path. A full base is returned unchanged -> the fast fork path is intact."""
+    if read_snap_encoding(snap) != RAM_COMPRESSED:
+        return snap
+    hy = snap + ".hydrated"
+    if not (os.path.exists(hy) and os.path.getmtime(hy) >= os.path.getmtime(snap)):
+        print("[fork] rehydrating compressed base -> %s (once per host; forks stay ~10ms)" % hy)
+        if not _nether_transform("rehydrate_in", "rehydrate_out", snap, hy):
+            die("rehydrate failed for %s" % snap)
+    return hy
+
 def reap_parks(parks_dir, ttl_s, dry_run=False, now=None):
     """Reap park-kind snapshots in `parks_dir` whose age (now - mtime) exceeds `ttl_s`. Only files
     whose header positively identifies a PARK of this format are touched; bases, non-snapshots, and
@@ -482,6 +546,16 @@ def selftest():
     check("reaper ignores a non-snapshot file", os.path.exists(junk))
     check("reaper dry-run removes nothing",
           [n for n, _ in reap_parks(pd, ttl_s=1, dry_run=True)] and os.path.exists(new_park))
+    # compress plumbing (host-independent parts): encoding read + ensure_forkable short-circuit.
+    def wsnap2(name, encoding):
+        p = os.path.join(pd, name); h = bytearray(SNAP_HDR_SIZE)
+        struct.pack_into("<I", h, 0, SNAP_MAGIC); struct.pack_into("<I", h, 4, SNAP_VERSION)
+        struct.pack_into("<I", h, 84, encoding)
+        open(p, "wb").write(bytes(h)); return p
+    full = wsnap2("full.base.snap", RAM_FULL); comp = wsnap2("comp.base.snap", RAM_COMPRESSED)
+    check("read_snap_encoding reads a full base", read_snap_encoding(full) == RAM_FULL)
+    check("read_snap_encoding reads a compressed base", read_snap_encoding(comp) == RAM_COMPRESSED)
+    check("ensure_forkable passes a full base through (no rehydrate)", ensure_forkable(full) == full)
     shutil.rmtree(d, ignore_errors=True)
     print("selftest:", "OK" if ok else "FAILED")
     return 0 if ok else 1

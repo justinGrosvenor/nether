@@ -122,4 +122,12 @@ the platform's responsibility, consistent with the lease/GC model.)
   standalone base sharing the base's blocks copy-on-write), and the `ttl_s` orphan-park reaper
   (`bake.py gc --parks --ttl-s N`: reaps never-woken park-kind snapshots past their age, keyed on
   the header KIND with the file mtime as created_at; bases are never at risk).
-- Not yet built (**[U]**): `compress` (opt-in, bases only). Does not need hypervisor support.
+- Shipped (**[U]**, runner-side): `compress` (opt-in, bases only). Codec is **deflate** via pure-Zig
+  `std.compress.flate`, not zstd -- zstd needs an external library the zero-dependency build avoids.
+  A compressed base is a stored/shipped artifact (not directly forkable, since a compressed RAM
+  region cannot be COW-mmap'd); `bake.py fork` rehydrates it once per host to a cached full base, so
+  forks stay the ~10 ms COW-mmap path. `compressSnapshot`/`rehydrateSnapshot` (+ `compress_*` /
+  `rehydrate_*` conf) are the pure file transforms the runner shells out to.
+- The storage stack is now complete: sparse, content-diff parks, clonefile dedup, ttl_s reaper,
+  and deflate compression. No remaining [U] storage items; incremental restore-side (`base=` at
+  wake) still waits on the control-plane `__park__ base=` parse (the SnapCtx.diff_base seam).

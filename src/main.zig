@@ -713,6 +713,42 @@ fn macMain() !void {
         }
     }
 
+    // `compress_in=<base> compress_out=<path>` deflates a full base's RAM region into a smaller
+    // stored artifact (bases only; header/metadata stay plaintext). `rehydrate_in/out` is the
+    // inverse: it expands a compressed base back to a full, sparse, fast-forkable one. Both are
+    // pure file transforms (no VM), so the runner shells out around bake/fork. Exit non-zero on
+    // failure (the functions fail closed).
+    {
+        var ci: [1024]u8 = undefined;
+        var co: [1024]u8 = undefined;
+        if (confGet("compress_in", &ci)) |in| {
+            const out = confGet("compress_out", &co) orelse {
+                std.debug.print("[nether] compress: compress_out=<path> required\n", .{});
+                std.process.exit(2);
+            };
+            if (!snapshot.compressSnapshot(@ptrCast(in.ptr), @ptrCast(out.ptr), allocator)) {
+                std.debug.print("[nether] compress: failed (not a full base, or I/O error)\n", .{});
+                std.process.exit(1);
+            }
+            return;
+        }
+    }
+    {
+        var ri: [1024]u8 = undefined;
+        var ro: [1024]u8 = undefined;
+        if (confGet("rehydrate_in", &ri)) |in| {
+            const out = confGet("rehydrate_out", &ro) orelse {
+                std.debug.print("[nether] rehydrate: rehydrate_out=<path> required\n", .{});
+                std.process.exit(2);
+            };
+            if (!snapshot.rehydrateSnapshot(@ptrCast(in.ptr), @ptrCast(out.ptr), allocator)) {
+                std.debug.print("[nether] rehydrate: failed (not a compressed base, or corrupt stream)\n", .{});
+                std.process.exit(1);
+            }
+            return;
+        }
+    }
+
     // A `nether-restore` marker forks a guest from a snapshot instead of booting.
     // `restore_from=<path>` in nether.conf selects the base image (defaults to
     // nether.snap), so the platform can pre-bake several base snapshots

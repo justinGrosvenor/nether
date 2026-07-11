@@ -61,9 +61,10 @@ kind = "base"       # base = durable, forks many. (park = one-shot, host-managed
 # later needs no format break. Until the sparse-storage / incremental work lands, the runner
 # parses these and rejects the gated one; the rest are no-ops.
 # sparse   = true     # [ships w/ storage work] zero pages as filesystem holes; near-free, on by default
-# compress = "none"   # [ships w/ storage work] "none" | "zstd". zstd trades disk for CPU AND
-#                     #   forfeits the ~10 ms lazy COW restore (a compressed RAM region can't be
-#                     #   mmap'd; it decompresses into anon memory). Bases only, never park.
+# compress = "none"   # "none" | "deflate". deflate (pure-Zig std.compress.flate, zero-dep) trades
+#                     #   CPU for a smaller stored/shipped base. The compressed base is not directly
+#                     #   forkable (a compressed RAM region can't be COW-mmap'd), so `fork` rehydrates
+#                     #   it once per host to a cached full base -> forks stay ~10 ms. Bases only.
 # ttl_s    = 0        # retention seconds for transient snapshots (0 = none); park/ttl reaper
 #
 # NOTE: incremental diff (`base=`) is intentionally NOT a bake field. Per
