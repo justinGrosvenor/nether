@@ -688,6 +688,31 @@ fn macMain() !void {
         }
     }
 
+    // `materialize_out=<path>` folds a content-diff snapshot into a standalone FULL base at that
+    // path, deduplicated on disk via an APFS clone of the base (needs materialize_base +
+    // materialize_diff). No VM: a provisioning step the runner shells out to. Exits non-zero on
+    // any header/geometry mismatch (materializeDiff already fails closed, leaving no debris).
+    {
+        var ob: [1024]u8 = undefined;
+        var bb: [1024]u8 = undefined;
+        var db: [1024]u8 = undefined;
+        if (confGet("materialize_out", &ob)) |o| {
+            const base = confGet("materialize_base", &bb) orelse {
+                std.debug.print("[nether] materialize: materialize_base=<path> required\n", .{});
+                std.process.exit(2);
+            };
+            const diff = confGet("materialize_diff", &db) orelse {
+                std.debug.print("[nether] materialize: materialize_diff=<path> required\n", .{});
+                std.process.exit(2);
+            };
+            if (!snapshot.materializeDiff(@ptrCast(base.ptr), @ptrCast(diff.ptr), @ptrCast(o.ptr))) {
+                std.debug.print("[nether] materialize: failed (base/diff mismatch or I/O error)\n", .{});
+                std.process.exit(1);
+            }
+            return;
+        }
+    }
+
     // A `nether-restore` marker forks a guest from a snapshot instead of booting.
     // `restore_from=<path>` in nether.conf selects the base image (defaults to
     // nether.snap), so the platform can pre-bake several base snapshots

@@ -54,7 +54,18 @@ pub const libc = struct {
     pub extern "c" fn raise(sig: c_int) c_int; // deliver a signal to this process (for tests)
     pub extern "c" fn mmap(addr: usize, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) usize;
     pub extern "c" fn munmap(addr: usize, len: usize) c_int;
+    // APFS block-level clone (macOS): `dst` becomes a copy-on-write clone of `src`, sharing every
+    // block until one side writes it. Referenced only on macOS (guarded in cloneFile), so the
+    // symbol is dead-code-eliminated on Linux where glibc has no clonefile.
+    pub extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_int;
 };
+
+/// Clone `src` to a new file `dst` sharing its blocks copy-on-write (APFS/macOS). `dst` must not
+/// exist. Returns false off macOS or on any failure, so the caller falls back to a full byte copy.
+pub fn cloneFile(src: [*:0]const u8, dst: [*:0]const u8) bool {
+    if (builtin.os.tag != .macos) return false;
+    return libc.clonefile(src, dst, 0) == 0;
+}
 
 /// Map `len` bytes of `fd` at `offset` read-only (a private, lazy view). Used to read a base
 /// snapshot's RAM region for the content-diff compare without a full-RAM heap read. null on failure.

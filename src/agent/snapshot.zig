@@ -608,6 +608,198 @@ test "content-diff round-trip reconstructs the forked RAM from base + diff" {
     try std.testing.expectEqualSlices(u8, &fork, &recon);
 }
 
+/// Full byte copy of `src` to a fresh `dst` (the non-APFS fallback for cloneFile). 0600, refuses
+/// a pre-existing symlink at the basename (createTruncNoFollow). Returns false on any I/O error.
+fn copyFileFull(src: [*:0]const u8, dst: [*:0]const u8) bool {
+    const s = libc.open(src, 0, @as(c_int, 0)); // O_RDONLY
+    if (s < 0) return false;
+    defer _ = libc.close(s);
+    const d = hostutil.createTruncNoFollow(dst);
+    if (d < 0) return false;
+    defer _ = libc.close(d);
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = libc.read(s, &buf, buf.len);
+        if (n < 0) return false;
+        if (n == 0) return true;
+        if (!writeAll(d, buf[0..@intCast(n)])) return false;
+    }
+}
+
+/// Splice the diff file's header+metadata region ([0..ram_off]) over the cloned base, patch the
+/// encoding to FULL (clearing the diff fields), then overlay the diverged RAM pages. `ofd` is the
+/// materialized file open RW; `dfd` is the diff snapshot. Off the hot path (a provisioning step).
+fn spliceAndOverlay(ofd: c_int, dfd: c_int, ram_off: u64, ram_size: u64, diff_pages: u32) bool {
+    // Child metadata replaces the base's (bytes [0..ram_off]); the cloned base RAM stays, about
+    // to be overlaid. Both offsets are identical (checked by the caller), so this is a byte splice.
+    if (libc.lseek(dfd, 0, 0) < 0 or libc.lseek(ofd, 0, 0) < 0) return false;
+    var buf: [64 * 1024]u8 = undefined;
+    var rem = ram_off;
+    while (rem > 0) {
+        const chunk = @min(rem, buf.len);
+        if (!readExact(dfd, buf[0..chunk]) or !writeAll(ofd, buf[0..chunk])) return false;
+        rem -= chunk;
+    }
+    // The file is now a FULL snapshot: encoding -> FULL, and clear diff_pages + base_ram_size.
+    var enc4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &enc4, RAM_FULL, .little);
+    if (libc.lseek(ofd, 84, 0) < 0 or !writeAll(ofd, &enc4)) return false;
+    const zero12 = [_]u8{0} ** 12; // diff_pages[96..100] + base_ram_size[100..108]
+    if (libc.lseek(ofd, 96, 0) < 0 or !writeAll(ofd, &zero12)) return false;
+    // Overlay: read each {index, page} from the diff (at its ram_off) and write it into the RAM
+    // region, COW-diverging only that block from the shared base. Every index is bounds-checked.
+    if (libc.lseek(dfd, @intCast(ram_off), 0) < 0) return false;
+    var p: u32 = 0;
+    while (p < diff_pages) : (p += 1) {
+        var rec: [4]u8 = undefined;
+        if (!readExact(dfd, &rec)) return false;
+        const off = @as(u64, std.mem.readInt(u32, &rec, .little)) * DIFF_PAGE;
+        if (off > ram_size or DIFF_PAGE > ram_size - off) return false; // OOB page index: fail closed
+        var page: [DIFF_PAGE]u8 = undefined;
+        if (!readExact(dfd, &page)) return false;
+        if (libc.lseek(ofd, @intCast(ram_off + off), 0) < 0 or !writeAll(ofd, &page)) return false;
+    }
+    return true;
+}
+
+/// Fold a content-diff snapshot (`diff_path`, against `base_path`) into a standalone FULL base at
+/// `out_path`, deduplicated on disk via an APFS clone of the base: the result shares every RAM
+/// block it did not diverge with the base (block-level copy-on-write), so a derived base costs
+/// ~its diff on disk yet is fully independent - the base may be deleted, APFS refcounts the shared
+/// blocks. `out_path` must not exist. Fails closed (leaving no debris) on any header/geometry
+/// mismatch. This is operator/same-uid input, so headers are sanity-checked before any read.
+pub fn materializeDiff(base_path: [*:0]const u8, diff_path: [*:0]const u8, out_path: [*:0]const u8) bool {
+    const O_RDWR: c_int = 2;
+    const bfd = libc.open(base_path, 0, @as(c_int, 0));
+    if (bfd < 0) return false;
+    defer _ = libc.close(bfd);
+    const dfd = libc.open(diff_path, 0, @as(c_int, 0));
+    if (dfd < 0) return false;
+    defer _ = libc.close(dfd);
+
+    var bh: [HDR_SIZE]u8 = undefined;
+    var dh: [HDR_SIZE]u8 = undefined;
+    if (!readExact(bfd, &bh) or !readExact(dfd, &dh)) return false;
+    if (std.mem.readInt(u32, bh[0..4], .little) != SNAP_MAGIC or std.mem.readInt(u32, dh[0..4], .little) != SNAP_MAGIC) return false;
+    if (std.mem.readInt(u32, bh[4..8], .little) != SNAP_VERSION or std.mem.readInt(u32, dh[4..8], .little) != SNAP_VERSION) return false;
+    if (std.mem.readInt(u32, bh[84..88], .little) != RAM_FULL) return false; // base must be a full snapshot
+    if (std.mem.readInt(u32, dh[84..88], .little) != RAM_DIFF) return false; // and diff a diff
+
+    const ram_off = std.mem.readInt(u64, bh[48..56], .little);
+    const ram_size = std.mem.readInt(u64, bh[24..32], .little);
+    const diff_pages = std.mem.readInt(u32, dh[96..100], .little);
+    // Geometry must line up, or these two files are unrelated: same layout offset, same RAM size,
+    // and the diff's base fingerprint must name a base of exactly this size.
+    if (std.mem.readInt(u64, dh[48..56], .little) != ram_off) return false;
+    if (std.mem.readInt(u64, dh[24..32], .little) != ram_size) return false;
+    if (std.mem.readInt(u64, dh[100..108], .little) != ram_size) return false;
+    if (ram_off < HDR_SIZE or ram_size % DIFF_PAGE != 0) return false;
+
+    // Both files must physically hold the regions the headers claim (no OOB splice/overlay).
+    const bsz = libc.lseek(bfd, 0, 2); // SEEK_END
+    const dsz = libc.lseek(dfd, 0, 2);
+    if (bsz < 0 or dsz < 0) return false;
+    if (@as(u64, @intCast(bsz)) < ram_off or ram_size > @as(u64, @intCast(bsz)) - ram_off) return false;
+    const diff_bytes = @as(u64, diff_pages) * (4 + DIFF_PAGE);
+    if (ram_off > @as(u64, @intCast(dsz)) or diff_bytes > @as(u64, @intCast(dsz)) - ram_off) return false;
+
+    // Clone the base (COW block share), or fall back to a full copy off APFS.
+    if (!hostutil.cloneFile(base_path, out_path)) {
+        if (!copyFileFull(base_path, out_path)) return false;
+    }
+    const ofd = libc.open(out_path, O_RDWR, @as(c_int, 0));
+    if (ofd < 0) {
+        _ = libc.unlink(out_path);
+        return false;
+    }
+    defer _ = libc.close(ofd);
+    const done = spliceAndOverlay(ofd, dfd, ram_off, ram_size, diff_pages);
+    if (!done) _ = libc.unlink(out_path); // never leave a half-materialized base on disk
+    return done;
+}
+
+test "materializeDiff clones a base and overlays the diff into a standalone full snapshot" {
+    const builtin = @import("builtin");
+    const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+    const O_TRUNC: c_int = if (builtin.os.tag == .macos) 0x0400 else 0o1000;
+    const MOFF: u64 = 256; // fake metadata region between the header and RAM
+    const ram_off: u64 = HDR_SIZE + MOFF;
+    const ram_size: u64 = 4 * DIFF_PAGE;
+
+    const base_path = "/tmp/nether-mat-base.snap";
+    const diff_path = "/tmp/nether-mat-diff.snap";
+    const out_path = "/tmp/nether-mat-out.snap";
+    defer {
+        _ = libc.unlink(base_path);
+        _ = libc.unlink(diff_path);
+        _ = libc.unlink(out_path);
+    }
+    _ = libc.unlink(out_path); // clonefile refuses an existing dst; clear any stale one up front
+
+    // --- base: FULL header + 0xBB metadata + RAM pages 0x11,0x22,0x33,0x44 ---
+    var bh = [_]u8{0} ** HDR_SIZE;
+    std.mem.writeInt(u32, bh[0..4], SNAP_MAGIC, .little);
+    std.mem.writeInt(u32, bh[4..8], SNAP_VERSION, .little);
+    std.mem.writeInt(u64, bh[24..32], ram_size, .little);
+    std.mem.writeInt(u64, bh[48..56], ram_off, .little);
+    std.mem.writeInt(u32, bh[84..88], RAM_FULL, .little);
+    var base_ram = [_]u8{0} ** ram_size;
+    inline for (0..4) |k| @memset(base_ram[k * DIFF_PAGE ..][0..DIFF_PAGE], 0x11 * (k + 1));
+    {
+        const fd = libc.open(base_path, 2 | O_CREAT | O_TRUNC, @as(c_int, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = libc.close(fd);
+        var meta = [_]u8{0xBB} ** MOFF;
+        try std.testing.expect(writeAll(fd, &bh) and writeAll(fd, &meta) and writeAll(fd, &base_ram));
+    }
+
+    // --- diff: DIFF header (diff_pages=2, base_ram_size=ram_size) + 0xCC metadata + 2 records ---
+    var dh = [_]u8{0} ** HDR_SIZE;
+    std.mem.writeInt(u32, dh[0..4], SNAP_MAGIC, .little);
+    std.mem.writeInt(u32, dh[4..8], SNAP_VERSION, .little);
+    std.mem.writeInt(u64, dh[24..32], ram_size, .little);
+    std.mem.writeInt(u64, dh[48..56], ram_off, .little);
+    std.mem.writeInt(u32, dh[84..88], RAM_DIFF, .little);
+    std.mem.writeInt(u32, dh[96..100], 2, .little);
+    std.mem.writeInt(u64, dh[100..108], ram_size, .little);
+    {
+        const fd = libc.open(diff_path, 2 | O_CREAT | O_TRUNC, @as(c_int, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = libc.close(fd);
+        var meta = [_]u8{0xCC} ** MOFF;
+        try std.testing.expect(writeAll(fd, &dh) and writeAll(fd, &meta));
+        // page 1 -> 0xAA, page 3 -> 0xBB
+        inline for (.{ .{ 1, 0xAA }, .{ 3, 0xBB } }) |rec| {
+            var idx: [4]u8 = undefined;
+            std.mem.writeInt(u32, &idx, rec[0], .little);
+            var page = [_]u8{rec[1]} ** DIFF_PAGE;
+            try std.testing.expect(writeAll(fd, &idx) and writeAll(fd, &page));
+        }
+    }
+
+    try std.testing.expect(materializeDiff(base_path, diff_path, out_path));
+
+    // The result is a standalone FULL snapshot: encoding FULL, diff fields cleared, child metadata,
+    // and RAM = base with pages 1 and 3 overlaid (0x11, 0xAA, 0x33, 0xBB).
+    const ofd = libc.open(out_path, 0, @as(c_int, 0));
+    try std.testing.expect(ofd >= 0);
+    defer _ = libc.close(ofd);
+    var oh: [HDR_SIZE]u8 = undefined;
+    try std.testing.expect(readExact(ofd, &oh));
+    try std.testing.expectEqual(RAM_FULL, std.mem.readInt(u32, oh[84..88], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, oh[96..100], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, oh[100..108], .little));
+    var ometa: [MOFF]u8 = undefined;
+    try std.testing.expect(readExact(ofd, &ometa));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xCC} ** MOFF, &ometa);
+    var oram: [ram_size]u8 = undefined;
+    try std.testing.expect(readExact(ofd, &oram));
+    var want = base_ram;
+    @memset(want[1 * DIFF_PAGE ..][0..DIFF_PAGE], 0xAA);
+    @memset(want[3 * DIFF_PAGE ..][0..DIFF_PAGE], 0xBB);
+    try std.testing.expectEqualSlices(u8, &want, &oram);
+}
+
 fn writeSnapshotBody(
     out_fd: c_int,
     path: [*:0]const u8,
