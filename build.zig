@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     // Nether targets Linux/KVM. Default to cross-compiling x86_64-linux so the
@@ -7,6 +8,24 @@ pub fn build(b: *std.Build) void {
         .default_target = .{ .cpu_arch = .x86_64, .os_tag = .linux },
     });
     const optimize = b.standardOptimizeOption(.{});
+
+    // On Apple Silicon the HVF backend only gets the hypervisor if the binary is
+    // codesigned with the com.apple.security.hypervisor entitlement. Automate that
+    // so `zig build -Dtarget=native` (and `zig build run`) always yield a signed,
+    // runnable binary - the whole "rebuilt, forgot to re-sign, HV_DENIED" class is
+    // killed. scripts/sign.sh is the single source of truth (see docs/codesigning.md).
+    // Options are declared unconditionally so -Dcodesign=false is always accepted
+    // (e.g. to hand signing to a downstream release pipeline).
+    const codesign_opt = b.option(
+        bool,
+        "codesign",
+        "Codesign the native macOS binary with the hypervisor entitlement (default: on when host and target are macOS)",
+    );
+    const entitlements_path = b.option(
+        []const u8,
+        "entitlements",
+        "Path to the codesign entitlements plist (default: nether.entitlements)",
+    ) orelse "nether.entitlements";
 
     const exe = b.addExecutable(.{
         .name = "nether",
@@ -29,11 +48,39 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
+    // Auto-sign the installed native binary. Gate to a macOS host building a macOS
+    // target: codesign only exists on macOS, and it only embeds the entitlement into
+    // a Mach-O (an ELF cross-build would sign "generic" and silently drop it, so we
+    // must not run it there - scripts/sign.sh also asserts this defensively).
+    const host_is_macos = builtin.os.tag == .macos;
+    const target_is_macos = target.result.os.tag == .macos;
+    const do_codesign = codesign_opt orelse (host_is_macos and target_is_macos);
+    var sign_step: ?*std.Build.Step = null;
+    if (do_codesign and host_is_macos and target_is_macos) {
+        const sign = b.addSystemCommand(&.{
+            b.pathFromRoot("scripts/sign.sh"),
+            b.getInstallPath(.bin, exe.out_filename),
+            b.pathFromRoot(entitlements_path),
+        });
+        // Sign the INSTALLED copy (in zig-out), not the content-addressed cache
+        // artifact - mutating a cache output out-of-band would confuse the cache.
+        sign.step.dependOn(b.getInstallStep());
+        const sign_top = b.step("sign", "Codesign the native binary with the hypervisor entitlement (implies install)");
+        sign_top.dependOn(&sign.step);
+        // Make bare `zig build` (the default step is install) produce a SIGNED binary.
+        // `zig build install` still installs unsigned if explicitly requested.
+        b.default_step = sign_top;
+        sign_step = &sign.step;
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    // A launched VM will HV_DENIED on an unsigned binary, so `zig build run` must
+    // sign first on native macOS.
+    if (sign_step) |s| run_cmd.step.dependOn(s);
     if (b.args) |args| run_cmd.addArgs(args);
     const run_desc = if (target.result.os.tag == .macos)
-        "Run the Nether VMM (HVF; codesign with nether.entitlements first)"
+        "Run the Nether VMM (HVF; auto-codesigned via scripts/sign.sh)"
     else
         "Run the Nether VMM (requires Linux + /dev/kvm)";
     const run_step = b.step("run", run_desc);
