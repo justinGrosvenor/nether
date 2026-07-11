@@ -6,7 +6,7 @@ with MSI-X, with virtio-console, virtio-blk, virtio-vsock, and virtio-net all
 live. On top of that datapath we built the **agent-platform track**: a control
 plane (a Unix-socket API + an in-guest agent REPL + host-mediated file transfer),
 live surfaces for all six platform pillars (observe / govern / isolate / meter /
-run / render), and **snapshot -> copy-on-write fork -> ~90 ms lazy restore** - the
+run / render), and **snapshot -> copy-on-write fork -> ~10 ms lazy restore** - the
 microVM fork primitive the edge product is built on. The whole stack is hardened
 against malformed guest input *and* against a hostile local control client.
 

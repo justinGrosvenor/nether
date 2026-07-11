@@ -9,7 +9,7 @@ swerver (one binary, embeds nether) ──► HVF / KVM ──► microVM
               │
               ├── egress firewall + budgets (when net enabled)
               ├── control plane + virtio-vsock
-              └── snapshot → COW fork (HVF only, ~90ms)
+              └── snapshot → COW fork (HVF only, ~10ms)
 ```
 
 The standalone `nether` executable in this repo is a dev/bringup wrapper around the

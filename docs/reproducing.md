@@ -47,7 +47,7 @@ Then run any script directly, e.g. `python3 scripts/fork_serve.py`.
 
 | Script | Proves |
 | --- | --- |
-| `park_await_proof.py` | A guest blocked in `recv()` on an outbound request is snapshotted and **killed**; when the upstream reply arrives, a restored fork completes the *same* `recv()` with the reply bytes. Nobody's VM runs while the upstream is slow (~66 ms restore). |
+| `park_await_proof.py` | A guest blocked in `recv()` on an outbound request is snapshotted and **killed**; when the upstream reply arrives, a restored fork completes the *same* `recv()` with the reply bytes. Nobody's VM runs while the upstream is slow (~20 ms wake to reply delivered). |
 | `park_multi_proof.py` | One VM with **four concurrent** in-flight upstream requests is parked and revived, and all four resume. |
 | `park_timer_proof.py` | A woken fork's virtual timer resumes at its captured value: the snapshot is the guest's last live moment, monotonic time is continuous across the gap. |
 | `wallclock_proof.py` | Fresh boot has a real wall clock (year ≥ 2026, not 1970, from the PL031 RTC); across a park the wall clock freezes while monotonic stays continuous, and one `hwclock -s` reconciles it. |

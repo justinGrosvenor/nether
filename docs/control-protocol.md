@@ -417,7 +417,7 @@ stays alive in the platform's process. When the reply arrives, the platform rest
 park; nether enumerates the surviving egress conns and re-dials `egress_socket` with
 `resume=1 conn=<id>` for each; the platform splices the reply in, and the guest's
 ORIGINAL blocking `recv()` completes - ordinary code, never rewritten, that slept through
-its own death. Verified live on HVF: `scripts/park_await_proof.py` (~66ms restore ->
+its own death. Verified live on HVF: `scripts/park_await_proof.py` (~20ms wake ->
 reply delivered).
 
 Only vsock-proxied conns survive a park; anything over virtio-net/slirp still dies on
@@ -563,4 +563,4 @@ fork's egress firewall / rate cap come from its own `nether.conf`, and `__stats_
 snapshot taken from a **non-control** sandbox has no vsock/agent state, so its forks are
 console + virtio-blk only even if `control_socket=` is set; the restore logs an explicit
 NOTE saying so. Snapshot-fork is HVF/aarch64 only (KVM snapshot is unimplemented). Fork
-latency is ~90 ms (COW RAM map).
+latency is ~10 ms to a driveable VM (COW RAM map; ~25 ms to a first served request).

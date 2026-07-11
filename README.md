@@ -4,7 +4,7 @@
 
 **Linux microVMs that fork like processes.** nether is a type-2 hypervisor (VMM)
 written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapshot
-into fresh VMs in **~70 ms** each, resuming exactly where the image froze, even
+into fresh VMs in **~10 ms** each, resuming exactly where the image froze, even
 mid-request. It runs in the layer below the guest, hence the name.
 
 **Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)).
@@ -15,8 +15,9 @@ A normal VM boots from cold every time. nether treats a running Linux VM as
 something you can snapshot, kill, and bring back, like `fork()` for a whole guest:
 
 - **Cold boot once (~0.5 s)** to a ready, serving base image.
-- **Warm-fork it in ~70 ms**, copy-on-write: each fork shares the base's pages and
-  only copies what it writes, so a fork is cheap in both time and memory.
+- **Warm-fork it in ~10 ms** to a live, driveable VM (a first served request through a
+  warm in-guest server lands in ~25 ms), copy-on-write: each fork shares the base's
+  pages and only copies what it writes, so a fork is cheap in both time and memory.
 - **Resume mid-flight.** Because the whole guest is captured, a fork wakes up
   inside the exact system call the snapshot froze on. You can accept a request on
   one VM, snapshot and kill it, and **complete the reply from a different VM** that
@@ -26,9 +27,11 @@ something you can snapshot, kill, and bring back, like `fork()` for a whole gues
 The monotonic clock stays continuous across a park; the wall clock catches up to
 real time on resume; forks reseed their CRNG so siblings don't share randomness.
 
-> Numbers are measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest. "~70 ms" is
-> a **warm fork / snapshot restore**, not a cold boot. Bigger guests copy more
-> pages on resume, so treat it as an order of magnitude, not a guarantee.
+> Numbers are measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest, and are
+> reproducible via the proof scripts under [`scripts/`](scripts/). "~10 ms" is a
+> **warm fork / snapshot restore** to a driveable VM (not a cold boot); ~25 ms is fork
+> to a first served request through a warm app. Bigger guests copy more pages on
+> resume, so treat these as order-of-magnitude, not guarantees.
 
 ## What it is
 
