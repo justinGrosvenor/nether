@@ -123,6 +123,14 @@ def validate_recipe(r):
     snap = r.get("snapshot", {})
     if not snap.get("out"):
         die("[snapshot].out is required")
+    # Storage policy (docs/incremental-snapshot-spec.md). Incremental (`base`) is gated on HVF
+    # dirty-page tracking: parse it, but fail closed until the mechanism ships, so a recipe
+    # can't silently produce a full snapshot when it asked for a delta.
+    if snap.get("base"):
+        die("[snapshot].base (incremental/diff) is not supported yet (pending HVF dirty-page "
+            "tracking). Use sparse storage instead, or drop the field for a full base.")
+    if snap.get("compress", "none") not in ("none", "zstd"):
+        die('[snapshot].compress must be "none" or "zstd"')
     # files: must fit the __put__ cap; large assets belong in the initramfs or a disk file.
     for f in r.get("files", []):
         h = f.get("host")
@@ -143,7 +151,7 @@ def render_conf(r, control_socket, data_socket, restore_from=None):
         lines.append("app_port=%d" % ready["port"])
     lines.append("ram_mb=%d" % res.get("ram_mb", 512))
     lines.append("cpus=%d" % res.get("cpus", 1))
-    disk = res.get("disk", {})
+    disk = r.get("disk", {})  # top-level [disk], per docs/incremental-snapshot-spec.md
     if disk.get("file"):  # file-backed: persistent, NOT captured in the snapshot, skips the eager read
         lines.append("disk=%s" % disk["file"])
         if disk.get("size_mb"):

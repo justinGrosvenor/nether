@@ -42,13 +42,12 @@ example is [`examples/base.nether.toml`](../examples/base.nether.toml); the fiel
 
 - **`[image]`** `kernel`, `initramfs`: the capability layer. Paths resolve relative to the
   recipe file.
-- **`[resources]`** `ram_mb`, `cpus`. In-memory disk size under `[resources.disk].size_mb`
-  is captured in the snapshot; note that in-memory disk sizing is honored only where the
-  build supports it, so for anything beyond a scratch disk prefer a file-backed disk.
-- **`[resources.disk]`** the one storage decision that matters at bake time:
-  - `size_mb` (in-memory): **captured** in the snapshot, COW-forked, adds to snapshot size.
-  - `file` (file-backed): **not captured**, persistent on its own, and it skips the eager
-    read on restore (so it is also the faster-restore choice for large disks).
+- **`[resources]`** `ram_mb`, `cpus`.
+- **`[disk]`** (top-level) the one storage decision that matters at bake time. Exactly one of:
+  - `size_mb` (in-memory): **captured** in the snapshot, COW-forked, adds directly to snapshot
+    size.
+  - `file` (file-backed): **not captured**, persistent on its own, and it skips the eager read
+    on restore (so it is also the faster-restore choice for large disks).
 - **`[network]`** `egress`: `deny` (safe default) | `allow` | a policy.
 - **`run_as`**: run guest commands as a non-root user.
 - **`[[files]]`** `host`/`guest`: your code, pushed over the control socket before warm-up.
@@ -58,10 +57,13 @@ example is [`examples/base.nether.toml`](../examples/base.nether.toml); the fiel
   process and moves on.
 - **`[ready]`** the readiness gate: `port` or `command`. A *declared condition, polled
   finely*, not a fixed sleep. (Fixed sleeps are how you get latency numbers wrong by 5x.)
-- **`[snapshot]`** `out`, `kind = "base"`, plus a reserved storage-policy block
-  (`sparse`, `compress`, `diff_from`, `retain`, `ttl`) that the sparse-storage / incremental
-  work will honor. The recipe is where storage *policy* lives; the VMM implements the
-  *mechanism*.
+- **`[snapshot]`** `out`, `kind = "base"`, plus a storage-policy block defined in
+  [`docs/incremental-snapshot-spec.md`](incremental-snapshot-spec.md): `sparse` (zero pages
+  as holes; near-free, default on), `compress` (`"none"`/`"zstd"`; note zstd trades disk for
+  CPU *and forfeits the ~10 ms lazy restore*, since a compressed RAM region can't be COW-mmap'd,
+  so it's bases-only), `base` (incremental delta, **gated** on HVF dirty-page tracking; the
+  runner rejects it until the mechanism ships), and `ttl_s` (retention). The recipe is where
+  storage *policy* lives; the VMM implements the *mechanism*.
 
 ## The base is a cache, not an artifact you ship
 

@@ -7,7 +7,7 @@ written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapsh
 into fresh VMs in **~10 ms** each, resuming exactly where the image froze, even
 mid-request. It runs in the layer below the guest, hence the name.
 
-**Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)).
+**Documentation:** [docs.nether.dev](https://docs.nether.dev) (source in [`docs/`](docs/index.md)). For the non-technical version of why this matters, see [nether in one page](docs/nether-for-execs.md).
 
 ## The idea
 
@@ -98,6 +98,10 @@ zig build test          # run the test suite (includes the always-on fuzz smoke)
 
 Every latency and behavior claim above has a live proof script under `scripts/`;
 [`docs/reproducing.md`](docs/reproducing.md) indexes what each proves and how to run it.
+
+**Provisioning a base to fork:** [`docs/provisioning.md`](docs/provisioning.md) walks the path
+from a guest image to a warm base to a fork, driven by a declarative recipe
+([`examples/base.nether.toml`](examples/base.nether.toml), run with `scripts/bake.py`).
 
 ## Layout
 

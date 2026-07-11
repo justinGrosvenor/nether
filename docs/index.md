@@ -59,8 +59,10 @@ Nether lives. Phase 0: real-mode guest over COM1.
 - :material-download: **[Installation](getting-started/installation.md)**: Zig toolchain, backends, build and test.
 - :material-server: **[Running on KVM](running-on-kvm.md)**: bare-metal or nested virt, PVH kernel, initramfs, virtio-blk.
 - :material-apple: **[Running on HVF](running-on-hvf.md)**: Apple Silicon dev host, codesign, Alpine Linux boot.
+- :material-package-variant: **[Provisioning base VMs](provisioning.md)**: image vs base, the declarative bake recipe, forking, and the re-bake/GC model.
 - :material-shield-lock: **[Sandbox policy](guide/sandbox-policy.md)**: egress firewall, runtime budgets, metering.
 - :material-map: **[Design](design.md)**: scope, security posture, prior art.
 - :material-source-branch: **[Roadmap](roadmap.md)**: phases, platform track, what's next.
+- :material-presentation: **[nether in one page](nether-for-execs.md)**: the non-technical why, in outcome language.
 
 </div>
