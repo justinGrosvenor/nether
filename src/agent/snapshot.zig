@@ -66,6 +66,11 @@ pub const SnapCtx = struct {
     // only: bytes buffered in its delivery rings live in host memory and are NOT part
     // of the snapshot, so a capture while any are pending is loudly flagged.
     bridge: ?*control.DataBridge = null,
+    // Content-diff base (set by the __snapshot__/__park__ handler from a validated `base=`
+    // path). When set on a PARK capture whose RAM geometry matches the base, captureImpl
+    // stores only the pages that diverged from this base (memcmp at capture); null => a full
+    // snapshot. The handler owns resolving/jailing the path; this is just the resolved value.
+    diff_base: ?[*:0]const u8 = null,
     // Serializes captures: the demo timer and the __snapshot__ control command both
     // drive captureToFile, and two captures must not quiesce at once.
     capturing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -158,7 +163,29 @@ fn captureImpl(ctx: *SnapCtx, out_fd: c_int, path: [*:0]const u8, resume_after: 
     // owning thread. Stored in the header so a restore resumes the guest count exactly
     // here (vtimer continuity: a parked guest does not observe the parked wall time).
     const cntvct_snap = sn.cntvct.load(.acquire);
-    const ok = writeSnapshotFile(out_fd, path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK, cntvct_snap);
+    // Content-diff (PARK only): when a base= was supplied and it is a FULL snapshot of matching
+    // RAM geometry, store only the pages that diverged from it. Map the base RAM read-only for
+    // the compare; anything off (missing base, wrong size, a diff base) falls back to a full write.
+    var diff_base: ?[]const u8 = null;
+    var base_fd: c_int = -1;
+    if (!resume_after) if (ctx.diff_base) |bp| {
+        base_fd = libc.open(bp, 0, @as(c_int, 0)); // O_RDONLY
+        if (base_fd >= 0) map: {
+            var bh: [HDR_SIZE]u8 = undefined;
+            if (!readExact(base_fd, &bh)) break :map;
+            if (std.mem.readInt(u32, bh[0..4], .little) != SNAP_MAGIC) break :map;
+            if (std.mem.readInt(u32, bh[84..88], .little) != RAM_FULL) break :map; // never diff-of-a-diff
+            const b_ram_size = std.mem.readInt(u64, bh[24..32], .little);
+            const b_ram_off = std.mem.readInt(u64, bh[48..56], .little);
+            if (b_ram_size != ctx.ram.len or ctx.ram.len % DIFF_PAGE != 0) break :map;
+            diff_base = hostutil.mapFileRead(base_fd, @intCast(b_ram_off), @intCast(b_ram_size));
+        }
+    };
+    defer {
+        if (diff_base) |b| hostutil.unmapFile(b);
+        if (base_fd >= 0) _ = libc.close(base_fd);
+    }
+    const ok = writeSnapshotFile(out_fd, path, ctx.ram, cpu_snap[0..n], con_snap, blk_snap, uart_snap, gic, ctx.blk_disk, vs_dev_snap, vsock_snap, conn_id_snap, net_dev_snap, if (resume_after) SNAP_KIND_BASE else SNAP_KIND_PARK, cntvct_snap, diff_base);
     if (resume_after or !ok) {
         sn.phase.store(@intFromEnum(hvfb.SnapPhase.resumed), .release);
         std.debug.print("[nether] snapshot {s} to {s} ({d} MiB + state, control-plane={s}, net={s}); guest resumed.\n", .{ if (ok) "written" else "FAILED writing", path, ctx.ram.len / (1024 * 1024), if (has_ctl) "captured" else "absent", if (net_dev_snap != null) "captured" else "absent" });
@@ -343,7 +370,7 @@ pub fn macSnapshotter(ctx: *SnapCtx) void {
 // shares the file's pages and only copies what it writes. Same-host/same-build
 // only (raw struct layout, native endian).
 const SNAP_MAGIC: u32 = 0x4e_53_4e_50; // 'NSNP'
-const SNAP_VERSION: u32 = 4; // bumped: header carries a control-plane flag + vsock state
+const SNAP_VERSION: u32 = 5; // bumped: header carries the RAM encoding (full vs content-diff)
 
 // Snapshot KIND (hdr[80..84]): the lifecycle contract, baked into the file itself.
 //   0 = BASE: durable, forks many (the platform re-bakes on version drift).
@@ -354,6 +381,12 @@ const SNAP_VERSION: u32 = 4; // bumped: header carries a control-plane flag + vs
 // Pre-kind v4 files carry 0 here (header zero padding), so they read as bases.
 const SNAP_KIND_BASE: u32 = 0;
 const SNAP_KIND_PARK: u32 = 1;
+// RAM encoding (header [84..88]). FULL: the RAM region is the whole guest RAM (sparse-written).
+// DIFF: the region is `diff_pages` records of {page_index:u32, PAGE bytes} - only the pages that
+// diverged from a base; restore COW-maps the base and overlays these. DIFF is PARK-only.
+const RAM_FULL: u32 = 0;
+const RAM_DIFF: u32 = 1;
+const DIFF_PAGE: usize = 16384; // diff granularity (== HOST_PAGE)
 const HDR_SIZE: usize = 128; // header bytes (grew from 64 for the control-plane fields)
 const HOST_PAGE: usize = 16384; // Apple Silicon page size (mmap offset alignment)
 const GIC_STATE_MAX: u64 = 16 * 1024 * 1024; // sane cap for the GIC blob (~126 KiB in practice)
@@ -387,6 +420,8 @@ fn validateHeader(hdr: *const [HDR_SIZE]u8, max_cpus: u32, disk_cap: u64, gic_ca
     // Lifecycle kind must be one this build understands (fail closed on garbage - an
     // unknown kind means a newer format or corruption, either way don't guess).
     if (std.mem.readInt(u32, hdr[80..84], .little) > SNAP_KIND_PARK) return error.BadSnapshot;
+    // RAM encoding must be one this build understands (unknown -> newer format or corruption).
+    if (std.mem.readInt(u32, hdr[84..88], .little) > RAM_DIFF) return error.BadSnapshot;
 }
 
 /// Fuzz entry (src/fuzz.zig): drive an ATTACKER-CONTROLLED snapshot header through
@@ -425,6 +460,7 @@ pub fn fuzzHeader(bytes: []const u8) void {
     if (std.mem.readInt(u32, hdr[64..68], .little) == 1)
         std.debug.assert(std.mem.readInt(u32, hdr[68..72], .little) == eng_sz);
     std.debug.assert(std.mem.readInt(u32, hdr[80..84], .little) <= SNAP_KIND_PARK);
+    std.debug.assert(std.mem.readInt(u32, hdr[84..88], .little) <= RAM_DIFF); // known RAM encoding
     // The `meta` sum that gates the RAM offset must not overflow on an accepted header
     // (the bounds above are exactly what keeps it from doing so - assert that ordering holds).
     const meta: u64 = HDR_SIZE + @as(u64, ncpu) * cpu_sz + 2 * @as(u64, dev_sz) + uart_sz +
@@ -448,8 +484,9 @@ fn writeSnapshotFile(
     net_dev: ?nether.virtio.Device.DeviceState, // virtio-net transport state (null => no NIC)
     kind: u32, // SNAP_KIND_BASE or SNAP_KIND_PARK (the file's lifecycle contract)
     cntvct: u64, // guest virtual-counter at capture (0 = unknown -> legacy restore)
+    diff_base: ?[]const u8, // set: store RAM as a content-diff vs this base RAM; null: full (sparse)
 ) bool {
-    const ok = writeSnapshotBody(out_fd, path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind, cntvct);
+    const ok = writeSnapshotBody(out_fd, path, ram, cpus, con, blk, uart, gic, disk, vs_dev, vsock, conn_id, net_dev, kind, cntvct, diff_base);
     // Strict lifecycle: a failed write never leaves debris. A truncated snapshot would be
     // rejected on restore anyway, but a half-written full-RAM image (tenant secrets
     // frozen inside) must not linger on disk either. With a caller-opened fd the caller
@@ -509,6 +546,68 @@ test "writeRamSparse round-trips including zero holes and keeps the logical size
     try std.testing.expectEqualSlices(u8, &ram, &back);
 }
 
+/// Write a content-diff of `cur` against `base` (same length) to `fd`: for each DIFF_PAGE that
+/// differs, a record {page_index:u32 LE, DIFF_PAGE bytes}. Returns the record count, or null on a
+/// write error or a non-page-multiple length (caller then falls back to a full snapshot).
+fn writeRamDiff(fd: c_int, cur: []const u8, base: []const u8) ?u32 {
+    if (cur.len != base.len or cur.len % DIFF_PAGE != 0) return null;
+    var pages: u32 = 0;
+    var i: usize = 0;
+    var idx: u32 = 0;
+    while (i < cur.len) : ({
+        i += DIFF_PAGE;
+        idx += 1;
+    }) {
+        if (std.mem.eql(u8, cur[i..][0..DIFF_PAGE], base[i..][0..DIFF_PAGE])) continue;
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, idx, .little);
+        if (!writeAll(fd, &hdr) or !writeAll(fd, cur[i..][0..DIFF_PAGE])) return null;
+        pages += 1;
+    }
+    return pages;
+}
+
+/// Apply a content-diff read from `fd` (current offset) onto `ram` (already the base): `pages`
+/// records of {page_index:u32, DIFF_PAGE bytes}. Every guest-supplied page index is bounds-checked
+/// against the RAM range; an out-of-range index fails closed.
+fn applyRamDiff(fd: c_int, ram: []u8, pages: u32) bool {
+    var p: u32 = 0;
+    while (p < pages) : (p += 1) {
+        var hdr: [4]u8 = undefined;
+        if (!readExact(fd, &hdr)) return false;
+        const off = @as(usize, std.mem.readInt(u32, &hdr, .little)) * DIFF_PAGE;
+        if (off > ram.len or DIFF_PAGE > ram.len - off) return false; // OOB page index: fail closed
+        if (!readExact(fd, ram[off..][0..DIFF_PAGE])) return false;
+    }
+    return true;
+}
+
+test "content-diff round-trip reconstructs the forked RAM from base + diff" {
+    const builtin = @import("builtin");
+    const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+    const O_TRUNC: c_int = if (builtin.os.tag == .macos) 0x0400 else 0o1000;
+    const path = "/tmp/nether-diff-roundtrip.bin";
+    const fd = libc.open(path, 2 | O_CREAT | O_TRUNC, @as(c_int, 0o600));
+    try std.testing.expect(fd >= 0);
+    defer {
+        _ = libc.close(fd);
+        _ = libc.unlink(path);
+    }
+    // base: 4 pages of 0x11..0x44; fork: pages 1 and 3 rewritten.
+    var base = [_]u8{0} ** (4 * DIFF_PAGE);
+    inline for (0..4) |k| @memset(base[k * DIFF_PAGE ..][0..DIFF_PAGE], 0x11 * (k + 1));
+    var fork = base;
+    @memset(fork[1 * DIFF_PAGE ..][0..DIFF_PAGE], 0xAA);
+    @memset(fork[3 * DIFF_PAGE ..][0..DIFF_PAGE], 0xBB);
+    const n = writeRamDiff(fd, &fork, &base) orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 2), n); // only the 2 changed pages stored
+    // apply onto a fresh copy of base -> must equal fork.
+    _ = libc.lseek(fd, 0, 0); // SEEK_SET
+    var recon = base;
+    try std.testing.expect(applyRamDiff(fd, &recon, n));
+    try std.testing.expectEqualSlices(u8, &fork, &recon);
+}
+
 fn writeSnapshotBody(
     out_fd: c_int,
     path: [*:0]const u8,
@@ -525,6 +624,7 @@ fn writeSnapshotBody(
     net_dev: ?nether.virtio.Device.DeviceState,
     kind: u32,
     cntvct: u64,
+    diff_base: ?[]const u8, // set: store RAM as a content-diff vs this base RAM; null: full (sparse)
 ) bool {
     // __snapshot__/__park__ hand us an fd the control plane opened via its pinned
     // jail-root dirfd (openJailedAt), so the destination provably sits inside the
@@ -580,6 +680,11 @@ fn writeSnapshotBody(
     // wall time. Rides in reserved space (84..88 stays reserved zero); 0 = written
     // by a build without the field (or no capture) -> restore skips the rebase.
     std.mem.writeInt(u64, hdr[88..96], cntvct, .little);
+    // RAM encoding: FULL (whole RAM, sparse) or DIFF (only pages diverged from a base). For a diff,
+    // diff_pages [96..100] is patched in after the records are written, and [100..108] holds the base
+    // RAM size (a cheap restore-time check that the wake was handed a base of the right geometry).
+    std.mem.writeInt(u32, hdr[84..88], if (diff_base != null) RAM_DIFF else RAM_FULL, .little);
+    std.mem.writeInt(u64, hdr[100..108], if (diff_base) |b| @as(u64, b.len) else 0, .little);
     if (!writeAll(fd, &hdr)) return false;
     for (cpus) |*c| if (!writeAll(fd, std.mem.asBytes(c))) return false;
     if (!writeAll(fd, std.mem.asBytes(&con))) return false;
@@ -594,10 +699,16 @@ fn writeSnapshotBody(
     if (net) {
         if (!writeAll(fd, std.mem.asBytes(&net_dev.?))) return false;
     }
-    // Pad to the page-aligned RAM offset, then write RAM.
+    // Pad to the page-aligned RAM offset, then write the RAM region.
     var pad = [_]u8{0} ** HOST_PAGE;
     if (ram_off > meta and !writeAll(fd, pad[0 .. ram_off - meta])) return false;
-    if (!writeRamSparse(fd, ram, ram_off + ram.len)) return false;
+    if (diff_base) |base_ram| {
+        // Content-diff: write only the diverged pages, then patch the record count into the header.
+        const dp = writeRamDiff(fd, ram, base_ram) orelse return false;
+        var dpb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &dpb, dp, .little);
+        if (libc.lseek(fd, 96, 0) < 0 or !writeAll(fd, &dpb)) return false; // patch diff_pages [96..100]
+    } else if (!writeRamSparse(fd, ram, ram_off + ram.len)) return false;
     return true;
 }
 
@@ -719,9 +830,16 @@ pub fn validateSnapshotFile(path: [*:0]const u8) !void {
         std.debug.print("[nether] validate: section sizes inconsistent with the RAM offset (meta={d}, ram_off={d})\n", .{ meta, ram_off });
         return error.BadSnapshot;
     }
-    // And the file must actually hold the RAM region (overflow-safe).
-    if (ram_off > file_size or ram_size > file_size - ram_off) {
-        std.debug.print("[nether] validate: truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_size, file_size });
+    // And the file must actually hold the RAM region (overflow-safe). A FULL snapshot stores
+    // ram_size bytes; a DIFF stores only diff_pages records (index + page), and its full RAM is
+    // reconstructed from a base at wake -- so the on-disk region is the diff, not ram_size.
+    const ram_encoding = std.mem.readInt(u32, hdr[84..88], .little);
+    const ram_bytes: u64 = if (ram_encoding == RAM_DIFF)
+        @as(u64, std.mem.readInt(u32, hdr[96..100], .little)) * (4 + DIFF_PAGE)
+    else
+        ram_size;
+    if (ram_off > file_size or ram_bytes > file_size - ram_off) {
+        std.debug.print("[nether] validate: truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_bytes, file_size });
         return error.BadSnapshot;
     }
 
@@ -803,21 +921,51 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     // too short to contain ram_off + ram_size would not fault here - it would SIGBUS
     // the guest on the first access to the missing tail. Verify the file actually
     // holds the RAM region up front (overflow-safe), then rewind to the metadata.
+    const ram_encoding = std.mem.readInt(u32, hdr[84..88], .little);
+    const diff_pages = std.mem.readInt(u32, hdr[96..100], .little);
     const fsize = libc.lseek(fd, 0, 2); // SEEK_END
     _ = libc.lseek(fd, @intCast(HDR_SIZE), 0); // SEEK_SET back to just after the header
     if (fsize < 0) return error.BadSnapshot;
     const file_size: u64 = @intCast(fsize);
-    if (ram_off > file_size or ram_size > file_size - ram_off) {
-        std.debug.print("[nether] restore: snapshot truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_size, file_size });
-        return error.BadSnapshot;
-    }
 
     var vm = try nether.Vm.init(allocator);
     defer vm.deinit();
-    // Map RAM copy-on-write from the snapshot file (at the snapshot's own size):
-    // the fork shares the base image's pages and only copies what it writes, so
-    // restore is instant (no full read) and forks are memory-cheap.
-    const ram = try vm.hv.mapMemoryCow(ARM_RAM_BASE, @intCast(ram_size), fd, ram_off);
+    // A DIFF park stores only the pages that diverged from a base: its RAM comes copy-on-write
+    // from the base file (supplied by the wake's conf `base=`) and the diff pages are overlaid
+    // below. A FULL snapshot maps its own RAM region. Either way `ram` is the guest's COW RAM.
+    var base_fd: c_int = -1;
+    defer if (base_fd >= 0) {
+        _ = libc.close(base_fd);
+    };
+    const ram = if (ram_encoding == RAM_DIFF) rblk: {
+        var base_buf: [1024]u8 = undefined;
+        const bp = conf.confGet("base", &base_buf) orelse {
+            std.debug.print("[nether] restore: diff snapshot needs base=<path> at wake; refusing\n", .{});
+            return error.BadSnapshot;
+        };
+        base_fd = libc.open(@ptrCast(bp.ptr), 0, @as(c_int, 0)); // O_RDONLY
+        if (base_fd < 0) return error.OpenFailed;
+        var bh: [HDR_SIZE]u8 = undefined;
+        if (!readExact(base_fd, &bh)) return error.BadSnapshot;
+        try validateHeader(&bh, hvfb.MAX_SNAP_CPUS, armdev.blk_disk_storage.len, GIC_STATE_MAX, @sizeOf(hvfb.CpuState), @sizeOf(nether.virtio.Device.DeviceState), @sizeOf(nether.Pl011.State), @sizeOf(nether.Vsock.State));
+        const b_ram_size = std.mem.readInt(u64, bh[24..32], .little);
+        const b_ram_off = std.mem.readInt(u64, bh[48..56], .little);
+        if (std.mem.readInt(u32, bh[84..88], .little) != RAM_FULL or b_ram_size != ram_size or
+            b_ram_size != std.mem.readInt(u64, hdr[100..108], .little))
+        {
+            std.debug.print("[nether] restore: base does not match this diff snapshot (encoding/size); refusing\n", .{});
+            return error.BadSnapshot;
+        }
+        const diff_bytes = @as(u64, diff_pages) * (4 + DIFF_PAGE);
+        if (ram_off > file_size or diff_bytes > file_size - ram_off) return error.BadSnapshot; // park truncated
+        break :rblk try vm.hv.mapMemoryCow(ARM_RAM_BASE, @intCast(ram_size), base_fd, b_ram_off);
+    } else rblk: {
+        if (ram_off > file_size or ram_size > file_size - ram_off) {
+            std.debug.print("[nether] restore: snapshot truncated (RAM region {d}+{d} exceeds file size {d})\n", .{ ram_off, ram_size, file_size });
+            return error.BadSnapshot;
+        }
+        break :rblk try vm.hv.mapMemoryCow(ARM_RAM_BASE, @intCast(ram_size), fd, ram_off);
+    };
     try vm.enableSplitIrqchip(); // create the GIC before vCPUs (state restored below)
 
     // Read the small metadata sequentially (cpus, con, blk, uart, gic, disk); RAM
@@ -861,6 +1009,13 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     var net_dev_state: nether.virtio.Device.DeviceState = undefined;
     if (net_present) {
         if (!readExact(fd, std.mem.asBytes(&net_dev_state))) return error.BadSnapshot;
+    }
+    // Overlay the content-diff (PARK only): `ram` is the base mapped COW, so writing a diverged
+    // page here copies just that page off the shared base. The diff records live at ram_off,
+    // past the metadata we just read, so seek there first.
+    if (ram_encoding == RAM_DIFF) {
+        if (libc.lseek(fd, @intCast(ram_off), 0) < 0) return error.BadSnapshot;
+        if (!applyRamDiff(fd, ram, diff_pages)) return error.BadSnapshot;
     }
     // No up-front I-cache invalidation: the RAM pages are demand-paged COW from
     // the file (already at the point of unification) and a freshly created vCPU's

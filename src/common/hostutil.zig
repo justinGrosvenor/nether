@@ -52,7 +52,24 @@ pub const libc = struct {
     // (@intFromPtr of a C-callconv handler). Return is the previous handler, ignored.
     pub extern "c" fn signal(sig: c_int, handler: usize) usize;
     pub extern "c" fn raise(sig: c_int) c_int; // deliver a signal to this process (for tests)
+    pub extern "c" fn mmap(addr: usize, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) usize;
+    pub extern "c" fn munmap(addr: usize, len: usize) c_int;
 };
+
+/// Map `len` bytes of `fd` at `offset` read-only (a private, lazy view). Used to read a base
+/// snapshot's RAM region for the content-diff compare without a full-RAM heap read. null on failure.
+pub fn mapFileRead(fd: c_int, offset: i64, len: usize) ?[]const u8 {
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2; // 0x02 on macOS and Linux
+    const a = libc.mmap(0, len, PROT_READ, MAP_PRIVATE, fd, offset);
+    if (a == 0 or a == std.math.maxInt(usize)) return null; // NULL / MAP_FAILED
+    const ptr: [*]const u8 = @ptrFromInt(a);
+    return ptr[0..len];
+}
+
+pub fn unmapFile(s: []const u8) void {
+    _ = libc.munmap(@intFromPtr(s.ptr), s.len);
+}
 
 /// Bound how long a `write` to `fd` blocks when the peer's receive buffer is full
 /// (SO_SNDTIMEO). Used on control-client sockets so a wedged consumer that stops reading
