@@ -9,7 +9,8 @@
 #   bake:  boot a control-mode sandbox -> push files -> run warm-up -> wait until ready
 #          -> __snapshot__ -> tear down, leaving <out> + <out>.manifest.json
 #   fork:  restore a base into a fresh, driveable VM (~10 ms)
-#   gc:    reap stale/superseded/orphaned bases (the manifest is the GC root)
+#   gc:    reap stale/superseded/orphaned bases (the manifest is the GC root), or with
+#          --parks --ttl-s N, reap never-woken park snapshots older than N seconds
 #
 # A base is a DERIVED, build-specific cache keyed on (nether build, image, recipe): a base
 # baked by one nether build is rejected by the next (validateHeader gates version + struct
@@ -24,10 +25,11 @@
 #   ./scripts/bake.py bake  base.nether.toml            # bake (or cache-hit) -> base.snap
 #   ./scripts/bake.py fork  base.snap --name tenant-1   # restore a driveable fork
 #   ./scripts/bake.py gc    [--dir bases] [--orphans]   # reap stale/superseded/orphaned bases
+#   ./scripts/bake.py gc    --dir parks --parks --ttl-s 3600 [--dry-run]  # reap never-woken parks
 #
 # Boot/HVF paths need an Apple Silicon box; the recipe parse / manifest / GC logic is host
 # independent (see the __main__ self-test: `./scripts/bake.py selftest`).
-import os, sys, json, time, hashlib, socket, subprocess, shutil, glob
+import os, sys, json, time, hashlib, socket, subprocess, shutil, glob, struct
 
 try:
     import tomllib  # py3.11+ stdlib
@@ -38,6 +40,13 @@ NB = os.environ.get("NETHER_ROOT") or os.path.expanduser("~/nether")
 BIN = NB + "/zig-out/bin/nether"
 MANIFEST_SCHEMA = 1
 MAX_XFER = 16 * 1024 * 1024  # control.zig __put__ cap; larger files must not go via __put__
+
+# Snapshot header (src/agent/snapshot.zig): 128-byte little-endian, magic 'NSNP', v5, KIND at 80.
+SNAP_MAGIC = 0x4e534e50
+SNAP_VERSION = 5
+SNAP_HDR_SIZE = 128
+SNAP_KIND_BASE = 0
+SNAP_KIND_PARK = 1
 
 # --- hashing / manifest (host-independent: the GC root) ---------------------
 
@@ -380,6 +389,50 @@ def _reap(snap):
         try: os.remove(p)
         except OSError: pass
 
+# --- orphan-park TTL reaper -------------------------------------------------
+# A park snapshot is unlinked by the VMM the instant a fork wakes it (macRestore). One that is
+# NEVER woken would otherwise linger at full size forever. `ttl_s` bounds that: reap park-kind
+# snapshots older than the TTL. The GC class comes from the header KIND, so a base is never at
+# risk; created_at is the file mtime (the VMM wrote the park then). Set the TTL well beyond the
+# expected wake window so the reaper only ever touches an abandoned park, never a live one.
+
+def read_snap_kind(path):
+    """Return a valid v5 snapshot's KIND (0=base, 1=park), or None if `path` is not a recognizable
+    snapshot of THIS format (too short, bad magic, wrong version). Fail safe: a file we cannot
+    positively identify as a snapshot is never a reap candidate."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(SNAP_HDR_SIZE)
+    except OSError:
+        return None
+    if len(h) < SNAP_HDR_SIZE:
+        return None
+    magic, ver = struct.unpack_from("<I", h, 0)[0], struct.unpack_from("<I", h, 4)[0]
+    if magic != SNAP_MAGIC or ver != SNAP_VERSION:
+        return None
+    return struct.unpack_from("<I", h, 80)[0]
+
+def reap_parks(parks_dir, ttl_s, dry_run=False, now=None):
+    """Reap park-kind snapshots in `parks_dir` whose age (now - mtime) exceeds `ttl_s`. Only files
+    whose header positively identifies a PARK of this format are touched; bases, non-snapshots, and
+    truncated/corrupt files are left alone. Returns [(basename, age_s), ...] reaped (or, dry-run,
+    that would be). `now` is injectable for tests."""
+    now = time.time() if now is None else now
+    reaped = []
+    for snap in sorted(glob.glob(os.path.join(parks_dir, "*.snap"))):
+        if read_snap_kind(snap) != SNAP_KIND_PARK:
+            continue  # not a park (base / unrecognized) -> not this reaper's business
+        try:
+            age = now - os.path.getmtime(snap)
+        except OSError:
+            continue
+        if age <= ttl_s:
+            continue  # still within its wake window
+        reaped.append((os.path.basename(snap), int(age)))
+        if not dry_run:
+            _reap(snap)
+    return reaped
+
 # --- self-test (host-independent: parsing + manifest + GC) ------------------
 
 def selftest():
@@ -407,6 +460,28 @@ def selftest():
     orph = os.path.join(d, "orph.snap"); open(orph, "wb").write(b"z")
     gc_superseded(d, keep=snap, recipe="/r.toml")
     check("orphan survives implicit gc", os.path.exists(orph))
+    # park reaper: an expired park is reaped by KIND + age; a base and a fresh park survive, and a
+    # non-snapshot file is never touched. Ages are baked into mtime so the test needs no sleeping.
+    pd = os.path.join(d, "parks"); os.makedirs(pd)
+    def wsnap(name, kind, age_s):
+        p = os.path.join(pd, name)
+        h = bytearray(SNAP_HDR_SIZE)
+        struct.pack_into("<I", h, 0, SNAP_MAGIC); struct.pack_into("<I", h, 4, SNAP_VERSION)
+        struct.pack_into("<I", h, 80, kind)
+        open(p, "wb").write(bytes(h))
+        t = time.time() - age_s; os.utime(p, (t, t))
+        return p
+    old_park = wsnap("old.park.snap", SNAP_KIND_PARK, 10_000)
+    new_park = wsnap("new.park.snap", SNAP_KIND_PARK, 5)
+    a_base   = wsnap("keep.base.snap", SNAP_KIND_BASE, 10_000)  # old, but a base -> never a park reap
+    junk = os.path.join(pd, "junk.snap"); open(junk, "wb").write(b"not a snapshot header")
+    names = [n for n, _ in reap_parks(pd, ttl_s=3600)]
+    check("reaper reaps the expired park", "old.park.snap" in names and not os.path.exists(old_park))
+    check("reaper spares a fresh park", "new.park.snap" not in names and os.path.exists(new_park))
+    check("reaper never reaps a base", os.path.exists(a_base))
+    check("reaper ignores a non-snapshot file", os.path.exists(junk))
+    check("reaper dry-run removes nothing",
+          [n for n, _ in reap_parks(pd, ttl_s=1, dry_run=True)] and os.path.exists(new_park))
     shutil.rmtree(d, ignore_errors=True)
     print("selftest:", "OK" if ok else "FAILED")
     return 0 if ok else 1
@@ -415,7 +490,8 @@ def selftest():
 
 def main(argv):
     if not argv:
-        print(__doc__ if False else "usage: bake.py {bake <recipe>|fork <snap> --name N|gc [--dir D] [--orphans]|selftest}")
+        print("usage: bake.py {bake <recipe>|fork <snap> --name N|"
+              "gc [--dir D] [--orphans] | gc --dir D --parks --ttl-s N [--dry-run]|selftest}")
         return 2
     cmd0 = argv[0]
     if cmd0 == "bake":
@@ -427,6 +503,18 @@ def main(argv):
         return do_fork(argv[1], name)
     if cmd0 == "gc":
         d = argv[argv.index("--dir") + 1] if "--dir" in argv else "."
+        if "--parks" in argv:
+            if "--ttl-s" not in argv: die("gc --parks needs --ttl-s <seconds>")
+            ttl = int(argv[argv.index("--ttl-s") + 1])
+            dry = "--dry-run" in argv
+            reaped = reap_parks(d, ttl, dry_run=dry)
+            if reaped:
+                print("[gc] %s %d orphan park(s) older than %ds in %s:" %
+                      ("would reap" if dry else "reaped", len(reaped), ttl, d))
+                for name, age in reaped: print("  - %s (age %ds)" % (name, age))
+            else:
+                print("[gc] no orphan parks older than %ds in %s" % (ttl, d))
+            return 0
         return do_gc(d, orphans="--orphans" in argv)
     if cmd0 == "selftest":
         return selftest()
