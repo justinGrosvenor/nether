@@ -45,15 +45,15 @@ faster option; it is the only option in its class.
 
 Because nether freezes a *running* machine, a clone can resume in the middle of an operation.
 A request can arrive on one machine, that machine can be snapshotted and shut down, and the
-reply can be completed **by a different machine that did not exist when the request arrived** —
-the network connection held open across the gap. Work survives the machine it started on.
+reply can be completed **by a different machine that did not exist when the request arrived**,
+with the network connection held open across the gap. Work survives the machine it started on.
 This is the demo that makes the model click; it is not possible with cold-boot tooling.
 
 ## Honest framing
 
 nether is early (pre-1.0) and has not had an external security audit, so it is not yet the
-thing to put untrusted production traffic on tomorrow. But the hard, novel part — cloning a
-warm, running, isolated VM in ~10 ms, natively on Apple Silicon — works today and is
+thing to put untrusted production traffic on tomorrow. But the hard, novel part (cloning a
+warm, running, isolated VM in ~10 ms, natively on Apple Silicon) works today and is
 reproducible. The engineering discipline behind it (a hostile-guest threat model, continuous
 fuzzing, adversarial review of the isolation boundary) is documented, not asserted.
 
