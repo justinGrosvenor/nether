@@ -458,6 +458,57 @@ fn writeSnapshotFile(
     return ok;
 }
 
+fn ramBlockZero(b: []const u8) bool {
+    for (b) |x| if (x != 0) return false;
+    return true;
+}
+
+/// Write `ram` to `fd` at the current file offset, but skip page-aligned runs of zeros -
+/// leaving filesystem holes - since a warm guest's unused RAM is mostly zero. Coalesces
+/// contiguous zero runs (one lseek SEEK_CUR) and non-zero runs (one writeAll), then ftruncate
+/// to `end_off` so a trailing zero run is still logically present. Restore is unchanged: the
+/// COW mmap reads a hole as zero, exactly the guest's original RAM. Strictly smaller-or-equal
+/// on disk than a literal write, at the cost of one zero-scan over RAM (off the hot path).
+fn writeRamSparse(fd: c_int, ram: []const u8, end_off: usize) bool {
+    const BLK = HOST_PAGE; // hole granularity (a multiple of the FS block size)
+    var i: usize = 0;
+    while (i < ram.len) {
+        const start = i;
+        const zero = ramBlockZero(ram[i..@min(i + BLK, ram.len)]);
+        i = @min(i + BLK, ram.len);
+        while (i < ram.len and ramBlockZero(ram[i..@min(i + BLK, ram.len)]) == zero) i = @min(i + BLK, ram.len);
+        if (zero) {
+            if (libc.lseek(fd, @intCast(i - start), 1) < 0) return false; // SEEK_CUR: leave a hole
+        } else if (!writeAll(fd, ram[start..i])) return false;
+    }
+    return libc.ftruncate(fd, @intCast(end_off)) == 0;
+}
+
+test "writeRamSparse round-trips including zero holes and keeps the logical size" {
+    const builtin = @import("builtin");
+    const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+    const O_TRUNC: c_int = if (builtin.os.tag == .macos) 0x0400 else 0o1000;
+    const path = "/tmp/nether-sparse-roundtrip.bin";
+    const fd = libc.open(path, 2 | O_CREAT | O_TRUNC, @as(c_int, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
+    try std.testing.expect(fd >= 0);
+    defer {
+        _ = libc.close(fd);
+        _ = libc.unlink(path);
+    }
+    // RAM: nonzero page, zero page, nonzero page, then a two-page zero tail.
+    var ram = [_]u8{0} ** (5 * HOST_PAGE);
+    @memset(ram[0..HOST_PAGE], 0xAB);
+    @memset(ram[2 * HOST_PAGE .. 3 * HOST_PAGE], 0xCD);
+    try std.testing.expect(writeRamSparse(fd, &ram, ram.len));
+    // Logical size is the full RAM length (the trailing hole is still present).
+    try std.testing.expectEqual(@as(i64, @intCast(ram.len)), libc.lseek(fd, 0, 2)); // SEEK_END
+    // Content reads back byte-identical (holes as zero).
+    _ = libc.lseek(fd, 0, 0); // SEEK_SET
+    var back = [_]u8{0xFF} ** (5 * HOST_PAGE);
+    try std.testing.expect(readExact(fd, &back));
+    try std.testing.expectEqualSlices(u8, &ram, &back);
+}
+
 fn writeSnapshotBody(
     out_fd: c_int,
     path: [*:0]const u8,
@@ -546,7 +597,7 @@ fn writeSnapshotBody(
     // Pad to the page-aligned RAM offset, then write RAM.
     var pad = [_]u8{0} ** HOST_PAGE;
     if (ram_off > meta and !writeAll(fd, pad[0 .. ram_off - meta])) return false;
-    if (!writeAll(fd, ram)) return false;
+    if (!writeRamSparse(fd, ram, ram_off + ram.len)) return false;
     return true;
 }
 
