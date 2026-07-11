@@ -104,7 +104,7 @@ def wait_serving(d, t0, budget=40):
                 r = hit(ds, 5)
                 if r: return r, time.time() - t0
             except Exception: pass
-        time.sleep(0.03)
+        time.sleep(0.0003)
     return None, time.time() - t0
 
 def main():
@@ -121,7 +121,7 @@ def main():
         # 1. Bake the base: boot, start the tenant server, snapshot it warm.
         bp = launch(base, "boot.log"); procs.append(bp)
         t0 = time.time()
-        while not os.path.exists(os.path.join(base, "base.sock")) and time.time() - t0 < 40: time.sleep(0.1)
+        while not os.path.exists(os.path.join(base, "base.sock")) and time.time() - t0 < 40: time.sleep(0.0003)
         s = uconn(os.path.join(base, "base.sock")); cmd(s, "__info__")
         for _ in range(120):
             if "ready" in cmd(s, "echo ready"): break

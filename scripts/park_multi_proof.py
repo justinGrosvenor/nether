@@ -121,7 +121,7 @@ def main():
         bp = launch(base, "boot.log"); procs.append(bp)
         csk = os.path.join(base, "c.sock")
         t0 = time.time()
-        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.1)
+        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.0003)
         s = uc(csk)
         for _ in range(120):
             if "ready" in cmd(s, "echo ready", 5): break
@@ -130,7 +130,7 @@ def main():
         # 1. Four concurrent in-flight upstreams from one guest.
         cmd(s, REQ4, 15)
         t0 = time.time()
-        while len(broker.parked) < len(TAGS) and time.time() - t0 < 20: time.sleep(0.05)
+        while len(broker.parked) < len(TAGS) and time.time() - t0 < 20: time.sleep(0.0003)
         if len(broker.parked) < len(TAGS):
             fails.append("only %d/%d conns parked" % (len(broker.parked), len(TAGS))); raise SystemExit
         ids = sorted(broker.parked)
@@ -154,7 +154,7 @@ def main():
         t_r = time.time()
         fp = launch(fork, "fork.log"); procs.append(fp)
         fsk = os.path.join(fork, "f.sock")
-        while not os.path.exists(fsk) and time.time() - t_r < 30: time.sleep(0.05)
+        while not os.path.exists(fsk) and time.time() - t_r < 30: time.sleep(0.0003)
         fs = uc(fsk)
         got = {}
         while time.time() - t_r < 30 and len(got) < len(TAGS):
@@ -162,7 +162,7 @@ def main():
                 if g not in got:
                     v = cat(fs, "/tmp/r-%s" % g)
                     if v: got[g] = v
-            time.sleep(0.1)
+            time.sleep(0.0003)
         dt = time.time() - t_r
         print("[wake] %.3fs; replies: %s" % (dt, got))
         flog = open(os.path.join(fork, "fork.log")).read()

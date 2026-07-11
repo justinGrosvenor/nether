@@ -48,7 +48,7 @@ def wait_sock(p, to=40):
     t0 = time.time()
     while not os.path.exists(p):
         if time.time() - t0 > to: return False
-        time.sleep(0.05)
+        time.sleep(0.0003)
     return True
 
 class Broker:
@@ -187,7 +187,7 @@ def main():
             while time.time() - t0 < 20:
                 got = cat(ws, "/tmp/reply")
                 if got: break
-                time.sleep(0.05)
+                time.sleep(0.0003)
             dt = time.time() - t0
             want = "REPLY-FOR-%s" % tag
             if got != want:

@@ -79,7 +79,7 @@ def wake(dirpath, snap_path, sockname, esock):
     t0 = time.time()
     p = launch(dirpath, "fork.log")
     sk = os.path.join(dirpath, sockname)
-    while not os.path.exists(sk) and time.time() - t0 < 30: time.sleep(0.02)
+    while not os.path.exists(sk) and time.time() - t0 < 30: time.sleep(0.0003)
     return p, uc(sk), t0
 
 def main():
@@ -98,7 +98,7 @@ def main():
         bp = launch(base, "boot.log"); procs.append(bp)
         csk = os.path.join(base, "c.sock")
         t0 = time.time()
-        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.1)
+        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.0003)
         s = uc(csk)
         for _ in range(120):
             if "ready" in cmd(s, "echo ready", 5): break
@@ -154,7 +154,7 @@ def main():
         while time.time() - t_first < 15.0:
             if "T3-PRESENT" in cmd(fs, "test -f /tmp/t3 && echo T3-PRESENT || echo T3-ABSENT", 8):
                 t3_seen = time.time(); break
-            time.sleep(0.1)
+            time.sleep(0.0003)
         if t3_seen is None:
             fails.append("armed timer never fired after wake")
         else:

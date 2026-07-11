@@ -150,7 +150,7 @@ def main():
         bp = launch(base, "boot.log"); procs.append(bp)
         csk = os.path.join(base, "c.sock")
         t0 = time.time()
-        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.1)
+        while not os.path.exists(csk) and time.time() - t0 < 40: time.sleep(0.0003)
         s = uc(csk)
         for _ in range(120):
             if "ready" in cmd(s, "echo ready", 5): break
@@ -169,7 +169,7 @@ def main():
         # 3. The slow request: guest blocks in recv(); broker parks the conn (no reply).
         cmd(s, SLOW, 10)
         t0 = time.time()
-        while not broker.fresh and time.time() - t0 < 15: time.sleep(0.05)
+        while not broker.fresh and time.time() - t0 < 15: time.sleep(0.0003)
         if not broker.fresh:
             fails.append("broker never saw the slow request"); raise SystemExit
         parked_id = [k for k in broker.fresh if b"/slow" in broker.fresh[k]][0]
@@ -206,13 +206,13 @@ def main():
         t_restore = time.time()
         fp = launch(fork, "fork.log"); procs.append(fp)
         fsk = os.path.join(fork, "f.sock")
-        while not os.path.exists(fsk) and time.time() - t_restore < 30: time.sleep(0.05)
+        while not os.path.exists(fsk) and time.time() - t_restore < 30: time.sleep(0.0003)
         fs = uc(fsk)
         got = ""
         while time.time() - t_restore < 25:
             got = cat(fs, "/tmp/reply")
             if NONCE in got: break
-            time.sleep(0.1)
+            time.sleep(0.0003)
         t_done = time.time()
         print("[wake] guest /tmp/reply: %r" % got)
         print("[wake] restore->reply-delivered: %.3fs (parked %.1fs total)" % (t_done - t_restore, t_done - t_parked))
@@ -251,7 +251,7 @@ def main():
         cmd(fs, SLOW2, 10)
         t0 = time.time()
         while not any(b"/slow2" in v for v in broker.fresh.values()) and time.time() - t0 < 15:
-            time.sleep(0.05)
+            time.sleep(0.0003)
         if not any(b"/slow2" in v for v in broker.fresh.values()):
             fails.append("broker never saw the gen-2 slow request"); raise SystemExit
         time.sleep(1.0)  # settle into recv()/WFI
@@ -270,13 +270,13 @@ def main():
         t_r2 = time.time()
         f3 = launch(fork3, "fork3.log"); procs.append(f3)
         f3sk = os.path.join(fork3, "f3.sock")
-        while not os.path.exists(f3sk) and time.time() - t_r2 < 30: time.sleep(0.05)
+        while not os.path.exists(f3sk) and time.time() - t_r2 < 30: time.sleep(0.0003)
         f3s = uc(f3sk)
         got2 = ""
         while time.time() - t_r2 < 25:
             got2 = cat(f3s, "/tmp/reply2")
             if NONCE2 in got2: break
-            time.sleep(0.1)
+            time.sleep(0.0003)
         print("[gen2] guest /tmp/reply2: %r (wake2 %.3fs)" % (got2, time.time() - t_r2))
         if NONCE2 not in got2: fails.append("gen-2 recv() did not complete (got %r)" % got2)
         # Gen-1 state carried through BOTH parks: the first reply is still in the guest.

@@ -47,7 +47,7 @@ def wait_sock(path, timeout=40):
     t0 = time.time()
     while time.time() - t0 < timeout:
         if os.path.exists(path): return True
-        time.sleep(0.1)
+        time.sleep(0.0003)
     return False
 
 def hit(path, to=15):
@@ -137,7 +137,7 @@ def main():
                     first = hit(fdata, 5)
                     if first: break
                 except Exception: pass
-            time.sleep(0.05)
+            time.sleep(0.0003)
         dt = time.time() - t0
         fiid, freq = parse(first or "")
         print("[fork] first serve via fork.data: %r  (launch->serving %.3fs)" % (first, dt))
