@@ -129,7 +129,29 @@ def main():
             "restore=1\nrestore_from=%s\ncontrol_socket=fork.sock\ndata_socket=fork.data\napp_port=8080\n" % snap)
         t0 = time.time()
         fpz = launch(fork, "fork.log"); procs.append(fpz)
+        fctl = os.path.join(fork, "fork.sock")
         fdata = os.path.join(fork, "fork.data")
+
+        # 3a. restore -> DRIVEABLE: the moment the fork answers the control protocol
+        #     (__info__ round-trips), i.e. the VM is live and controllable. This is the bare
+        #     fork/restore latency (the headline number), measured BEFORE the in-guest app has
+        #     served anything - distinct from launch->serving (3b), which also includes the
+        #     guest app's own response time. The blocking recv in cmd() captures the exact
+        #     moment the control plane first answers, so the sub-ms poll only gates the socket
+        #     appearing, not the timing itself.
+        drive = None
+        while time.time() - t0 < 40:
+            if os.path.exists(fctl):
+                try:
+                    cs = uconn(fctl, 10); r = cmd(cs, "__info__"); cs.close()
+                    if r and "ERR" not in r: drive = r; break
+                except Exception: pass
+            time.sleep(0.0003)
+        t_drive = time.time() - t0
+        print("[fork] driveable (control __info__ answers): restore->driveable %.3fs" % t_drive)
+        if not drive: fails.append("FORK never became driveable (no __info__ response)")
+
+        # 3b. restore -> serving: the in-guest app serves its first request over the data socket.
         first = None
         while time.time() - t0 < 40:
             if os.path.exists(fdata):
