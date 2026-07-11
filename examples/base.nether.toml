@@ -64,7 +64,9 @@ kind = "base"       # base = durable, forks many. (park = one-shot, host-managed
 # compress = "none"   # [ships w/ storage work] "none" | "zstd". zstd trades disk for CPU AND
 #                     #   forfeits the ~10 ms lazy COW restore (a compressed RAM region can't be
 #                     #   mmap'd; it decompresses into anon memory). Bases only, never park.
-# base     = ""       # [pending impl, no HVF dependency] incremental: store only pages that
-#                     #   diverged from this base. HVF has no dirty-page log, so the mechanism is a
-#                     #   content-diff (memcmp vs the base at park). Rejected until the VMM ships it.
 # ttl_s    = 0        # retention seconds for transient snapshots (0 = none); park/ttl reaper
+#
+# NOTE: incremental diff (`base=`) is intentionally NOT a bake field. Per
+# docs/incremental-snapshot-spec.md the content-diff is a __park__-only optimization (a parked
+# fork has dirtied little RAM); a durable base bake always writes a full snapshot, so its
+# storage win is `sparse` above, not diff. The runner rejects `base` in a bake recipe.

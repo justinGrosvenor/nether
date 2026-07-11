@@ -61,10 +61,10 @@ example is [`examples/base.nether.toml`](../examples/base.nether.toml); the fiel
   [`docs/incremental-snapshot-spec.md`](incremental-snapshot-spec.md): `sparse` (zero pages
   as holes; near-free, default on), `compress` (`"none"`/`"zstd"`; note zstd trades disk for
   CPU *and forfeits the ~10 ms lazy restore*, since a compressed RAM region can't be COW-mmap'd,
-  so it's bases-only), `base` (incremental delta; HVF has no dirty-page log, so the mechanism is
-  a content-diff, `memcmp` of guest RAM against the base at park time, decided and landing with
-  the incremental work; the runner rejects it until the VMM ships it), and `ttl_s` (retention).
-  The recipe is where
+  so it's bases-only), and `ttl_s` (retention). Incremental diff (`base=`) is intentionally *not*
+  a bake field: per [`docs/incremental-snapshot-spec.md`](incremental-snapshot-spec.md) the
+  content-diff is a `__park__`-only optimization (a durable base always writes a full snapshot),
+  so a base bake's storage win is `sparse`, not diff. The recipe is where
   storage *policy* lives; the VMM implements the *mechanism*.
 
 ## The base is a cache, not an artifact you ship

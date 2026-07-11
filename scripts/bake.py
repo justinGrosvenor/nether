@@ -127,10 +127,10 @@ def validate_recipe(r):
     # dirty-page tracking: parse it, but fail closed until the mechanism ships, so a recipe
     # can't silently produce a full snapshot when it asked for a delta.
     if snap.get("base"):
-        die("[snapshot].base (incremental/diff) is decided but not yet implemented. HVF has no "
-            "dirty-page log, so the mechanism is a content-diff (memcmp guest RAM against the base "
-            "at park time, off the hot path), landing with the incremental-snapshot work. Rejected "
-            "until the VMM __snapshot__ path accepts it; use sparse instead, or drop it for a full base.")
+        die("[snapshot].base does not apply to a base bake. Per docs/incremental-snapshot-spec.md "
+            "the content-diff is a __park__-only optimization (kind=park, the platform's parked-fork "
+            "flow); a durable base (kind=base) always writes a full snapshot. Drop it; use sparse "
+            "(on by default) for base size reduction.")
     if snap.get("compress", "none") not in ("none", "zstd"):
         die('[snapshot].compress must be "none" or "zstd"')
     # files: must fit the __put__ cap; large assets belong in the initramfs or a disk file.
