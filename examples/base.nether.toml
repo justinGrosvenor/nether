@@ -64,6 +64,7 @@ kind = "base"       # base = durable, forks many. (park = one-shot, host-managed
 # compress = "none"   # [ships w/ storage work] "none" | "zstd". zstd trades disk for CPU AND
 #                     #   forfeits the ~10 ms lazy COW restore (a compressed RAM region can't be
 #                     #   mmap'd; it decompresses into anon memory). Bases only, never park.
-# base     = ""       # [GATED on HVF dirty-page tracking] incremental: store only pages that
-#                     #   diverged from this base. Rejected with a clear message until supported.
+# base     = ""       # [pending impl, no HVF dependency] incremental: store only pages that
+#                     #   diverged from this base. HVF has no dirty-page log, so the mechanism is a
+#                     #   content-diff (memcmp vs the base at park). Rejected until the VMM ships it.
 # ttl_s    = 0        # retention seconds for transient snapshots (0 = none); park/ttl reaper
