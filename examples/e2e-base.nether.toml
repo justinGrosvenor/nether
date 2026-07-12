@@ -1,0 +1,37 @@
+# e2e-base.nether.toml - the minimal base the e2e harness forks from.
+#
+# Deliberately bare: no app, no warm-up, no port gate. It boots the guest to the
+# agent and freezes. The SDK e2e drivers (nether-sdk-*/examples/e2e.py and the
+# NETHER_BIN-gated SDK tests) fork THIS base and exercise exec/put/get/snapshot
+# themselves, so the base only has to be a forkable warm guest that answers control.
+#
+# Baked by scripts/e2e.sh; you can also bake it by hand:
+#   ./scripts/bake.py bake examples/e2e-base.nether.toml
+#
+# The image files are whatever scripts/fetch-guest-image.sh (or your own build)
+# leaves in kernels/. initramfs.cpio.gz is the agent-capable initramfs.
+
+[image]
+# Paths resolve relative to THIS recipe file (bake.py makes recipes portable), so
+# reach up to the repo-root kernels/ that fetch-guest-image.sh populates.
+kernel = "../kernels/Image"
+initramfs = "../kernels/initramfs.cpio.gz"
+
+[resources]
+ram_mb = 512
+cpus = 1
+
+[disk]
+size_mb = 128
+
+[network]
+egress = "deny"
+
+[ready]
+# The guest is a bare agent (no app port), so gate on the agent executing a command
+# rather than a port. This avoids the discouraged fixed-settle fallback.
+command = "true"
+
+[snapshot]
+out = "e2e-base.snap"
+kind = "base"
