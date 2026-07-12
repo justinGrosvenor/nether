@@ -91,6 +91,8 @@ nav:
       - Sandbox policy: guide/sandbox-policy.md
       - Control protocol: control-protocol.md
       - Control protocol v2: control-protocol-v2.md
+      - Versioning & stability: versioning.md
+  - Security: security.md
   - Operations:
       - Bringup notes: bringup-notes.md
   - About:
