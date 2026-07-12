@@ -61,9 +61,8 @@ most. Two disciplines hold that line:
 - **Continuous fuzzing + adversarial review.** The guest-facing parsers (virtio
   transport and devices, the vsock protocol engine, the terminal parser, the
   snapshot-header decoder) run always-on fuzz smoke in the test suite, and the
-  guest→host surface is reviewed adversarially. The most recent pass fixed a
-  guest-triggerable use-after-free in the file-transfer path and closed several
-  resource-exhaustion edges (see the commit history).
+  guest→host surface is reviewed adversarially. Specific hardening fixes are
+  recorded in the [changelog](CHANGELOG.md).
 
 nether is pre-1.0 and has had **no external audit**. Don't run untrusted guests in
 production yet. But "malformed guest input must never corrupt the host" is a

@@ -24,9 +24,9 @@ breaking *out of* the guest is the thing we defend against.
   protocol engine, the terminal parser, the snapshot-header decoder) run always-on fuzz smoke
   in the test suite, alongside a black-box restore-parser mutation fuzzer. Fuzzing runs on
   every change, not as a one-off.
-- **Adversarial review.** The guest -> host surface is reviewed adversarially. The most
-  recent pass fixed a guest-triggerable use-after-free in the file-transfer path and closed
-  several resource-exhaustion edges (see the [changelog](https://github.com/justinGrosvenor/nether/blob/main/CHANGELOG.md)).
+- **Adversarial review.** The guest -> host surface is reviewed adversarially; specific
+  hardening fixes are recorded in the
+  [changelog](https://github.com/justinGrosvenor/nether/blob/main/CHANGELOG.md).
 - **Fail-closed formats.** A corrupt, truncated, or version-mismatched snapshot is rejected,
   not misread; the control protocol is versioned and self-describing. See
   [Versioning and stability](versioning.md).
