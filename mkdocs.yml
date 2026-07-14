@@ -1,6 +1,6 @@
 site_name: nether
 site_description: A type-2 hypervisor in Zig. Modern guests only. The isolation layer of the edge runtime.
-site_url: https://docs.nether.dev/
+site_url: https://justingrosvenor.github.io/nether/
 repo_url: https://github.com/justinGrosvenor/nether
 repo_name: justinGrosvenor/nether
 edit_uri: edit/main/docs/

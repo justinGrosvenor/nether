@@ -1,6 +1,6 @@
 # nether documentation
 
-Published at **[docs.nether.dev](https://docs.nether.dev)** via MkDocs Material.
+Published at **[justingrosvenor.github.io/nether](https://justingrosvenor.github.io/nether/)** via MkDocs Material.
 
 ## Local preview
 

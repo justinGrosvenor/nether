@@ -1,6 +1,6 @@
 name: docs
 
-# Publishes the docs site to GitHub Pages (docs.nether.dev) on any docs change.
+# Publishes the docs site to GitHub Pages on any docs change.
 on:
   push:
     branches: [main]
