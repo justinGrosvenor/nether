@@ -7,7 +7,7 @@ written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapsh
 into fresh VMs in **~10 ms** each, resuming exactly where the image froze, even
 mid-request. It runs in the layer below the guest, hence the name.
 
-**Documentation:** in [`docs/`](docs/index.md). For the non-technical version of why this matters, see [nether in one page](docs/nether-for-execs.md).
+**Documentation:** [justingrosvenor.github.io/nether](https://justingrosvenor.github.io/nether/) (source in [`docs/`](docs/index.md)). For the non-technical version of why this matters, see [nether in one page](docs/nether-for-execs.md).
 
 ## The idea
 
