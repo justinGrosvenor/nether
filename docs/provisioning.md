@@ -38,7 +38,7 @@ directly; the declarative recipe is the ergonomic front door.
 ## The recipe
 
 The recipe is TOML (stdlib, no dependency, matching nether's zero-dep build). The annotated
-example is [`examples/base.nether.toml`](../examples/base.nether.toml); the fields:
+example is [`examples/base.nether.toml`](https://github.com/justinGrosvenor/nether/blob/main/examples/base.nether.toml); the fields:
 
 - **`[image]`** `kernel`, `initramfs`: the capability layer. Paths resolve relative to the
   recipe file.

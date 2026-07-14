@@ -1,7 +1,7 @@
 # Reproducing the claims
 
 Every latency and behavior claim in the README and design docs has a live proof
-script under [`scripts/`](../scripts/). This page is the index: what each proves and
+script under [`scripts/`](https://github.com/justinGrosvenor/nether/tree/main/scripts). This page is the index: what each proves and
 how to run it.
 
 > **These are live HVF proofs.** They boot real guests on Apple Hypervisor.framework,

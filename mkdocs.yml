@@ -87,15 +87,20 @@ nav:
       - Running on KVM: running-on-kvm.md
       - Code signing: codesigning.md
   - Guide:
+      - Forking a VM: forking.md
+      - Provisioning base VMs: provisioning.md
       - Source layout: architecture.md
       - Sandbox policy: guide/sandbox-policy.md
       - Control protocol: control-protocol.md
       - Control protocol v2: control-protocol-v2.md
+      - Incremental snapshots: incremental-snapshot-spec.md
       - Versioning & stability: versioning.md
   - Security: security.md
   - Operations:
+      - Reproducing the claims: reproducing.md
       - Bringup notes: bringup-notes.md
   - About:
+      - nether in one page: nether-for-execs.md
       - Design: design.md
       - Roadmap: roadmap.md
       - Decisions: decisions.md

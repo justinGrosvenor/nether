@@ -1,16 +1,14 @@
 name: docs
 
-# Auto-publish disabled: we are not publishing the docs site yet. The workflow is
-# kept but runs only on manual dispatch. To resume auto-publish on docs changes,
-# restore the push trigger below.
+# Publishes the docs site to GitHub Pages (docs.nether.dev) on any docs change.
 on:
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - "docs/**"
-  #     - "mkdocs.yml"
-  #     - "docs/requirements.txt"
-  #     - ".github/workflows/docs.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "docs/requirements.txt"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
