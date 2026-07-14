@@ -11,8 +11,9 @@ version surfaces (release, snapshot format, control protocol).
 
 ## [Unreleased]
 
-The first public cut, grouped by capability rather than by commit. No release has been
-tagged yet; when `0.1.0` is cut this becomes its notes.
+## [0.1.0] - 2026-07-14
+
+The first public cut, grouped by capability rather than by commit.
 
 ### Added
 - **Snapshot -> COW fork -> park/resume on Apple Hypervisor.framework.** Capture a running
