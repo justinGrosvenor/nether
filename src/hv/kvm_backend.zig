@@ -83,6 +83,32 @@ pub const Vm = struct {
         return host[0..size];
     }
 
+    /// Map guest RAM copy-on-write from a snapshot image (MAP_PRIVATE of `fd` at
+    /// `file_off`) and register it as guest physical memory at `guest_phys`. A fork
+    /// shares the image's pages and only copies what the guest writes - the fast
+    /// restore path (no full RAM read). The image's RAM region must be page-aligned
+    /// (kvm_snapshot writes it so); holes read back as shared zero pages.
+    pub fn mapMemoryCow(self: *Vm, slot: u32, guest_phys: u64, size: usize, fd: i32, file_off: u64) Error![]u8 {
+        const addr = try sys(linux.mmap(
+            null,
+            size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE },
+            fd,
+            @intCast(file_off),
+        ), "mmap cow guest ram");
+        const host: [*]u8 = @ptrFromInt(addr);
+        const region = kvm.UserspaceMemoryRegion{
+            .slot = slot,
+            .flags = 0,
+            .guest_phys_addr = guest_phys,
+            .memory_size = size,
+            .userspace_addr = addr,
+        };
+        _ = try kvm.ioctl(self.vm_fd, kvm.SET_USER_MEMORY_REGION, @intFromPtr(&region));
+        return host[0..size];
+    }
+
     pub fn unmapMemory(self: *Vm, host: []u8) void {
         _ = self;
         _ = linux.munmap(host.ptr, host.len);

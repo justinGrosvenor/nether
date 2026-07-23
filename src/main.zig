@@ -130,10 +130,30 @@ fn linuxMain() !void {
     // Split irqchip: in-kernel LAPIC, userspace IOAPIC/PIC. Before any vCPU.
     try vm.enableSplitIrqchip();
 
-    // The memory map is the single source of truth; register every RAM region
-    // it produces. Low RAM holds the boot blob.
+    // Restore? Open the snapshot image up front so guest RAM can be mapped
+    // COPY-ON-WRITE from it (the fork shares the base's pages and copies only what
+    // it writes - the fast restore path) instead of allocated anonymous and read in.
+    const ksnap = @import("hv/kvm_snapshot.zig");
+    const restore_mode = modeOn("restore", "nether-restore");
+    var restore_rpath_buf: [512]u8 = undefined;
+    const restore_rpath: [*:0]const u8 = if (confGet("restore_from", &restore_rpath_buf)) |p| @ptrCast(p.ptr) else "nether.snap";
+    var restore_img: ?ksnap.Image = if (restore_mode) (ksnap.Image.load(restore_rpath) catch |err| {
+        std.debug.print("[nether] restore: cannot open image {s}: {s}\n", .{ restore_rpath, @errorName(err) });
+        return err;
+    }) else null;
+    defer if (restore_img) |*img| img.deinit();
+
+    // The memory map is the single source of truth; register every RAM region it
+    // produces. On restore, low RAM is COW-mapped from the image (holes read as
+    // shared zero pages); otherwise it is anonymous and the boot blob loads into it.
     const layout = nether.memmap.Layout.compute(GUEST_RAM_SIZE);
-    const low = try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
+    const low = if (restore_img) |*img| blk: {
+        if (img.ram_size != layout.ram_low.size or layout.ram_high != null) {
+            std.debug.print("[nether] restore: image RAM {d} != region {d} bytes (or multi-region); unsupported\n", .{ img.ram_size, layout.ram_low.size });
+            return error.SnapshotRamMismatch;
+        }
+        break :blk try vm.addMemoryCow(0, layout.ram_low.base, @intCast(img.ram_size), img.fd, img.ram_off);
+    } else try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
 
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
@@ -308,12 +328,10 @@ fn linuxMain() !void {
 
     // Snapshot/restore (KVM/x86 cross-process fork). The quiesce rendezvous is
     // shared by every vCPU so a capture thread can park them out of KVM_RUN; set it
-    // before any vCPU runs.
-    const ksnap = @import("hv/kvm_snapshot.zig");
+    // before any vCPU runs. (The restore image was opened above so RAM is COW-mapped.)
     const kbk = @import("hv/kvm_backend.zig");
     var snap_pause = kbk.Pause{};
     for (0..num_cpus) |i| vcpus[i].pause = &snap_pause;
-    const restore_mode = modeOn("restore", "nether-restore");
 
     // The virtio devices whose transport state a fork carries so a restored sandbox
     // is driveable: the control plane over vsock (transport + engine + the live agent
@@ -330,19 +348,13 @@ fn linuxMain() !void {
     // guest, or run the demo blob. Restore reuses all the device/memory setup above
     // and only swaps the kernel load for re-establishing RAM + vCPU + clock state.
     const kernel: ?[]u8 = if (restore_mode) null else readFile(allocator, "vmlinux") catch null;
-    if (restore_mode) {
-        var rpath_buf: [512]u8 = undefined;
-        const rpath: [*:0]const u8 = if (confGet("restore_from", &rpath_buf)) |p| @ptrCast(p.ptr) else "nether.snap";
-        var img = ksnap.Image.load(rpath) catch |err| {
-            std.debug.print("[nether] restore: cannot open image: {s}\n", .{@errorName(err)});
-            return err;
-        };
-        defer img.deinit();
+    if (restore_img) |*img| {
+        // RAM is already COW-mapped from the image (above); restore the rest of the
+        // guest state over it - vCPUs, the paravirt clock, the IOAPIC, and devices.
         if (img.num_cpus != num_cpus) {
             std.debug.print("[nether] restore: image has {d} vCPUs, config has {d}\n", .{ img.num_cpus, num_cpus });
             return error.SnapshotCpuMismatch;
         }
-        try img.readRam(low);
         for (0..num_cpus) |i| {
             var cs = try img.cpu(@intCast(i));
             try vcpus[i].restoreState(&cs);
@@ -372,7 +384,7 @@ fn linuxMain() !void {
                 if (control_on) core.agent.conn_id.store(db.conn_id, .release);
             }
         }
-        std.debug.print("[nether] restore: forked from {s} ({d} vCPUs, {d} MiB RAM, devs=0x{x} agent_conn={d})\n", .{ rpath, num_cpus, img.ram_size / (1024 * 1024), db.flags, db.conn_id });
+        std.debug.print("[nether] restore: COW-forked from {s} ({d} vCPUs, {d} MiB RAM, devs=0x{x} agent_conn={d})\n", .{ restore_rpath, num_cpus, img.ram_size / (1024 * 1024), db.flags, db.conn_id });
     } else if (kernel) |k| {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;

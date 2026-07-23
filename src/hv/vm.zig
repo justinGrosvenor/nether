@@ -57,6 +57,18 @@ pub const Vm = struct {
         return host;
     }
 
+    /// Like addMemory, but map the region copy-on-write from a snapshot image file
+    /// (a fork shares the base's pages, copying only what the guest writes). Backend
+    /// support is required (KVM MAP_PRIVATE of the image fd); the region table owns
+    /// the returned slice for teardown the same as an anonymous region.
+    pub fn addMemoryCow(self: *Vm, slot: u32, guest_phys: u64, size: usize, fd: i32, file_off: u64) ![]u8 {
+        if (self.region_count == max_regions) return error.TooManyRegions;
+        const host = try self.hv.mapMemoryCow(slot, guest_phys, size, fd, file_off);
+        self.regions[self.region_count] = .{ .slot = slot, .guest_phys = guest_phys, .host = host };
+        self.region_count += 1;
+        return host;
+    }
+
     /// Return a host slice for the guest physical range, or NotMapped.
     fn guestSlice(self: *Vm, gpa: u64, len: usize) Error![]u8 {
         for (self.regions[0..self.region_count]) |r| {
