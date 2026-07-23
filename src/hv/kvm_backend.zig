@@ -22,6 +22,10 @@ const writeValue = hvtypes.writeValue;
 
 const Error = hvtypes.Error || kvm.Error;
 
+// libc usleep (linked on every target): a short off-core wait while an AP spins on
+// EAGAIN in the pre-SIPI window. Matches the usleep idiom used elsewhere in the tree.
+extern "c" fn usleep(usec: c_uint) c_int;
+
 fn sys(r: usize, comptime what: []const u8) Error!usize {
     return switch (linux.errno(r)) {
         .SUCCESS => r,
@@ -260,6 +264,20 @@ pub const Vcpu = struct {
                         .reset => .reset,
                         .shutdown => .shutdown,
                     };
+                    continue;
+                },
+                .AGAIN => {
+                    // A not-yet-RUNNABLE vCPU (an AP still UNINITIALIZED / INIT_RECEIVED,
+                    // waiting for the BSP's SIPI). KVM_RUN does NOT block for it - it
+                    // returns EAGAIN after trying to accept pending APIC events. So
+                    // re-enter: KVM promotes the AP to RUNNABLE and starts it at the SIPI
+                    // vector once the BSP sends it. A short sleep keeps the pre-SIPI wait
+                    // off a busy core (the AP runs normally, no EAGAIN, once it is up).
+                    if (power.action) |a| return switch (a) {
+                        .reset => .reset,
+                        .shutdown => .shutdown,
+                    };
+                    _ = usleep(200);
                     continue;
                 },
                 else => |e| {
