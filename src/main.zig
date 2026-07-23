@@ -173,8 +173,10 @@ fn linuxMain() !void {
     // guest claims it via the ACPI _CRS), and completions delivered by MSI-X.
     var blk: nether.VirtioBlk = undefined;
     var blk_dev: nether.virtio.Device = undefined;
+    var blk_present = false;
     var msi_sink = MsiSink{ .vm_fd = vm.hv.vm_fd };
     if (mapFile("disk.img")) |disk| {
+        blk_present = true;
         blk = .{ .disk = disk };
         blk_dev = nether.virtio.Device.init(blk.backend(), .{ .bytes = low, .base = layout.ram_low.base });
         blk_dev.assignBar(nether.memmap.pci_mmio32_base);
@@ -313,6 +315,17 @@ fn linuxMain() !void {
     for (0..num_cpus) |i| vcpus[i].pause = &snap_pause;
     const restore_mode = modeOn("restore", "nether-restore");
 
+    // The virtio devices whose transport state a fork carries so a restored sandbox
+    // is driveable: the control plane over vsock (transport + engine + the live agent
+    // connection id), plus net and blk. Only the present ones are captured/restored.
+    const snap_devs = ksnap.Devices{
+        .blk = if (blk_present) &blk_dev else null,
+        .vsock_dev = if (vsock_on) &vs_dev else null,
+        .net_dev = if (net_running) &net_dev else null,
+        .vsock_engine = vsock_engine,
+        .conn_id = if (control_on) &core.agent.conn_id else null,
+    };
+
     // Boot a PVH kernel, RESTORE a snapshot image over the (already device-wired)
     // guest, or run the demo blob. Restore reuses all the device/memory setup above
     // and only swaps the kernel load for re-establishing RAM + vCPU + clock state.
@@ -337,7 +350,29 @@ fn linuxMain() !void {
         const clk = try img.clock();
         vm.hv.setClock(&clk) catch {};
         ioapic.redir = try img.redir();
-        std.debug.print("[nether] restore: forked from {s} ({d} vCPUs, {d} MiB RAM)\n", .{ rpath, num_cpus, img.ram_size / (1024 * 1024) });
+
+        // Restore virtio transport state so the guest's drivers resume mid-operation.
+        // Each device is imported only if BOTH the image captured it and this process
+        // wired the same device (the fork must be launched with a matching config).
+        const db = try img.devices();
+        if (db.blk) |s| {
+            if (blk_present) blk_dev.importState(&s);
+        }
+        if (db.net_dev) |s| {
+            if (net_running) net_dev.importState(&s);
+        }
+        if (db.vs_dev) |s| {
+            if (vsock_on) {
+                vs_dev.importState(&s);
+                if (db.vsock) |es| {
+                    if (vsock_engine) |ve| ve.importState(&es);
+                }
+                // The agent's live vsock connection survives the fork: adopt the saved
+                // conn id so the restored control plane drives immediately (no reconnect).
+                if (control_on) core.agent.conn_id.store(db.conn_id, .release);
+            }
+        }
+        std.debug.print("[nether] restore: forked from {s} ({d} vCPUs, {d} MiB RAM, devs=0x{x} agent_conn={d})\n", .{ rpath, num_cpus, img.ram_size / (1024 * 1024), db.flags, db.conn_id });
     } else if (kernel) |k| {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
@@ -474,10 +509,10 @@ fn linuxMain() !void {
     // selects the output (default nether.snap).
     if (modeOn("snapshot", "nether-snapshot")) {
         const Saver = struct {
-            fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, p: [*:0]const u8, delay_s: u32) void {
+            fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, devs: ksnap.Devices, p: [*:0]const u8, delay_s: u32) void {
                 var s: u32 = 0;
                 while (s < delay_s) : (s += 1) _ = usleep(1_000_000);
-                ksnap.capture(&vmp.hv, vlist, ram, ap, pz, p) catch |err| {
+                ksnap.capture(&vmp.hv, vlist, ram, ap, pz, devs, p) catch |err| {
                     std.debug.print("[nether] snapshot failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -488,7 +523,7 @@ fn linuxMain() !void {
         const delay: u32 = @intCast(confGetInt("snapshot_after_s", 8));
         var spath_buf: [512]u8 = undefined;
         const spath: [*:0]const u8 = if (confGet("snapshot_path", &spath_buf)) |pp| @ptrCast(pp.ptr) else "nether.snap";
-        if (std.Thread.spawn(.{}, Saver.run, .{ &vm, vcpus[0..num_cpus], low, &ioapic, &snap_pause, spath, delay })) |t| t.detach() else |_| {}
+        if (std.Thread.spawn(.{}, Saver.run, .{ &vm, vcpus[0..num_cpus], low, &ioapic, &snap_pause, snap_devs, spath, delay })) |t| t.detach() else |_| {}
     }
 
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
