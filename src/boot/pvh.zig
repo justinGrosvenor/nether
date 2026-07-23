@@ -11,6 +11,7 @@ const vmm = @import("../hv/vm.zig");
 
 pub const magic = 0x336ec578; // XEN_HVM_START_MAGIC_VALUE
 pub const E820_RAM = 1;
+pub const E820_RESERVED = 2;
 
 // Low-memory layout for boot structures (all below the 1 MiB kernel load).
 const gdt_addr = 0x1000;
@@ -54,14 +55,21 @@ pub fn buildStartInfo(
     // start_info block (56 B) are all fixed. If the whole thing would not fit `buf`, fail
     // instead of running the @memcpy below past the caller's buffer - on the boot path buf
     // is a fixed [1024]u8, so a ~976+ byte cmdline would otherwise overrun the stack.
-    const fixed_max: usize = 2 * 24 + 1 + 7 + 32 + 7 + 56; // memmap + nul + align + module + align + si
+    const fixed_max: usize = 3 * 24 + 1 + 7 + 32 + 7 + 56; // memmap (<=3) + nul + align + module + align + si
     if (cmdline.len + fixed_max > buf.len) return error.CmdlineTooLong;
     @memset(buf, 0);
     var pos: usize = 0;
 
     const memmap_off = pos;
     var entries: u32 = 0;
-    writeMemmapEntry(buf, &pos, layout.ram_low.base, layout.ram_low.size, E820_RAM);
+    // Split the top page of low RAM out as an E820 RESERVED entry for the VM
+    // Generation ID GUID buffer: the kernel won't allocate it, but (unlike an absent
+    // hole) it stays known reserved memory the vmgenid driver can memremap from the
+    // DSDT VGEN.ADDR (memmap.vmgenid_addr).
+    const low_usable = layout.ram_low.size - memmap.vmgenid_page;
+    writeMemmapEntry(buf, &pos, layout.ram_low.base, low_usable, E820_RAM);
+    entries += 1;
+    writeMemmapEntry(buf, &pos, memmap.vmgenid_addr, memmap.vmgenid_page, E820_RESERVED);
     entries += 1;
     if (layout.ram_high) |hi| {
         writeMemmapEntry(buf, &pos, hi.base, hi.size, E820_RAM);

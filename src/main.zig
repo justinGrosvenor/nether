@@ -156,6 +156,12 @@ fn linuxMain() !void {
     } else try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
 
+    // Seed the VM Generation ID GUID (top reserved page). Every VM gets fresh host
+    // entropy; on restore this writes into the fork's private COW copy, diverging it
+    // from the captured base, and the GPE0 pulse in the restore branch below makes
+    // the guest's vmgenid driver reseed the CRNG (fork entropy divergence).
+    writeVmgenid(low);
+
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
     var ioapic = nether.IoApic{ .vm_fd = vm.hv.vm_fd };
 
@@ -174,6 +180,7 @@ fn linuxMain() !void {
     serial.mirror_lock = &console_lock;
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
+    var gpe_blk = nether.Gpe{ .apic = &ioapic }; // GPE0: the vmgenid fork-signal SCI
     var reset = nether.Reset{ .power = &power };
     var fw = nether.FwCfg{};
 
@@ -183,6 +190,7 @@ fn linuxMain() !void {
     try bus.addPio(serial.device());
     try bus.addPio(rtc.device());
     try bus.addPio(pm.device());
+    try bus.addPio(gpe_blk.device());
     try bus.addPio(reset.device());
     try bus.addPio(fw.device());
     try bus.addMmio(ioapic.mmioDevice()); // userspace IOAPIC at 0xFEC00000
@@ -383,6 +391,14 @@ fn linuxMain() !void {
                 // conn id so the restored control plane drives immediately (no reconnect).
                 if (control_on) core.agent.conn_id.store(db.conn_id, .release);
             }
+        }
+        // Fork entropy divergence: a fresh GUID was already written to this fork's
+        // private COW page; pulse GPE0 so the guest's vmgenid driver sees the change
+        // and reseeds the CRNG on resume. Two siblings get distinct GUIDs, so their
+        // random streams diverge from the first post-fork draw. fork_reseed=0 opts out.
+        if (confGetInt("fork_reseed", 1) != 0) {
+            gpe_blk.signal(nether.Gpe.FORK_BIT);
+            std.debug.print("[nether] fork crng reseed armed (fresh vmgenid GUID + GPE0/SCI pulse)\n", .{});
         }
         std.debug.print("[nether] restore: COW-forked from {s} ({d} vCPUs, {d} MiB RAM, devs=0x{x} agent_conn={d})\n", .{ restore_rpath, num_cpus, img.ram_size / (1024 * 1024), db.flags, db.conn_id });
     } else if (kernel) |k| {
@@ -592,6 +608,19 @@ fn webInput(ctx: *anyopaque, bytes: []const u8) void {
 /// True if a `nether-web` marker file is present in the working directory.
 fn webEnabled() bool {
     return markerPresent("nether-web");
+}
+
+/// Write a fresh 16-byte VM Generation ID (host entropy) into the reserved GUID
+/// page at the top of guest RAM. The guest's stock vmgenid driver reads it via the
+/// DSDT VGEN.ADDR; a fork gets a distinct GUID here (in its private COW page).
+fn writeVmgenid(ram: []u8) void {
+    const off: usize = @intCast(nether.memmap.vmgenid_addr);
+    if (off + 16 > ram.len) return;
+    var guid: [16]u8 = undefined;
+    const fd = linux.open("/dev/urandom", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    if (linux.read(@intCast(fd), &guid, 16) == 16) @memcpy(ram[off..][0..16], &guid);
 }
 
 fn markerPresent(path: [*:0]const u8) bool {
