@@ -86,7 +86,8 @@ pub fn capture(
     apic: *const ioapic.IoApic,
     pause: *kb.Pause,
     devs: Devices,
-    path: [*:0]const u8,
+    fd: c_int,
+    resume_after: bool,
 ) Error!void {
     if (vcpus.len > MAX_SNAP_CPUS) return error.TooManyCpus;
     // Quiesce: ask every vCPU to leave KVM_RUN, kick each with the force-exit
@@ -106,11 +107,59 @@ pub fn capture(
     for (vcpus, 0..) |*v, i| states[i] = v.saveState() catch return error.WriteFailed;
     const clk = vm.getClock() catch kvm.ClockData{ .clock = 0, .flags = 0 };
 
-    const err = writeImage(path, ram, states[0..vcpus.len], clk, apic.redir, devs);
+    const err = writeImageToFd(fd, ram, states[0..vcpus.len], clk, apic.redir, devs);
 
-    // Resume the guest (a no-op for the guest if the caller now exits).
-    pause.request.store(false, .release);
+    // __snapshot__ resumes the guest (a base captured live); __park__ leaves it
+    // quiesced (the caller exits, so the image is the guest's last live moment - no
+    // divergence window).
+    if (resume_after) pause.request.store(false, .release);
     return err;
+}
+
+/// Everything the control-plane __snapshot__/__park__ commands need to capture the
+/// running guest on demand. Wired into ControlCtx.snapshot/.park in linuxMain.
+pub const SnapCtx = struct {
+    vm: *kb.Vm,
+    vcpus: []kb.Vcpu,
+    ram: []u8,
+    apic: *const ioapic.IoApic,
+    pause: *kb.Pause,
+    devs: Devices,
+};
+
+/// __snapshot__: capture a fork-source base to the (jailed, caller-opened) fd and
+/// RESUME the guest. Matches platform.Snapshotter.func.
+pub fn snapshotCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
+    _ = path; // the caller already opened the fd inside the transfer jail
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    capture(ctx.vm, ctx.vcpus, ctx.ram, ctx.apic, ctx.pause, ctx.devs, fd, true) catch return false;
+    return true;
+}
+
+/// __park__: capture WITHOUT resuming (the control handler bills and exits after).
+pub fn parkCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
+    _ = path;
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    capture(ctx.vm, ctx.vcpus, ctx.ram, ctx.apic, ctx.pause, ctx.devs, fd, false) catch return false;
+    return true;
+}
+
+/// Capture to a path this function opens (the `snapshot=1` timed-thread path, which
+/// has no caller-provided fd). Opens O_CREAT|O_TRUNC and closes on return.
+pub fn captureToPath(
+    vm: *kb.Vm,
+    vcpus: []kb.Vcpu,
+    ram: []const u8,
+    apic: *const ioapic.IoApic,
+    pause: *kb.Pause,
+    devs: Devices,
+    path: [*:0]const u8,
+    resume_after: bool,
+) Error!void {
+    const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    if (fd < 0) return error.WriteFailed;
+    defer _ = close(fd);
+    try capture(vm, vcpus, ram, apic, pause, devs, fd, resume_after);
 }
 
 /// The fixed metadata following the header: per-vCPU state, the paravirt clock,
@@ -166,10 +215,24 @@ pub fn writeImage(
     redir: [NUM_GSI]u64,
     devs: Devices,
 ) Error!void {
-    const ram_off = alignUp(HDR + metaLen(@intCast(cpus.len), devs), PAGE);
     const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
     if (fd < 0) return error.WriteFailed;
     defer _ = close(fd);
+    try writeImageToFd(fd, ram, cpus, clock, redir, devs);
+}
+
+/// Write the image to an already-open, writable, truncated fd (the control-plane
+/// __snapshot__/__park__ path opens it through the transfer-jail dirfd for TOCTOU
+/// safety and owns its close/cleanup). Does not close the fd.
+pub fn writeImageToFd(
+    fd: c_int,
+    ram: []const u8,
+    cpus: []const CpuState,
+    clock: kvm.ClockData,
+    redir: [NUM_GSI]u64,
+    devs: Devices,
+) Error!void {
+    const ram_off = alignUp(HDR + metaLen(@intCast(cpus.len), devs), PAGE);
 
     // Header.
     try wr32(fd, 0, MAGIC);

@@ -464,6 +464,17 @@ fn linuxMain() !void {
     // the same shared helpers as the HVF path, with the KVM force-exit injected as the
     // Stop. (No virtio-gpu on the KVM path yet, so .gpu = null / gpu = false.)
     var kvm_stop = KvmStop{ .power = &power, .vcpu = vcpu };
+    // On-demand base capture for the control protocol: __snapshot__ (capture a
+    // fork-source base, guest resumes) and __park__ (capture + exit). Same devices
+    // and quiesce rendezvous the timed snapshot thread uses.
+    var kvm_snap_ctx = ksnap.SnapCtx{
+        .vm = &vm.hv,
+        .vcpus = vcpus[0..num_cpus],
+        .ram = low,
+        .apic = &ioapic,
+        .pause = &snap_pause,
+        .devs = snap_devs,
+    };
     var ctl_ctx: control.ControlCtx = undefined; // stable storage for the listener/relay threads
     if (control_on) {
         control.startControl(&ctl_ctx, .{
@@ -473,6 +484,8 @@ fn linuxMain() !void {
             .journal = &core.journal,
             .gpu = null,
             .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
+            .snapshot = .{ .ctx = &kvm_snap_ctx, .func = ksnap.snapshotCall },
+            .park = .{ .ctx = &kvm_snap_ctx, .func = ksnap.parkCall },
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
@@ -524,7 +537,7 @@ fn linuxMain() !void {
             fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, devs: ksnap.Devices, p: [*:0]const u8, delay_s: u32) void {
                 var s: u32 = 0;
                 while (s < delay_s) : (s += 1) _ = usleep(1_000_000);
-                ksnap.capture(&vmp.hv, vlist, ram, ap, pz, devs, p) catch |err| {
+                ksnap.captureToPath(&vmp.hv, vlist, ram, ap, pz, devs, p, false) catch |err| {
                     std.debug.print("[nether] snapshot failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
