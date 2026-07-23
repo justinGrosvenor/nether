@@ -62,15 +62,22 @@ pub fn buildStartInfo(
 
     const memmap_off = pos;
     var entries: u32 = 0;
-    // Split the top page of low RAM out as an E820 RESERVED entry for the VM
-    // Generation ID GUID buffer: the kernel won't allocate it, but (unlike an absent
-    // hole) it stays known reserved memory the vmgenid driver can memremap from the
-    // DSDT VGEN.ADDR (memmap.vmgenid_addr).
-    const low_usable = layout.ram_low.size - memmap.vmgenid_page;
-    writeMemmapEntry(buf, &pos, layout.ram_low.base, low_usable, E820_RAM);
-    entries += 1;
-    writeMemmapEntry(buf, &pos, memmap.vmgenid_addr, memmap.vmgenid_page, E820_RESERVED);
-    entries += 1;
+    // If the vmgenid GUID page falls inside low RAM, split it out as an E820
+    // RESERVED entry: the kernel won't allocate it, but (unlike an absent hole) it
+    // stays known reserved memory the vmgenid driver can memremap from the DSDT
+    // VGEN.ADDR. The runtime guest is 256 MiB, so vmgenid_addr (its top page) is in
+    // range; a smaller guest that can't hold it just gets low RAM whole.
+    const vg = memmap.vmgenid_addr;
+    const lo = layout.ram_low;
+    if (vg >= lo.base and vg + memmap.vmgenid_page <= lo.base + lo.size) {
+        writeMemmapEntry(buf, &pos, lo.base, vg - lo.base, E820_RAM);
+        entries += 1;
+        writeMemmapEntry(buf, &pos, vg, memmap.vmgenid_page, E820_RESERVED);
+        entries += 1;
+    } else {
+        writeMemmapEntry(buf, &pos, lo.base, lo.size, E820_RAM);
+        entries += 1;
+    }
     if (layout.ram_high) |hi| {
         writeMemmapEntry(buf, &pos, hi.base, hi.size, E820_RAM);
         entries += 1;
