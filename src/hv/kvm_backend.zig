@@ -398,6 +398,10 @@ pub const Vcpu = struct {
                         .reset => .reset,
                         .shutdown => .shutdown,
                     };
+                    // Park for a snapshot quiesce even while an AP still spins for its
+                    // SIPI, so a capture racing early SMP bring-up cannot hang waiting
+                    // for a vCPU that never leaves this loop.
+                    if (self.pause) |p| if (p.request.load(.acquire)) p.wait();
                     _ = usleep(200);
                     continue;
                 },
