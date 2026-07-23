@@ -20,7 +20,10 @@ BB_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
 
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
-mkdir -p "$ROOT/bin" "$OUT"
+# The mountpoint dirs MUST exist in the initramfs or the init's mounts silently fail
+# (busybox `mount` does not create the target). Without /sys the init can't even find
+# the NIC (`ls /sys/class/net`), so networking never comes up - the KVM "no eth" symptom.
+mkdir -p "$ROOT"/{bin,proc,sys,dev,etc,tmp} "$OUT"
 
 echo "[guest-x86] fetching static busybox"
 curl -fSL "$BB_URL" -o "$ROOT/bin/busybox"
@@ -34,6 +37,7 @@ echo "[guest-x86] writing /init"
 cat > "$ROOT/init" <<'SH'
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
+mkdir -p /proc /sys /dev /etc /tmp
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null

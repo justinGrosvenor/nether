@@ -86,8 +86,8 @@ pub fn unmapFile(s: []const u8) void {
 /// (SO_SNDTIMEO). Used on control-client sockets so a wedged consumer that stops reading
 /// cannot make the relay's write block forever - and thereby stall the pipe -> agent ->
 /// vCPU chain that would freeze the guest. A timed-out write returns short/EAGAIN, which
-/// the relay treats as "drop this client". BSD/macOS socket-option values; on Linux this
-/// is a graceful no-op (wrong constants -> setsockopt errors, ignored) until the port.
+/// the relay treats as "drop this client". Socket-option constants and the timeval
+/// layout are both selected per-OS, so this is active on macOS AND Linux.
 pub fn setSendTimeout(fd: c_int, ms: u32) void {
     const SOL_SOCKET: c_int = if (builtin.os.tag == .macos) 0xffff else 1;
     const SO_SNDTIMEO: c_int = if (builtin.os.tag == .macos) 0x1005 else 21;
@@ -202,8 +202,14 @@ pub fn peerUid(fd: c_int) ?u32 {
     }
 }
 
-// macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
-const timeval = extern struct { sec: i64, usec: i32 };
+// timeval: tv_sec is time_t (i64) on both ABIs; tv_usec is suseconds_t - i32 on
+// macOS, but `long` (i64) on Linux x86_64. Hardcoding i32 leaves the high 32 bits
+// of tv_usec as uninitialized padding on Linux, which makes the kernel reject
+// setsockopt(SO_SNDTIMEO) (EDOM: tv_usec parsed as >= USEC_PER_SEC) so the send
+// timeout is silently never set and a blocked write hangs forever. Match each ABI
+// (same split as RuTimeval below); sizeof stays 16 on both.
+const Suseconds = if (builtin.os.tag == .macos) i32 else i64;
+const timeval = extern struct { sec: i64, usec: Suseconds };
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
 
 pub fn nowMs() i64 {

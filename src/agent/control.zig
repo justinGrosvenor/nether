@@ -2510,6 +2510,16 @@ test "peerUid returns the owner uid for a local socketpair" {
     try testing.expectEqual(libc.getuid(), peer.?);
 }
 
+// Non-blocking drain of `fd` into `got`, advancing `*glen`. `fd` must be O_NONBLOCK so an
+// empty socket returns EAGAIN (r < 0) rather than blocking.
+fn drainReadInto(fd: c_int, got: []u8, glen: *usize) void {
+    while (glen.* < got.len) {
+        const r = libc.read(fd, @ptrCast(got[glen.*..].ptr), got.len - glen.*);
+        if (r <= 0) break; // EAGAIN (nothing buffered right now) or EOF
+        glen.* += @intCast(r);
+    }
+}
+
 test "data-plane delivery ring is byte-exact across many wraparounds" {
     // The bridge's per-conn ring (bufAppend/bufDrain) is the lossless-delivery core: onRw
     // buffers into it, the device thread + pump drain it non-blocking to the unix socket.
@@ -2519,10 +2529,11 @@ test "data-plane delivery ring is byte-exact across many wraparounds" {
     if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
-    hostutil.setNonblock(fds[0]); // read end: so the final drain-check read returns EAGAIN, not blocks
+    hostutil.setNonblock(fds[0]); // read end: drainReadInto returns EAGAIN, never blocks
     hostutil.setNonblock(fds[1]); // write end: bufDrain uses trySend (must be non-blocking)
-    hostutil.setSendBuf(fds[1], 4 << 20); // hold the whole test's bytes without a reader
 
+    var got: [80 * 1024]u8 = undefined;
+    var glen: usize = 0;
     var ring: [64]u8 = undefined; // small -> forces frequent wraparound
     var br = DataBridge{ .vsdev = undefined, .path = undefined }; // rate_bps=0: unlimited (no pacing)
     var e = DataBridge.Entry{ .active = true, .unix_fd = fds[1], .buf = &ring };
@@ -2543,16 +2554,19 @@ test "data-plane delivery ring is byte-exact across many wraparounds" {
         @memcpy(expected[elen..][0..n], chunk[0..n]);
         elen += n;
         _ = br.bufDrain(&e, true); // opportunistic non-blocking drain (like the device thread)
+        // Read as we go. A non-reading peer's AF_UNIX receive queue is bounded by per-skb
+        // truesize, not payload: on Linux it wedges after only a few KiB (macOS holds far
+        // more), so draining continuously is both correct and closer to a real consumer.
+        drainReadInto(fds[0], got[0..], &glen);
     }
-    while (e.bc > 0) if (br.bufDrain(&e, false) == 0) break; // final flush (like teardown)
+    // Final flush (like teardown), interleaving reads so a full socket can't stall the drain.
+    var guard: usize = 0;
+    while (e.bc > 0 and guard < 100_000) : (guard += 1) {
+        _ = br.bufDrain(&e, false);
+        drainReadInto(fds[0], got[0..], &glen);
+    }
+    drainReadInto(fds[0], got[0..], &glen);
 
-    var got: [80 * 1024]u8 = undefined;
-    var glen: usize = 0;
-    while (true) {
-        const r = libc.read(fds[0], @ptrCast(got[glen..].ptr), got.len - glen);
-        if (r <= 0) break; // EAGAIN once drained
-        glen += @intCast(r);
-    }
     try testing.expectEqualSlices(u8, expected[0..elen], got[0..glen]);
 }
 

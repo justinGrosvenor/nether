@@ -12,30 +12,46 @@
 //! guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3, /24.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Lock = @import("../common/lock.zig").Lock;
 
-// Host BSD sockets for outbound NAT (no privilege required). Portable libc; the
-// NAT path only runs on the macOS/HVF net path, but the bindings compile anywhere.
+// Host BSD/POSIX sockets for outbound NAT (no privilege required). This path runs
+// on BOTH backends now (slirp is the default net stack on macOS/HVF AND Linux/KVM),
+// so the option constants and the sockaddr_in / timeval layouts must be selected
+// per-OS - the values differ, and a macOS-shaped sockaddr_in makes connect() fail
+// with EAFNOSUPPORT on Linux (sin_family misread), silently breaking all outbound NAT.
+const is_macos = builtin.os.tag == .macos;
 const sock = struct {
     const AF_INET: c_int = 2;
     const SOCK_STREAM: c_int = 1;
     const SOCK_DGRAM: c_int = 2;
-    const F_SETFL: c_int = 4;
-    const O_NONBLOCK: c_int = 0x0004; // macOS
+    const F_SETFL: c_int = 4; // same on macOS + Linux
+    const O_NONBLOCK: c_int = if (is_macos) 0x0004 else 0o4000;
     const POLLIN: c_short = 0x0001;
     const POLLOUT: c_short = 0x0004;
-    const SOL_SOCKET: c_int = 0xffff; // macOS
-    const SO_ERROR: c_int = 0x1007; // macOS
+    const SOL_SOCKET: c_int = if (is_macos) 0xffff else 1;
+    const SO_ERROR: c_int = if (is_macos) 0x1007 else 4;
     const SHUT_WR: c_int = 1;
 
-    // macOS sockaddr_in (note the leading sin_len byte).
-    const sockaddr_in = extern struct {
-        len: u8 = 16,
-        family: u8 = AF_INET,
-        port: u16 = 0, // network byte order
-        addr: u32 = 0, // network byte order
-        zero: [8]u8 = .{0} ** 8,
-    };
+    // sockaddr_in: BSD/macOS carries a leading sin_len byte and a u8 sin_family;
+    // Linux has no sin_len and a u16 sin_family at offset 0. Both are 16 bytes, but
+    // the family lands at a different offset, so the layout must match each ABI or
+    // connect()/sendto() see a bogus address family. Both expose `.port`/`.addr`.
+    const sockaddr_in = if (is_macos)
+        extern struct {
+            len: u8 = 16,
+            family: u8 = AF_INET,
+            port: u16 = 0, // network byte order
+            addr: u32 = 0, // network byte order
+            zero: [8]u8 = .{0} ** 8,
+        }
+    else
+        extern struct {
+            family: u16 = AF_INET,
+            port: u16 = 0, // network byte order
+            addr: u32 = 0, // network byte order
+            zero: [8]u8 = .{0} ** 8,
+        };
     const pollfd = extern struct { fd: c_int, events: c_short, revents: c_short = 0 };
 
     extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
@@ -49,8 +65,9 @@ const sock = struct {
     extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
 };
 
-// macOS timeval: tv_sec is time_t (i64), tv_usec is suseconds_t (i32).
-const timeval = extern struct { sec: i64, usec: i32 };
+// timeval: tv_sec is time_t (i64) on both; tv_usec is suseconds_t - i32 on macOS,
+// `long` (i64) on Linux x86_64. Match each ABI so gettimeofday writes the field we read.
+const timeval = extern struct { sec: i64, usec: if (is_macos) i32 else i64 };
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
 fn nowMs() u64 {
     var tv: timeval = .{ .sec = 0, .usec = 0 };
