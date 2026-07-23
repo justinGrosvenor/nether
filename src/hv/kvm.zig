@@ -45,6 +45,26 @@ pub const SET_SREGS = iow(0x84, Sregs);
 pub const GET_MP_STATE = ior(0x98, MpState);
 pub const SET_MP_STATE = iow(0x99, MpState);
 
+// --- snapshot: full vCPU + VM state capture/restore ------------------------
+// The ioctls that enumerate every architectural register so a guest can be
+// serialized and re-created in a fresh process (cross-process fork). kvm_msrs is
+// variable-length like kvm_cpuid2, so its ioctl encodes only the 8-byte header.
+pub const GET_MSRS = ioc(IOC_READ | IOC_WRITE, 0x88, 8);
+pub const SET_MSRS = ioc(IOC_WRITE, 0x89, 8);
+pub const GET_LAPIC = ior(0x8e, LapicState);
+pub const SET_LAPIC = iow(0x8f, LapicState);
+pub const GET_VCPU_EVENTS = ior(0x9f, VcpuEvents);
+pub const SET_VCPU_EVENTS = iow(0xa0, VcpuEvents);
+pub const GET_DEBUGREGS = ior(0xa1, Debugregs);
+pub const SET_DEBUGREGS = iow(0xa2, Debugregs);
+pub const GET_XSAVE = ior(0xa4, Xsave);
+pub const SET_XSAVE = iow(0xa5, Xsave);
+pub const GET_XCRS = ior(0xa6, Xcrs);
+pub const SET_XCRS = iow(0xa7, Xcrs);
+// VM-level (fd = vm_fd): the paravirt clock, for TSC/kvmclock continuity.
+pub const GET_CLOCK = ior(0x7c, ClockData);
+pub const SET_CLOCK = iow(0x7b, ClockData);
+
 pub const CHECK_EXTENSION = io(0x03);
 // kvm_cpuid2 is variable-length; the ioctl number encodes only the 8-byte header.
 pub const GET_SUPPORTED_CPUID = ioc(IOC_READ | IOC_WRITE, 0x05, 8);
@@ -258,6 +278,88 @@ pub const Msi = extern struct {
     pad: [12]u8,
 };
 
+// --- snapshot state structures (must match kernel layout) ------------------
+
+pub const MsrEntry = extern struct { index: u32, reserved: u32 = 0, data: u64 = 0 };
+
+/// kvm_msrs with inline capacity. `nmsrs` is the populated count; the kernel
+/// reads/writes that many entries. GET returns how many it actually filled.
+pub const Msrs = extern struct {
+    nmsrs: u32,
+    pad: u32 = 0,
+    entries: [MSR_SAVE_LIST.len]MsrEntry = undefined,
+};
+
+/// MSRs saved/restored across a fork. The SYSCALL/SYSENTER path, segment bases,
+/// PAT, the TSC, and the KVM paravirt-clock MSRs (system-time/wall-clock) are the
+/// ones a Linux guest depends on; missing the clock MSRs corrupts guest time.
+pub const MSR_SAVE_LIST = [_]u32{
+    0x00000010, // IA32_TSC
+    0x0000001b, // IA32_APIC_BASE
+    0x00000174, // IA32_SYSENTER_CS
+    0x00000175, // IA32_SYSENTER_ESP
+    0x00000176, // IA32_SYSENTER_EIP
+    0x00000277, // IA32_CR_PAT
+    0xc0000080, // EFER
+    0xc0000081, // STAR
+    0xc0000082, // LSTAR
+    0xc0000083, // CSTAR
+    0xc0000084, // SYSCALL_MASK (SFMASK)
+    0xc0000100, // FS_BASE
+    0xc0000101, // GS_BASE
+    0xc0000102, // KERNEL_GS_BASE
+    0x4b564d00, // MSR_KVM_WALL_CLOCK_NEW
+    0x4b564d01, // MSR_KVM_SYSTEM_TIME_NEW
+};
+
+/// kvm_lapic_state: the in-kernel local APIC register page.
+pub const LapicState = extern struct { regs: [1024]u8 };
+
+/// kvm_xsave: FPU/SSE/AVX (and beyond) extended state. The fixed 4 KiB form.
+pub const Xsave = extern struct { region: [1024]u32 };
+
+pub const Xcr = extern struct { xcr: u32, reserved: u32 = 0, value: u64 = 0 };
+pub const Xcrs = extern struct {
+    nr_xcrs: u32,
+    flags: u32 = 0,
+    xcrs: [16]Xcr = undefined,
+    padding: [16]u64 = [_]u64{0} ** 16,
+};
+
+/// kvm_vcpu_events: pending exception/interrupt/NMI/SMI injection state.
+pub const VcpuEvents = extern struct {
+    exception: extern struct { injected: u8, nr: u8, has_error_code: u8, pending: u8, error_code: u32 },
+    interrupt: extern struct { injected: u8, nr: u8, soft: u8, shadow: u8 },
+    nmi: extern struct { injected: u8, pending: u8, masked: u8, pad: u8 },
+    sipi_vector: u32,
+    flags: u32,
+    smi: extern struct { smm: u8, pending: u8, smm_inside_nmi: u8, latched_init: u8 },
+    reserved: [27]u8,
+    exception_has_payload: u8,
+    exception_payload: u64,
+};
+
+/// kvm_debugregs: DR0-DR3, DR6, DR7.
+pub const Debugregs = extern struct {
+    db: [4]u64,
+    dr6: u64,
+    dr7: u64,
+    flags: u64,
+    reserved: [9]u64,
+};
+
+/// kvm_clock_data: the paravirt clock value (VM-level). Current kernels carry
+/// realtime + host_tsc after pad0 (used for cross-host clock reconstruction);
+/// the struct is 48 bytes, and the ioctl number encodes that size.
+pub const ClockData = extern struct {
+    clock: u64,
+    flags: u32,
+    pad0: u32 = 0,
+    realtime: u64 = 0,
+    host_tsc: u64 = 0,
+    pad: [4]u32 = [_]u32{0} ** 4,
+};
+
 // --- ioctl wrapper ---------------------------------------------------------
 
 pub const Error = error{IoctlFailed};
@@ -307,6 +409,31 @@ test "interrupt struct sizes match kernel" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Irqfd));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Ioeventfd));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Msi));
+}
+
+test "snapshot struct sizes match kernel" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MsrEntry));
+    try std.testing.expectEqual(@as(usize, 1024), @sizeOf(LapicState));
+    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(Xsave));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Xcr));
+    try std.testing.expectEqual(@as(usize, 392), @sizeOf(Xcrs));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(VcpuEvents));
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(Debugregs));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(ClockData));
+}
+
+test "snapshot ioctl numbers match KVM ABI" {
+    try std.testing.expectEqual(@as(u32, 0xC008AE88), GET_MSRS);
+    try std.testing.expectEqual(@as(u32, 0x4008AE89), SET_MSRS);
+    try std.testing.expectEqual(@as(u32, 0x8400AE8E), GET_LAPIC);
+    try std.testing.expectEqual(@as(u32, 0x4400AE8F), SET_LAPIC);
+    try std.testing.expectEqual(@as(u32, 0x8040AE9F), GET_VCPU_EVENTS);
+    try std.testing.expectEqual(@as(u32, 0x4040AEA0), SET_VCPU_EVENTS);
+    try std.testing.expectEqual(@as(u32, 0x8080AEA1), GET_DEBUGREGS);
+    try std.testing.expectEqual(@as(u32, 0x9000AEA4), GET_XSAVE);
+    try std.testing.expectEqual(@as(u32, 0x8188AEA6), GET_XCRS);
+    try std.testing.expectEqual(@as(u32, 0x8030AE7C), GET_CLOCK);
+    try std.testing.expectEqual(@as(u32, 0x4030AE7B), SET_CLOCK);
 }
 
 test "interrupt ioctl numbers match KVM ABI" {

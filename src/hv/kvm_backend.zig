@@ -96,6 +96,19 @@ pub const Vm = struct {
     pub fn createVcpu(self: *Vm, id: u32) Error!Vcpu {
         return Vcpu.init(self.kvm_fd, self.vm_fd, id);
     }
+
+    /// Read the paravirt (kvmclock) value. VM-level, captured once per snapshot so
+    /// the guest's notion of time is continuous across a fork instead of jumping.
+    pub fn getClock(self: *Vm) Error!kvm.ClockData {
+        var c: kvm.ClockData = undefined;
+        _ = try kvm.ioctl(self.vm_fd, kvm.GET_CLOCK, @intFromPtr(&c));
+        return c;
+    }
+
+    /// Restore the paravirt clock captured by getClock.
+    pub fn setClock(self: *Vm, c: *const kvm.ClockData) Error!void {
+        _ = try kvm.ioctl(self.vm_fd, kvm.SET_CLOCK, @intFromPtr(&c.*));
+    }
 };
 
 // Force-exit signal: a watchdog / control thread sends this to the vCPU thread to
@@ -182,6 +195,67 @@ pub const Vcpu = struct {
         var mp: kvm.MpState = undefined;
         _ = try kvm.ioctl(self.fd, kvm.GET_MP_STATE, @intFromPtr(&mp));
         return mp.mp_state;
+    }
+
+    /// The full architectural state of one vCPU, serialized for a snapshot. Every
+    /// field is a fixed-size kernel struct, so a CpuState is memcpy-able straight
+    /// into a snapshot image (no pointers, no allocation). Mirrors the HVF backend's
+    /// CpuState role, for the x86/KVM cross-process fork path.
+    pub const CpuState = extern struct {
+        regs: kvm.Regs,
+        sregs: kvm.Sregs,
+        xsave: kvm.Xsave,
+        xcrs: kvm.Xcrs,
+        debugregs: kvm.Debugregs,
+        lapic: kvm.LapicState,
+        events: kvm.VcpuEvents,
+        mp_state: u32,
+        msr_count: u32,
+        msrs: [kvm.MSR_SAVE_LIST.len]kvm.MsrEntry,
+    };
+
+    /// Capture every architectural register of this vCPU. Must run on a quiesced
+    /// vCPU (out of KVM_RUN) so the kernel state is settled.
+    pub fn saveState(self: *Vcpu) Error!CpuState {
+        var s: CpuState = undefined;
+        _ = try kvm.ioctl(self.fd, kvm.GET_REGS, @intFromPtr(&s.regs));
+        _ = try kvm.ioctl(self.fd, kvm.GET_SREGS, @intFromPtr(&s.sregs));
+        _ = try kvm.ioctl(self.fd, kvm.GET_XSAVE, @intFromPtr(&s.xsave));
+        _ = try kvm.ioctl(self.fd, kvm.GET_XCRS, @intFromPtr(&s.xcrs));
+        _ = try kvm.ioctl(self.fd, kvm.GET_DEBUGREGS, @intFromPtr(&s.debugregs));
+        _ = try kvm.ioctl(self.fd, kvm.GET_LAPIC, @intFromPtr(&s.lapic));
+        _ = try kvm.ioctl(self.fd, kvm.GET_VCPU_EVENTS, @intFromPtr(&s.events));
+        var mp: kvm.MpState = undefined;
+        _ = try kvm.ioctl(self.fd, kvm.GET_MP_STATE, @intFromPtr(&mp));
+        s.mp_state = mp.mp_state;
+        // MSRs: pre-fill the index list, ask the kernel to fill the data. GET_MSRS
+        // returns the count it actually read (it stops at the first unreadable one),
+        // so record that and restore exactly as many.
+        var msrs: kvm.Msrs = .{ .nmsrs = kvm.MSR_SAVE_LIST.len };
+        inline for (kvm.MSR_SAVE_LIST, 0..) |idx, i| msrs.entries[i] = .{ .index = idx };
+        const got = try kvm.ioctl(self.fd, kvm.GET_MSRS, @intFromPtr(&msrs));
+        s.msr_count = @intCast(got);
+        s.msrs = msrs.entries;
+        return s;
+    }
+
+    /// Re-establish this vCPU's architectural state from a snapshot. Order matters:
+    /// sregs (CR4.OSXSAVE, EFER) then XCR0 before XSAVE so extended components are
+    /// interpreted correctly; mp_state last so the vCPU is only made RUNNABLE once
+    /// every register is in place.
+    pub fn restoreState(self: *Vcpu, s: *const CpuState) Error!void {
+        _ = try kvm.ioctl(self.fd, kvm.SET_SREGS, @intFromPtr(&s.sregs));
+        _ = try kvm.ioctl(self.fd, kvm.SET_XCRS, @intFromPtr(&s.xcrs));
+        _ = try kvm.ioctl(self.fd, kvm.SET_XSAVE, @intFromPtr(&s.xsave));
+        var msrs: kvm.Msrs = .{ .nmsrs = s.msr_count };
+        @memcpy(msrs.entries[0..], s.msrs[0..]);
+        _ = try kvm.ioctl(self.fd, kvm.SET_MSRS, @intFromPtr(&msrs));
+        _ = try kvm.ioctl(self.fd, kvm.SET_REGS, @intFromPtr(&s.regs));
+        _ = try kvm.ioctl(self.fd, kvm.SET_DEBUGREGS, @intFromPtr(&s.debugregs));
+        _ = try kvm.ioctl(self.fd, kvm.SET_LAPIC, @intFromPtr(&s.lapic));
+        _ = try kvm.ioctl(self.fd, kvm.SET_VCPU_EVENTS, @intFromPtr(&s.events));
+        var mp = kvm.MpState{ .mp_state = s.mp_state };
+        _ = try kvm.ioctl(self.fd, kvm.SET_MP_STATE, @intFromPtr(&mp));
     }
 
     /// Put the vCPU in 16-bit real mode with execution starting at `ip`. CS base
