@@ -125,11 +125,30 @@ fn installForceExitHandler() void {
     std.posix.sigaction(FORCE_EXIT_SIG, &act, null);
 }
 
+/// Snapshot quiesce rendezvous. To capture a consistent image the orchestrator
+/// must get every vCPU OUT of KVM_RUN (so it can GET the vCPU fd's state) and hold
+/// it there while RAM + registers are serialized. It sets `request`, kicks each
+/// vCPU thread with FORCE_EXIT_SIG (requestExit), and waits until `parked` reaches
+/// the vCPU count; each vCPU's run loop, kicked to EINTR, bumps `parked` and spins
+/// until `request` clears, then resumes exactly where it was. Cross-process fork
+/// captures once and exits, so resume is only used by an in-process snapshot.
+pub const Pause = struct {
+    request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    parked: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn wait(self: *Pause) void {
+        _ = self.parked.fetchAdd(1, .acq_rel);
+        while (self.request.load(.acquire)) _ = usleep(50);
+        _ = self.parked.fetchSub(1, .acq_rel);
+    }
+};
+
 pub const Vcpu = struct {
     fd: i32,
     run_page: *kvm.Run,
     run_mem: []u8,
     run_thread: std.c.pthread_t = undefined, // set at run() start, for requestExit()
+    pause: ?*Pause = null, // snapshot quiesce rendezvous (null = no snapshotting)
 
     /// Force this vCPU out of a blocking KVM_RUN (called from another thread). Pairs
     /// with the run loop's EINTR handling; the caller sets the power action first.
@@ -333,11 +352,13 @@ pub const Vcpu = struct {
                 .SUCCESS => {},
                 .INTR => {
                     // A force-exit signal kicked us out of KVM_RUN. Honor a pending
-                    // power request (shutdown/reset); otherwise re-enter the guest.
+                    // power request (shutdown/reset); park for a snapshot quiesce if
+                    // one is in progress; otherwise re-enter the guest.
                     if (power.action) |a| return switch (a) {
                         .reset => .reset,
                         .shutdown => .shutdown,
                     };
+                    if (self.pause) |p| if (p.request.load(.acquire)) p.wait();
                     continue;
                 },
                 .AGAIN => {

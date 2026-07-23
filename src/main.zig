@@ -304,9 +304,41 @@ fn linuxMain() !void {
     defer for (vcpus[0..num_cpus]) |*v| v.deinit();
     const vcpu = &vcpus[0]; // the BSP
 
-    // Boot a PVH kernel if `vmlinux` is present; otherwise run the demo blob.
-    const kernel: ?[]u8 = readFile(allocator, "vmlinux") catch null;
-    if (kernel) |k| {
+    // Snapshot/restore (KVM/x86 cross-process fork). The quiesce rendezvous is
+    // shared by every vCPU so a capture thread can park them out of KVM_RUN; set it
+    // before any vCPU runs.
+    const ksnap = @import("hv/kvm_snapshot.zig");
+    const kbk = @import("hv/kvm_backend.zig");
+    var snap_pause = kbk.Pause{};
+    for (0..num_cpus) |i| vcpus[i].pause = &snap_pause;
+    const restore_mode = modeOn("restore", "nether-restore");
+
+    // Boot a PVH kernel, RESTORE a snapshot image over the (already device-wired)
+    // guest, or run the demo blob. Restore reuses all the device/memory setup above
+    // and only swaps the kernel load for re-establishing RAM + vCPU + clock state.
+    const kernel: ?[]u8 = if (restore_mode) null else readFile(allocator, "vmlinux") catch null;
+    if (restore_mode) {
+        var rpath_buf: [512]u8 = undefined;
+        const rpath: [*:0]const u8 = if (confGet("restore_from", &rpath_buf)) |p| @ptrCast(p.ptr) else "nether.snap";
+        var img = ksnap.Image.load(rpath) catch |err| {
+            std.debug.print("[nether] restore: cannot open image: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        defer img.deinit();
+        if (img.num_cpus != num_cpus) {
+            std.debug.print("[nether] restore: image has {d} vCPUs, config has {d}\n", .{ img.num_cpus, num_cpus });
+            return error.SnapshotCpuMismatch;
+        }
+        try img.readRam(low);
+        for (0..num_cpus) |i| {
+            var cs = try img.cpu(@intCast(i));
+            try vcpus[i].restoreState(&cs);
+        }
+        const clk = try img.clock();
+        vm.hv.setClock(&clk) catch {};
+        ioapic.redir = try img.redir();
+        std.debug.print("[nether] restore: forked from {s} ({d} vCPUs, {d} MiB RAM)\n", .{ rpath, num_cpus, img.ram_size / (1024 * 1024) });
+    } else if (kernel) |k| {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
         defer if (initramfs) |fs| allocator.free(fs);
@@ -434,6 +466,29 @@ fn linuxMain() !void {
             }
         }
         std.debug.print("[nether] SMP: {d} vCPUs (BSP + {d} APs)\n", .{ num_cpus, num_cpus - 1 });
+    }
+
+    // Snapshot SAVE: `snapshot=1` arms a thread that, after `snapshot_after_s`
+    // seconds, quiesces the guest, writes the image, and exits the process - the
+    // image IS the guest (mirrors the HVF nether-snapshot-save path). `snapshot_path`
+    // selects the output (default nether.snap).
+    if (modeOn("snapshot", "nether-snapshot")) {
+        const Saver = struct {
+            fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, p: [*:0]const u8, delay_s: u32) void {
+                var s: u32 = 0;
+                while (s < delay_s) : (s += 1) _ = usleep(1_000_000);
+                ksnap.capture(&vmp.hv, vlist, ram, ap, pz, p) catch |err| {
+                    std.debug.print("[nether] snapshot failed: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+                std.debug.print("[nether] snapshot written to {s}; exiting\n", .{p});
+                std.process.exit(0);
+            }
+        };
+        const delay: u32 = @intCast(confGetInt("snapshot_after_s", 8));
+        var spath_buf: [512]u8 = undefined;
+        const spath: [*:0]const u8 = if (confGet("snapshot_path", &spath_buf)) |pp| @ptrCast(pp.ptr) else "nether.snap";
+        if (std.Thread.spawn(.{}, Saver.run, .{ &vm, vcpus[0..num_cpus], low, &ioapic, &snap_pause, spath, delay })) |t| t.detach() else |_| {}
     }
 
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
