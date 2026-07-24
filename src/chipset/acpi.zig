@@ -10,6 +10,7 @@
 const std = @import("std");
 const memmap = @import("../mem/memmap.zig");
 const pm = @import("../chipset/pm.zig");
+const gpe = @import("../chipset/gpe.zig");
 
 const oem_id = [6]u8{ 'N', 'E', 'T', 'H', 'E', 'R' };
 const oem_table = [8]u8{ 'N', 'E', 'T', 'H', 'E', 'R', '0', ' ' };
@@ -85,9 +86,11 @@ fn writeFadt(b: []u8, dsdt_addr: u64, facs_addr: u64) usize {
     w32(b, 56, pm.Pm.base); // PM1a_EVT_BLK
     w32(b, 64, pm.Pm.base + 4); // PM1a_CNT_BLK
     w32(b, 76, pm.Pm.base + 8); // PM_TMR_BLK
+    w32(b, 80, gpe.Gpe.base); // GPE0_BLK (fork-signal general purpose events)
     b[88] = 4; // PM1_EVT_LEN
     b[89] = 2; // PM1_CNT_LEN
     b[91] = 4; // PM_TMR_LEN
+    b[92] = 2; // GPE0_BLK_LEN (1 status + 1 enable byte, GPE bits 0..7)
     b[108] = 0x32; // CENTURY (RTC century register index)
     w32(b, 112, 1 << 10); // Flags: RESET_REG_SUP
     writeGas(b, 116, 1, 8, 1, 0xCF9); // RESET_REG = SystemIO 0xCF9
@@ -98,6 +101,7 @@ fn writeFadt(b: []u8, dsdt_addr: u64, facs_addr: u64) usize {
     writeGas(b, 148, 1, 32, 3, pm.Pm.base); // X_PM1a_EVT_BLK
     writeGas(b, 172, 1, 16, 2, pm.Pm.base + 4); // X_PM1a_CNT_BLK
     writeGas(b, 208, 1, 32, 3, pm.Pm.base + 8); // X_PM_TMR_BLK
+    writeGas(b, 220, 1, 16, 1, gpe.Gpe.base); // X_GPE0_BLK (SystemIO, 16 bits)
     finalizeSdt(b, len);
     return len;
 }

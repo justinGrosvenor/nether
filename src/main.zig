@@ -130,11 +130,37 @@ fn linuxMain() !void {
     // Split irqchip: in-kernel LAPIC, userspace IOAPIC/PIC. Before any vCPU.
     try vm.enableSplitIrqchip();
 
-    // The memory map is the single source of truth; register every RAM region
-    // it produces. Low RAM holds the boot blob.
+    // Restore? Open the snapshot image up front so guest RAM can be mapped
+    // COPY-ON-WRITE from it (the fork shares the base's pages and copies only what
+    // it writes - the fast restore path) instead of allocated anonymous and read in.
+    const ksnap = @import("hv/kvm_snapshot.zig");
+    const restore_mode = modeOn("restore", "nether-restore");
+    var restore_rpath_buf: [512]u8 = undefined;
+    const restore_rpath: [*:0]const u8 = if (confGet("restore_from", &restore_rpath_buf)) |p| @ptrCast(p.ptr) else "nether.snap";
+    var restore_img: ?ksnap.Image = if (restore_mode) (ksnap.Image.load(restore_rpath) catch |err| {
+        std.debug.print("[nether] restore: cannot open image {s}: {s}\n", .{ restore_rpath, @errorName(err) });
+        return err;
+    }) else null;
+    defer if (restore_img) |*img| img.deinit();
+
+    // The memory map is the single source of truth; register every RAM region it
+    // produces. On restore, low RAM is COW-mapped from the image (holes read as
+    // shared zero pages); otherwise it is anonymous and the boot blob loads into it.
     const layout = nether.memmap.Layout.compute(GUEST_RAM_SIZE);
-    const low = try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
+    const low = if (restore_img) |*img| blk: {
+        if (img.ram_size != layout.ram_low.size or layout.ram_high != null) {
+            std.debug.print("[nether] restore: image RAM {d} != region {d} bytes (or multi-region); unsupported\n", .{ img.ram_size, layout.ram_low.size });
+            return error.SnapshotRamMismatch;
+        }
+        break :blk try vm.addMemoryCow(0, layout.ram_low.base, @intCast(img.ram_size), img.fd, img.ram_off);
+    } else try vm.addMemory(0, layout.ram_low.base, layout.ram_low.size);
     if (layout.ram_high) |hi| _ = try vm.addMemory(1, hi.base, hi.size);
+
+    // Seed the VM Generation ID GUID (top reserved page). Every VM gets fresh host
+    // entropy; on restore this writes into the fork's private COW copy, diverging it
+    // from the captured base, and the GPE0 pulse in the restore branch below makes
+    // the guest's vmgenid driver reseed the CRNG (fork entropy divergence).
+    writeVmgenid(low);
 
     // Firmware floor: serial, RTC, the ACPI PM block, and the 0xCF9 reset port.
     var ioapic = nether.IoApic{ .vm_fd = vm.hv.vm_fd };
@@ -154,6 +180,7 @@ fn linuxMain() !void {
     serial.mirror_lock = &console_lock;
     var rtc = nether.Rtc{};
     var pm = nether.Pm{ .power = &power };
+    var gpe_blk = nether.Gpe{ .apic = &ioapic }; // GPE0: the vmgenid fork-signal SCI
     var reset = nether.Reset{ .power = &power };
     var fw = nether.FwCfg{};
 
@@ -163,6 +190,7 @@ fn linuxMain() !void {
     try bus.addPio(serial.device());
     try bus.addPio(rtc.device());
     try bus.addPio(pm.device());
+    try bus.addPio(gpe_blk.device());
     try bus.addPio(reset.device());
     try bus.addPio(fw.device());
     try bus.addMmio(ioapic.mmioDevice()); // userspace IOAPIC at 0xFEC00000
@@ -173,8 +201,10 @@ fn linuxMain() !void {
     // guest claims it via the ACPI _CRS), and completions delivered by MSI-X.
     var blk: nether.VirtioBlk = undefined;
     var blk_dev: nether.virtio.Device = undefined;
+    var blk_present = false;
     var msi_sink = MsiSink{ .vm_fd = vm.hv.vm_fd };
     if (mapFile("disk.img")) |disk| {
+        blk_present = true;
         blk = .{ .disk = disk };
         blk_dev = nether.virtio.Device.init(blk.backend(), .{ .bytes = low, .base = layout.ram_low.base });
         blk_dev.assignBar(nether.memmap.pci_mmio32_base);
@@ -306,30 +336,33 @@ fn linuxMain() !void {
 
     // Snapshot/restore (KVM/x86 cross-process fork). The quiesce rendezvous is
     // shared by every vCPU so a capture thread can park them out of KVM_RUN; set it
-    // before any vCPU runs.
-    const ksnap = @import("hv/kvm_snapshot.zig");
+    // before any vCPU runs. (The restore image was opened above so RAM is COW-mapped.)
     const kbk = @import("hv/kvm_backend.zig");
     var snap_pause = kbk.Pause{};
     for (0..num_cpus) |i| vcpus[i].pause = &snap_pause;
-    const restore_mode = modeOn("restore", "nether-restore");
+
+    // The virtio devices whose transport state a fork carries so a restored sandbox
+    // is driveable: the control plane over vsock (transport + engine + the live agent
+    // connection id), plus net and blk. Only the present ones are captured/restored.
+    const snap_devs = ksnap.Devices{
+        .blk = if (blk_present) &blk_dev else null,
+        .vsock_dev = if (vsock_on) &vs_dev else null,
+        .net_dev = if (net_running) &net_dev else null,
+        .vsock_engine = vsock_engine,
+        .conn_id = if (control_on) &core.agent.conn_id else null,
+    };
 
     // Boot a PVH kernel, RESTORE a snapshot image over the (already device-wired)
     // guest, or run the demo blob. Restore reuses all the device/memory setup above
     // and only swaps the kernel load for re-establishing RAM + vCPU + clock state.
     const kernel: ?[]u8 = if (restore_mode) null else readFile(allocator, "vmlinux") catch null;
-    if (restore_mode) {
-        var rpath_buf: [512]u8 = undefined;
-        const rpath: [*:0]const u8 = if (confGet("restore_from", &rpath_buf)) |p| @ptrCast(p.ptr) else "nether.snap";
-        var img = ksnap.Image.load(rpath) catch |err| {
-            std.debug.print("[nether] restore: cannot open image: {s}\n", .{@errorName(err)});
-            return err;
-        };
-        defer img.deinit();
+    if (restore_img) |*img| {
+        // RAM is already COW-mapped from the image (above); restore the rest of the
+        // guest state over it - vCPUs, the paravirt clock, the IOAPIC, and devices.
         if (img.num_cpus != num_cpus) {
             std.debug.print("[nether] restore: image has {d} vCPUs, config has {d}\n", .{ img.num_cpus, num_cpus });
             return error.SnapshotCpuMismatch;
         }
-        try img.readRam(low);
         for (0..num_cpus) |i| {
             var cs = try img.cpu(@intCast(i));
             try vcpus[i].restoreState(&cs);
@@ -337,7 +370,37 @@ fn linuxMain() !void {
         const clk = try img.clock();
         vm.hv.setClock(&clk) catch {};
         ioapic.redir = try img.redir();
-        std.debug.print("[nether] restore: forked from {s} ({d} vCPUs, {d} MiB RAM)\n", .{ rpath, num_cpus, img.ram_size / (1024 * 1024) });
+
+        // Restore virtio transport state so the guest's drivers resume mid-operation.
+        // Each device is imported only if BOTH the image captured it and this process
+        // wired the same device (the fork must be launched with a matching config).
+        const db = try img.devices();
+        if (db.blk) |s| {
+            if (blk_present) blk_dev.importState(&s);
+        }
+        if (db.net_dev) |s| {
+            if (net_running) net_dev.importState(&s);
+        }
+        if (db.vs_dev) |s| {
+            if (vsock_on) {
+                vs_dev.importState(&s);
+                if (db.vsock) |es| {
+                    if (vsock_engine) |ve| ve.importState(&es);
+                }
+                // The agent's live vsock connection survives the fork: adopt the saved
+                // conn id so the restored control plane drives immediately (no reconnect).
+                if (control_on) core.agent.conn_id.store(db.conn_id, .release);
+            }
+        }
+        // Fork entropy divergence: a fresh GUID was already written to this fork's
+        // private COW page; pulse GPE0 so the guest's vmgenid driver sees the change
+        // and reseeds the CRNG on resume. Two siblings get distinct GUIDs, so their
+        // random streams diverge from the first post-fork draw. fork_reseed=0 opts out.
+        if (confGetInt("fork_reseed", 1) != 0) {
+            gpe_blk.signal(nether.Gpe.FORK_BIT);
+            std.debug.print("[nether] fork crng reseed armed (fresh vmgenid GUID + GPE0/SCI pulse)\n", .{});
+        }
+        std.debug.print("[nether] restore: COW-forked from {s} ({d} vCPUs, {d} MiB RAM, devs=0x{x} agent_conn={d})\n", .{ restore_rpath, num_cpus, img.ram_size / (1024 * 1024), db.flags, db.conn_id });
     } else if (kernel) |k| {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
@@ -417,6 +480,17 @@ fn linuxMain() !void {
     // the same shared helpers as the HVF path, with the KVM force-exit injected as the
     // Stop. (No virtio-gpu on the KVM path yet, so .gpu = null / gpu = false.)
     var kvm_stop = KvmStop{ .power = &power, .vcpu = vcpu };
+    // On-demand base capture for the control protocol: __snapshot__ (capture a
+    // fork-source base, guest resumes) and __park__ (capture + exit). Same devices
+    // and quiesce rendezvous the timed snapshot thread uses.
+    var kvm_snap_ctx = ksnap.SnapCtx{
+        .vm = &vm.hv,
+        .vcpus = vcpus[0..num_cpus],
+        .ram = low,
+        .apic = &ioapic,
+        .pause = &snap_pause,
+        .devs = snap_devs,
+    };
     var ctl_ctx: control.ControlCtx = undefined; // stable storage for the listener/relay threads
     if (control_on) {
         control.startControl(&ctl_ctx, .{
@@ -426,6 +500,8 @@ fn linuxMain() !void {
             .journal = &core.journal,
             .gpu = null,
             .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
+            .snapshot = .{ .ctx = &kvm_snap_ctx, .func = ksnap.snapshotCall },
+            .park = .{ .ctx = &kvm_snap_ctx, .func = ksnap.parkCall },
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
@@ -474,10 +550,10 @@ fn linuxMain() !void {
     // selects the output (default nether.snap).
     if (modeOn("snapshot", "nether-snapshot")) {
         const Saver = struct {
-            fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, p: [*:0]const u8, delay_s: u32) void {
+            fn run(vmp: *nether.Vm, vlist: []nether.Vcpu, ram: []u8, ap: *nether.IoApic, pz: *kbk.Pause, devs: ksnap.Devices, p: [*:0]const u8, delay_s: u32) void {
                 var s: u32 = 0;
                 while (s < delay_s) : (s += 1) _ = usleep(1_000_000);
-                ksnap.capture(&vmp.hv, vlist, ram, ap, pz, p) catch |err| {
+                ksnap.captureToPath(&vmp.hv, vlist, ram, ap, pz, devs, p, false) catch |err| {
                     std.debug.print("[nether] snapshot failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -488,7 +564,7 @@ fn linuxMain() !void {
         const delay: u32 = @intCast(confGetInt("snapshot_after_s", 8));
         var spath_buf: [512]u8 = undefined;
         const spath: [*:0]const u8 = if (confGet("snapshot_path", &spath_buf)) |pp| @ptrCast(pp.ptr) else "nether.snap";
-        if (std.Thread.spawn(.{}, Saver.run, .{ &vm, vcpus[0..num_cpus], low, &ioapic, &snap_pause, spath, delay })) |t| t.detach() else |_| {}
+        if (std.Thread.spawn(.{}, Saver.run, .{ &vm, vcpus[0..num_cpus], low, &ioapic, &snap_pause, snap_devs, spath, delay })) |t| t.detach() else |_| {}
     }
 
     const reason = vcpu.run(&bus, &power, &ioapic) catch |err| {
@@ -532,6 +608,19 @@ fn webInput(ctx: *anyopaque, bytes: []const u8) void {
 /// True if a `nether-web` marker file is present in the working directory.
 fn webEnabled() bool {
     return markerPresent("nether-web");
+}
+
+/// Write a fresh 16-byte VM Generation ID (host entropy) into the reserved GUID
+/// page at the top of guest RAM. The guest's stock vmgenid driver reads it via the
+/// DSDT VGEN.ADDR; a fork gets a distinct GUID here (in its private COW page).
+fn writeVmgenid(ram: []u8) void {
+    const off: usize = @intCast(nether.memmap.vmgenid_addr);
+    if (off + 16 > ram.len) return;
+    var guid: [16]u8 = undefined;
+    const fd = linux.open("/dev/urandom", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    if (linux.read(@intCast(fd), &guid, 16) == 16) @memcpy(ram[off..][0..16], &guid);
 }
 
 fn markerPresent(path: [*:0]const u8) bool {

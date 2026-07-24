@@ -17,6 +17,37 @@ const std = @import("std");
 const kvm = @import("kvm.zig");
 const kb = @import("kvm_backend.zig");
 const ioapic = @import("ioapic.zig");
+const virtio = @import("../virtio/virtio.zig");
+const Vsock = @import("../virtio/virtio_vsock.zig").Vsock;
+
+const DeviceState = virtio.Device.DeviceState;
+const VsockState = Vsock.State;
+
+// Presence bits for the device-state section (header-independent; read from the
+// flags word so restore knows which device blocks follow).
+const DEV_BLK: u32 = 1 << 0;
+const DEV_VSOCK: u32 = 1 << 1; // vsock transport + engine + agent conn (the control plane)
+const DEV_NET: u32 = 1 << 2;
+
+/// The virtio devices whose transport state must survive a fork so a restored
+/// sandbox is DRIVEABLE (the virtqueue rings themselves live in guest RAM, already
+/// captured; only the transport registers + the vsock engine + the agent's live
+/// connection id need serializing). Any subset may be present.
+pub const Devices = struct {
+    blk: ?*virtio.Device = null,
+    vsock_dev: ?*virtio.Device = null,
+    net_dev: ?*virtio.Device = null,
+    vsock_engine: ?*Vsock = null,
+    conn_id: ?*std.atomic.Value(i32) = null, // read at capture time (the live agent conn)
+
+    fn flags(self: Devices) u32 {
+        var f: u32 = 0;
+        if (self.blk != null) f |= DEV_BLK;
+        if (self.vsock_dev != null and self.vsock_engine != null) f |= DEV_VSOCK;
+        if (self.net_dev != null) f |= DEV_NET;
+        return f;
+    }
+};
 
 // libc file I/O (Linux-only module; the KVM path always links libc). Flags are the
 // Linux x86_64 values.
@@ -31,7 +62,7 @@ extern "c" fn pread(fd: c_int, buf: [*]u8, n: usize, off: i64) isize;
 extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
 
 pub const MAGIC: u32 = 0x564b_534e; // 'NSKV' little-endian
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2; // v2: virtio device-state section (blk/vsock/net + engine + conn)
 const HDR: usize = 128;
 const PAGE: usize = 4096; // x86 host page (mmap/offset alignment)
 const NUM_GSI = 24; // IOAPIC redirection entries (ioapic.zig)
@@ -54,7 +85,9 @@ pub fn capture(
     ram: []const u8,
     apic: *const ioapic.IoApic,
     pause: *kb.Pause,
-    path: [*:0]const u8,
+    devs: Devices,
+    fd: c_int,
+    resume_after: bool,
 ) Error!void {
     if (vcpus.len > MAX_SNAP_CPUS) return error.TooManyCpus;
     // Quiesce: ask every vCPU to leave KVM_RUN, kick each with the force-exit
@@ -74,18 +107,78 @@ pub fn capture(
     for (vcpus, 0..) |*v, i| states[i] = v.saveState() catch return error.WriteFailed;
     const clk = vm.getClock() catch kvm.ClockData{ .clock = 0, .flags = 0 };
 
-    const err = writeImage(path, ram, states[0..vcpus.len], clk, apic.redir);
+    const err = writeImageToFd(fd, ram, states[0..vcpus.len], clk, apic.redir, devs);
 
-    // Resume the guest (a no-op for the guest if the caller now exits).
-    pause.request.store(false, .release);
+    // __snapshot__ resumes the guest (a base captured live); __park__ leaves it
+    // quiesced (the caller exits, so the image is the guest's last live moment - no
+    // divergence window).
+    if (resume_after) pause.request.store(false, .release);
     return err;
+}
+
+/// Everything the control-plane __snapshot__/__park__ commands need to capture the
+/// running guest on demand. Wired into ControlCtx.snapshot/.park in linuxMain.
+pub const SnapCtx = struct {
+    vm: *kb.Vm,
+    vcpus: []kb.Vcpu,
+    ram: []u8,
+    apic: *const ioapic.IoApic,
+    pause: *kb.Pause,
+    devs: Devices,
+};
+
+/// __snapshot__: capture a fork-source base to the (jailed, caller-opened) fd and
+/// RESUME the guest. Matches platform.Snapshotter.func.
+pub fn snapshotCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
+    _ = path; // the caller already opened the fd inside the transfer jail
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    capture(ctx.vm, ctx.vcpus, ctx.ram, ctx.apic, ctx.pause, ctx.devs, fd, true) catch return false;
+    return true;
+}
+
+/// __park__: capture WITHOUT resuming (the control handler bills and exits after).
+pub fn parkCall(p: *anyopaque, fd: c_int, path: [*:0]const u8) bool {
+    _ = path;
+    const ctx: *SnapCtx = @ptrCast(@alignCast(p));
+    capture(ctx.vm, ctx.vcpus, ctx.ram, ctx.apic, ctx.pause, ctx.devs, fd, false) catch return false;
+    return true;
+}
+
+/// Capture to a path this function opens (the `snapshot=1` timed-thread path, which
+/// has no caller-provided fd). Opens O_CREAT|O_TRUNC and closes on return.
+pub fn captureToPath(
+    vm: *kb.Vm,
+    vcpus: []kb.Vcpu,
+    ram: []const u8,
+    apic: *const ioapic.IoApic,
+    pause: *kb.Pause,
+    devs: Devices,
+    path: [*:0]const u8,
+    resume_after: bool,
+) Error!void {
+    const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    if (fd < 0) return error.WriteFailed;
+    defer _ = close(fd);
+    try capture(vm, vcpus, ram, apic, pause, devs, fd, resume_after);
 }
 
 /// The fixed metadata following the header: per-vCPU state, the paravirt clock,
 /// and the userspace IOAPIC's redirection table. Size is num_cpus-dependent, so
 /// callers compute ram_off = align(HDR + metaLen(num_cpus), PAGE).
-fn metaLen(num_cpus: u32) usize {
-    return @as(usize, num_cpus) * @sizeOf(CpuState) + @sizeOf(kvm.ClockData) + NUM_GSI * 8;
+fn metaLen(num_cpus: u32, devs: Devices) usize {
+    var n = @as(usize, num_cpus) * @sizeOf(CpuState) + @sizeOf(kvm.ClockData) + NUM_GSI * 8;
+    n += 8; // dev flags (u32) + conn_id (i32)
+    const f = devs.flags();
+    if (f & DEV_BLK != 0) n += @sizeOf(DeviceState);
+    if (f & DEV_VSOCK != 0) n += @sizeOf(DeviceState) + @sizeOf(VsockState);
+    if (f & DEV_NET != 0) n += @sizeOf(DeviceState);
+    return n;
+}
+
+/// Byte offset (within the file) where the device-state section begins: right
+/// after the header, per-vCPU states, the clock, and the IOAPIC table.
+fn devSectionOff(num_cpus: u32) usize {
+    return HDR + @as(usize, num_cpus) * @sizeOf(CpuState) + @sizeOf(kvm.ClockData) + NUM_GSI * 8;
 }
 
 fn alignUp(n: usize, a: usize) usize {
@@ -120,11 +213,26 @@ pub fn writeImage(
     cpus: []const CpuState,
     clock: kvm.ClockData,
     redir: [NUM_GSI]u64,
+    devs: Devices,
 ) Error!void {
-    const ram_off = alignUp(HDR + metaLen(@intCast(cpus.len)), PAGE);
     const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
     if (fd < 0) return error.WriteFailed;
     defer _ = close(fd);
+    try writeImageToFd(fd, ram, cpus, clock, redir, devs);
+}
+
+/// Write the image to an already-open, writable, truncated fd (the control-plane
+/// __snapshot__/__park__ path opens it through the transfer-jail dirfd for TOCTOU
+/// safety and owns its close/cleanup). Does not close the fd.
+pub fn writeImageToFd(
+    fd: c_int,
+    ram: []const u8,
+    cpus: []const CpuState,
+    clock: kvm.ClockData,
+    redir: [NUM_GSI]u64,
+    devs: Devices,
+) Error!void {
+    const ram_off = alignUp(HDR + metaLen(@intCast(cpus.len), devs), PAGE);
 
     // Header.
     try wr32(fd, 0, MAGIC);
@@ -134,7 +242,7 @@ pub fn writeImage(
     try wr64(fd, 16, ram.len);
     try wr64(fd, 24, ram_off);
 
-    // Metadata region.
+    // Metadata region: per-vCPU state, clock, IOAPIC.
     var off: usize = HDR;
     for (cpus) |*c| {
         try writeAt(fd, std.mem.asBytes(c), off);
@@ -145,6 +253,32 @@ pub fn writeImage(
     for (redir) |r| {
         try wr64(fd, off, r);
         off += 8;
+    }
+
+    // Device-state section: flags, the live agent conn id, then each present
+    // device's transport state (and the vsock engine State for the control plane).
+    const f = devs.flags();
+    try wr32(fd, off, f);
+    const conn: i32 = if (devs.conn_id) |c| c.load(.acquire) else -1;
+    try wr32(fd, off + 4, @bitCast(conn));
+    off += 8;
+    if (devs.blk) |d| {
+        const s = d.exportState();
+        try writeAt(fd, std.mem.asBytes(&s), off);
+        off += @sizeOf(DeviceState);
+    }
+    if (f & DEV_VSOCK != 0) {
+        const s = devs.vsock_dev.?.exportState();
+        try writeAt(fd, std.mem.asBytes(&s), off);
+        off += @sizeOf(DeviceState);
+        const es = devs.vsock_engine.?.exportState();
+        try writeAt(fd, std.mem.asBytes(&es), off);
+        off += @sizeOf(VsockState);
+    }
+    if (devs.net_dev) |d| {
+        const s = d.exportState();
+        try writeAt(fd, std.mem.asBytes(&s), off);
+        off += @sizeOf(DeviceState);
     }
 
     // Sparse RAM: skip page-aligned all-zero runs (leaving file holes) so an image
@@ -214,6 +348,53 @@ pub const Image = struct {
         _ = try readAt(self.fd, &buf, base);
         for (&r, 0..) |*e, i| e.* = std.mem.readInt(u64, buf[i * 8 ..][0..8], .little);
         return r;
+    }
+
+    /// The captured virtio device-state section (whichever devices were present).
+    pub const DevBlock = struct {
+        flags: u32,
+        conn_id: i32,
+        blk: ?DeviceState = null,
+        vs_dev: ?DeviceState = null,
+        vsock: ?VsockState = null,
+        net_dev: ?DeviceState = null,
+    };
+
+    pub fn devices(self: *Image) Error!DevBlock {
+        var b: DevBlock = undefined;
+        var off = devSectionOff(self.num_cpus);
+        var fbuf: [8]u8 = undefined;
+        _ = try readAt(self.fd, &fbuf, off);
+        b.flags = std.mem.readInt(u32, fbuf[0..4], .little);
+        b.conn_id = @bitCast(std.mem.readInt(u32, fbuf[4..8], .little));
+        b.blk = null;
+        b.vs_dev = null;
+        b.vsock = null;
+        b.net_dev = null;
+        off += 8;
+        if (b.flags & DEV_BLK != 0) {
+            var d: DeviceState = undefined;
+            _ = try readAt(self.fd, std.mem.asBytes(&d), off);
+            b.blk = d;
+            off += @sizeOf(DeviceState);
+        }
+        if (b.flags & DEV_VSOCK != 0) {
+            var d: DeviceState = undefined;
+            _ = try readAt(self.fd, std.mem.asBytes(&d), off);
+            b.vs_dev = d;
+            off += @sizeOf(DeviceState);
+            var e: VsockState = undefined;
+            _ = try readAt(self.fd, std.mem.asBytes(&e), off);
+            b.vsock = e;
+            off += @sizeOf(VsockState);
+        }
+        if (b.flags & DEV_NET != 0) {
+            var d: DeviceState = undefined;
+            _ = try readAt(self.fd, std.mem.asBytes(&d), off);
+            b.net_dev = d;
+            off += @sizeOf(DeviceState);
+        }
+        return b;
     }
 
     /// Fill `ram` (the fresh guest's zero-filled anon RAM slice) from the image.

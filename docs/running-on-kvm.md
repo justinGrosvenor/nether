@@ -59,7 +59,8 @@ make x86_64_defconfig
   -e ACPI -e KVM_GUEST -e PARAVIRT \
   -e PCI -e PCI_MSI -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK \
   -e VIRTIO_NET -e VIRTIO_CONSOLE \
-  -e VSOCKETS -e VIRTIO_VSOCKETS
+  -e VSOCKETS -e VIRTIO_VSOCKETS \
+  -e VIRT_DRIVERS -e VMGENID
 make olddefconfig
 make -j"$(nproc)"            # vmlinux (ELF, with the PVH note) lands in the build root
 cp vmlinux ../vmlinux && cd ..

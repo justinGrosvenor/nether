@@ -1802,8 +1802,8 @@ fn controlCommand(ctx: *ControlCtx, c: c_int, line: []const u8, is_primary: bool
             "__help__         this list\n" ++
             "# primary client only (drive the sandbox):\n" ++
             "__shutdown__     clean teardown\n" ++
-            "__snapshot__ [p] capture a fork-source base snapshot (default nether.snap; HVF)\n" ++
-            "__park__ [p]     capture + bill + EXIT without resuming (wake = restore; HVF)\n" ++
+            "__snapshot__ [p] capture a fork-source base snapshot (default nether.snap)\n" ++
+            "__park__ [p]     capture + bill + EXIT without resuming (wake = restore)\n" ++
             "__put__ <h> <g>  push host file -> guest path\n" ++
             "__get__ <g> <h>  pull guest file -> host path\n" ++
             "<other>          run as a shell command in the guest (framed reply + [exit N])\n" ++

@@ -76,6 +76,7 @@ pub const Pl011 = @import("chipset/pl011.zig").Pl011;
 pub const Pl031 = @import("chipset/pl031.zig").Pl031;
 pub const Rtc = @import("chipset/rtc.zig").Rtc;
 pub const Pm = @import("chipset/pm.zig").Pm;
+pub const Gpe = @import("chipset/gpe.zig").Gpe;
 pub const Reset = @import("chipset/reset.zig").Reset;
 pub const FwCfg = @import("chipset/fw_cfg.zig").FwCfg;
 

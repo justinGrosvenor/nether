@@ -24,6 +24,13 @@ pub const ioapic_base: u64 = 0xFEC0_0000;
 pub const lapic_base: u64 = 0xFEE0_0000;
 pub const apic_size: u64 = 4 * kib;
 
+// VM Generation ID GUID buffer: the top page of the fixed 256 MiB low RAM,
+// reserved out of E820 (see pvh.zig) so the guest kernel never allocates it - the
+// vmgenid driver ioremaps it. Must equal GUEST_RAM_SIZE - vmgenid_page AND the
+// DSDT VGEN.ADDR literal (0x0FFFF000).
+pub const vmgenid_addr: u64 = 0x0FFF_F000;
+pub const vmgenid_page: u64 = 4 * kib;
+
 // 64-bit PCI MMIO window, placed above any plausible high RAM.
 pub const pci_mmio64_base: u64 = 1 << 39; // 512 GiB
 pub const pci_mmio64_size: u64 = 1 << 39;
