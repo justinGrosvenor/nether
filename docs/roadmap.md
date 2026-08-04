@@ -10,15 +10,23 @@ run / render), and **snapshot -> copy-on-write fork -> ~10 ms lazy restore** - t
 microVM fork primitive the edge product is built on. The whole stack is hardened
 against malformed guest input *and* against a hostile local control client.
 
-The **x86-64/KVM** path stays the reference backend: it PVH-boots Linux 6.12 to an
-interactive shell on bare metal, the userspace IOAPIC routes serial IRQ4 (no more
-16-byte FIFO stall), and virtio-blk reads/writes work end to end; its network path
-now runs through the same slirp + egress firewall. The HVF-proven platform layer
-(control plane, metering, observe/govern) is **wired on KVM and run-verified on metal**
-(bring-up steps 0–3 PASS). Remaining KVM gaps: virtio-net guest
-interface, SMP AP boot, snapshot/restore, and GPU. The bet is that what HVF proved
-about the device models and control protocol transfers largely intact; snapshot on KVM
-still needs `KVM_GET/SET_*` work.
+The **x86-64/KVM** reference backend has now **reached parity with HVF** for the
+platform primitive. It PVH-boots Linux 6.12 to an interactive shell on bare metal
+(userspace IOAPIC routes serial IRQ4, no more 16-byte FIFO stall), virtio-blk reads
+and writes work end to end, **virtio-net** brings up a guest interface over the same
+slirp + egress firewall (DNS/HTTP/HTTPS through the NAT), and **SMP** boots multiple
+vCPUs (AP INIT/SIPI via KVM's in-kernel LAPIC). On top of that the whole
+**cross-process snapshot fork** landed: full vCPU/VM state via `KVM_GET/SET_*`
+(regs, sregs, MSRs, xsave/xcrs, lapic, mp_state, vcpu_events, kvmclock), a
+**driveable** restore (virtio transport + vsock engine + the live agent connection
+survive, so the control plane resumes with no reconnect), **COW-mmap** fast restore
+(~150 ms to a live control socket), **SMP fork**, the control-protocol
+`__snapshot__`/`__park__` commands + the SDK `Sandbox.create` fork path, and
+**vmgenid** entropy divergence (an ACPI VM Generation ID device + a GPE0/SCI notify
+so sibling forks reseed their CRNG). All run-verified on a bare-metal `c5.metal`,
+driven through the Python SDK. Every gap traced to the same root: host code written
+on the Mac that compiled for x86 but had never been *run* there. The one remaining
+KVM gap is **GPU** (virtio-gpu is still HVF-only).
 
 See [decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the
 irqchip/IOAPIC, D3 for the concurrency model, and D9 for the backend seam.
@@ -108,9 +116,9 @@ virtio-pci block and net, MSI-X, boot a Linux disk image.
 
 **Done when:** a Linux image boots to an interactive shell over virtio-block/net
 with MSI-X interrupts. **DONE on the aarch64/HVF backend** (Alpine 6.12, with
-virtio-console/blk/vsock/net and both MSI-X and legacy INTx). The x86/KVM
-equivalent boots to a shell with virtio-blk; a live networked boot is the
-remaining step there.
+virtio-console/blk/vsock/net and both MSI-X and legacy INTx) **and on the x86/KVM
+backend** (PVH Linux 6.12 to a shell with virtio-blk + virtio-net over slirp, SMP,
+vsock, and the full snapshot-fork primitive; see the status header above).
 
 ## Phase 4 - Boot Windows
 
@@ -825,10 +833,15 @@ The build-out arc (offline-first chunks):
    or an out-of-bounds write into the fixed disk buffer. Unit-tested and proven live
    (a wrong-version, wrong-magic, and oversized-disk snapshot are each rejected cleanly).
 
-The x86-64/KVM path stays the reference backend. It PVH-boots to a shell with
-virtio-blk, and its network path now runs through the same slirp + egress firewall
-(the firewall is on **both** backends). The core platform layer is **ported and
-run-verified** on metal; remaining x86 work is virtio-net bring-up, SMP AP boot,
-snapshot/restore (per-vCPU threads + INIT/SIPI; KVM's GET/SET ioctls + dirty-log),
-and GPU. The deliberate bet of the aarch64-first detour is that what HVF proved
-about the device models and control protocol transfers to KVM largely intact.
+The x86-64/KVM path stays the reference backend, now at **HVF parity** for the
+platform primitive. It PVH-boots to a shell with virtio-blk; virtio-net brings up a
+guest interface over the shared slirp + egress firewall; SMP boots multiple vCPUs
+(AP INIT/SIPI via the in-kernel LAPIC); and the full cross-process snapshot fork
+works: `KVM_GET/SET_*` for all vCPU/VM state, a driveable restore (device + vsock
+engine + agent connection survive), COW-mmap fast restore, SMP fork, the
+`__snapshot__`/`__park__` control commands + SDK `Sandbox.create` fork path, and
+vmgenid entropy divergence. All run-verified on a bare-metal `c5.metal` through the
+Python SDK. The deliberate bet of the aarch64-first detour paid off: the device
+models and control protocol transferred to KVM largely intact, and the gaps that
+remained were host-side macOS-isms flushed out by running on real hardware. The one
+remaining x86 gap is GPU (virtio-gpu is HVF-only).
