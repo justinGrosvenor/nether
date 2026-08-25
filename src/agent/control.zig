@@ -1326,14 +1326,19 @@ pub const DataBridge = struct {
 
     fn pumpLoop(self: *DataBridge, slot: usize) void {
         // Wait (bounded) for the host->guest connect to establish (the guest forwarder accepts).
-        var waited: u32 = 0;
-        while (waited < 3000) : (waited += 10) {
+        // This is a short-lived connect barrier, not an idle poll. A 10ms tick
+        // added a full scheduling quantum to every data-socket request and made
+        // a blocking gateway serialize N guests in ~10ms steps. Check at 200us
+        // while the vsock handshake is live; established pumps block in pollRW.
+        const connect_poll_us: u32 = 200;
+        var waited_us: u32 = 0;
+        while (waited_us < 3_000_000) : (waited_us += connect_poll_us) {
             if (self.stopping.load(.acquire)) return self.teardown(slot);
             self.lock.lock();
             const st = self.conns[slot].state;
             self.lock.unlock();
             if (st != .connecting) break;
-            _ = usleep(10_000);
+            _ = usleep(connect_poll_us);
         }
         self.lock.lock();
         const e = self.conns[slot];

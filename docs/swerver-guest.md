@@ -66,6 +66,10 @@ while [ ! -S /tmp/nsw/control.sock ]; do sleep 0.1; done
 cd ~/swerver
 ./zig-out/bin/swerver --config ~/nether/kernels/swerver/gateway.json \
   > /tmp/nsw/gateway.log 2>&1 &
+
+# Give all 16 broker lanes time to finish their non-blocking handshakes before
+# measuring the first burst (ordinary traffic may arrive immediately and queue).
+sleep 1
 ```
 
 Drive the full gateway route. The rewrite removes `/tenant`, so the guest sees
@@ -85,6 +89,12 @@ to supervisor dispatch + HVF restore + the guest's first Swerver response:
 cd ~/nether
 python3 scripts/swerver_guest_burst.py --concurrency 8
 python3 scripts/swerver_guest_burst.py --concurrency 16
+
+# Include the host Swerver filter and proxy path in the measured interval.
+python3 scripts/swerver_guest_burst.py --concurrency 8 \
+  --gateway http://127.0.0.1:18080/tenant
+python3 scripts/swerver_guest_burst.py --concurrency 16 \
+  --gateway http://127.0.0.1:18080/tenant
 ```
 
 This is a warm-fork measurement, not a cold Linux boot and not an HttpArena

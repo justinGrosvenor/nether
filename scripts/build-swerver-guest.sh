@@ -97,7 +97,9 @@ fi
 
 swerver_commit=$(git -C "$SWERVER_ROOT" rev-parse HEAD)
 arena_commit=$(git -C "$HTTPARENA_ROOT" rev-parse HEAD)
+nether_commit=$(git -C "$ROOT" rev-parse HEAD)
 {
+  printf 'nether_commit=%s\n' "$nether_commit"
   printf 'swerver_commit=%s\n' "$swerver_commit"
   printf 'httparena_commit=%s\n' "$arena_commit"
   printf 'zig_version=%s\n' "$("$ZIG" version)"

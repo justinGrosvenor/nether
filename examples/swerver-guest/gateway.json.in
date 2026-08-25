@@ -26,6 +26,7 @@
     }
   ],
   "wasm_control_socket": "/tmp/nsw/control.sock",
+  "wasm_control_connections": 16,
   "wasm_host_call_deadline_ms": 30000,
   "tenant_idle_ttl_ms": 3600000,
   "admin": {
