@@ -107,9 +107,10 @@ net=1
 
 and attach with `nc -U /tmp/nether.sock` (the same control protocol as HVF:
 `__info__`, `__stats__`, `__events__`, `__shutdown__`, command relay, `__put__`/
-`__get__`). **Verified on metal** (2026-06-27): PVH boot, idle
-shell, control plane over vsock, `__shutdown__`, and watchdogs all pass. virtio-net
-interface bring-up and SMP (`cpus>1`) still fail — see the [roadmap](roadmap.md).
+`__get__`). **Verified on metal** (`c5.metal`, 2026-07-23): PVH boot, shell, control
+plane over vsock, `__shutdown__`, watchdogs, virtio-net (`eth0` up, DNS/HTTP/HTTPS
+through the slirp NAT + egress firewall), and SMP (`cpus=4`) all pass. The status
+header in the [roadmap](roadmap.md) tracks what remains (GPU).
 
 ### Boot
 
@@ -141,6 +142,47 @@ head -c 11 /dev/vda            # -> NETHER-DISK  (read path)
 echo hello | dd of=/dev/vda bs=512 seek=1   # write path
 # back on the host, the bytes are visible in disk.img (writes are shared mmap)
 ```
+
+## 5. Snapshot and fork
+
+The KVM backend has the same cross-process fork primitive as HVF. A running guest is
+captured to an image: every vCPU's state via `KVM_GET_*` (regs, sregs, MSRs,
+xsave/xcrs, LAPIC, mp_state, pending events), the kvmclock, the IOAPIC table, the
+virtio transport state for blk/net/vsock plus the vsock engine and the live agent
+connection, and sparse guest RAM. A fresh process re-creates it with guest RAM
+`MAP_PRIVATE`-mapped straight from the image, so a fork shares the base's pages and
+copies only what it writes.
+
+**Timed capture (demo).** `snapshot=1` in `nether.conf` arms a thread that, after
+`snapshot_after_s` seconds (default 8), quiesces the guest, writes `snapshot_path`
+(default `nether.snap`), and exits. The image is the guest.
+
+**On-demand capture (production).** With a control socket configured, `__snapshot__
+[path]` captures a base and resumes the guest; `__park__ [path]` captures, bills, and
+exits. Same [control protocol](control-protocol.md) and same SDK fork path as HVF
+(`Sandbox.create` forks a KVM image directly).
+
+**Restore / fork.** In a working directory with the same device set as the base
+(`vsock`, `net`, `cpus`, and whether `disk.img` is present):
+
+```
+restore=1
+restore_from=nether.snap
+```
+
+The restored guest resumes where it was captured with its agent connection intact, so
+the control plane drives it immediately with no reconnect (about 150 ms to a live
+control socket). Two forks of one base get distinct VM Generation IDs: on restore
+nether writes a fresh GUID into the fork's private page and pulses GPE0/SCI, the
+guest's stock `vmgenid` driver reseeds the CRNG (`random: crng reseeded due to
+virtual machine fork`), and sibling forks draw different random streams from their
+first read. `fork_reseed=0` opts out. The guest kernel needs `CONFIG_VIRT_DRIVERS` +
+`CONFIG_VMGENID` (already in the recipe above).
+
+Constraints: images are same-host, same-build (native-endian, KVM format `NSKV`, not
+interchangeable with HVF images); the fork must launch with the same vCPU count and
+device set as the base; the slirp NAT engine restarts fresh (in-flight outbound flows
+reset, as on HVF); deflate-compressed bases and incremental diffs are HVF-only today.
 
 ## Notes
 

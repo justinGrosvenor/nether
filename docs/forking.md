@@ -110,8 +110,10 @@ path; `scripts/reproducing.md` indexes the rest.
 
 ## What this is, and isn't
 
-- **Backend:** Apple Hypervisor.framework, aarch64, macOS only. The x86/KVM backend
-  is a reference implementation and does not do snapshot-fork yet.
+- **Backend:** Apple Hypervisor.framework (aarch64, macOS) is the lead path and where
+  the numbers above are measured. The x86/KVM backend has the same fork primitive
+  (cross-process snapshot, COW restore, `__snapshot__`/`__park__`, vmgenid reseed),
+  run-verified on bare metal; the proof scripts themselves are still HVF-only.
 - **Maturity:** pre-1.0, no external security audit. The guest is treated as hostile
   (malformed guest input is the primary threat model, the guest-facing parsers are
   continuously fuzzed), but don't run untrusted guests in production yet.

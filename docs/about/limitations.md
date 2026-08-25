@@ -7,13 +7,13 @@ Honest scope notes for the current tree. These are intentional cuts and sequenci
 | Track | Maturity |
 | --- | --- |
 | **HVF / aarch64** | Platform layer live: Linux boot, virtio (blk/net/vsock/gpu), snapshot-fork, control plane, govern, observe, meter, SMP |
-| **KVM / x86-64** | PVH Linux boot, virtio-blk, IOAPIC; platform layer wired and **run-verified on metal** for control plane, vsock, metering, watchdogs, and slirp (compile path). Remaining gaps: virtio-net guest interface, SMP AP boot, snapshot/restore, GPU |
+| **KVM / x86-64** | PVH Linux boot, virtio-blk/net/vsock, SMP, IOAPIC; the platform layer (control plane, metering, govern, observe, watchdogs, slirp + egress firewall) and the cross-process snapshot fork (COW restore, SMP fork, `__snapshot__`/`__park__`, vmgenid reseed), all **run-verified on bare metal**. Remaining gap: virtio-gpu |
 
 KVM parity is tracked in the [roadmap](../roadmap.md).
 
 ## Snapshot / restore
 
-Snapshot save, rewind demo, and COW restore (`nether-restore` / `restore_from=`) are **HVF-only** today. KVM snapshot work is planned (`KVM_GET/SET_*` vCPU state + dirty pages) but not implemented.
+Snapshot save, COW restore (`restore=1` / `restore_from=`), and the on-demand `__snapshot__`/`__park__` capture work on **both** backends. The image formats differ (HVF vs KVM `NSKV`) and are same-host, same-build: a base is not portable across backends or machines. Still HVF-only: the rewind demo, GPU scanout capture, deflate-compressed durable bases, and incremental (diff) snapshots. See [Running on KVM](../running-on-kvm.md#5-snapshot-and-fork) for the x86 flow.
 
 ## Not a general-purpose VMM (yet)
 

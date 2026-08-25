@@ -37,7 +37,7 @@ net_rate_kbps = 4000          # download cap in kbps (0 = unlimited)
 
 Denied attempts increment `net_blocked` in the `__stats__` report.
 
-Slirp + firewall is implemented on **both** KVM and HVF when `net=1` is enabled. On KVM, virtio-net guest interface bring-up is still under investigation.
+Slirp + firewall is implemented on **both** KVM and HVF when `net=1` is enabled, and verified end to end on both (DNS/HTTP/HTTPS through the NAT and the firewall on a bare-metal KVM host).
 
 ## Runtime budgets
 

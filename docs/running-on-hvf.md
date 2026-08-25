@@ -326,5 +326,6 @@ the datapaths by hand.
   the guest core on Apple Silicon.
 - `zig build run` is not wired for codesigning; run the signed binary directly.
   Cross-compiling the Linux artifact with `zig build` is unaffected and unsigned.
-- Snapshot save/restore and COW fork are HVF-only today; KVM parity is tracked in
-  the [roadmap](roadmap.md).
+- Snapshot save/restore and COW fork work on both backends; the x86 flow is in
+  [Running on KVM](running-on-kvm.md#5-snapshot-and-fork). Deflate-compressed durable
+  bases and incremental diffs are HVF-only today.

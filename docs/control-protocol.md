@@ -223,7 +223,7 @@ form is unchanged.
 | Command | Reply | Purpose |
 |---|---|---|
 | `__shutdown__` | framed `OK` | Clean teardown: the guest stops via its power-off path and the process exits (emitting the final usage bill). Reply `OK shutting down` + `0x1e0\n`. |
-| `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a fork-source base snapshot on demand (HVF only): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply (framed, exit 0 on `OK` / -1 on `ERR`) blocks until the file is on disk, so the platform knows the base is ready to fork. **Fails closed if the guest is not quiescent** (a vCPU not parked at WFI): a base captured mid-instruction can bake inconsistent state into every fork, so it returns `ERR` and resumes rather than write a dirty base. Set `snapshot_allow_dirty=1` in `nether.conf` to opt into best-effort capture. `ERR snapshot not supported on this backend` on KVM. |
+| `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a fork-source base snapshot on demand (both backends): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply (framed, exit 0 on `OK` / -1 on `ERR`) blocks until the file is on disk, so the platform knows the base is ready to fork. **Fails closed if the guest is not quiescent** (a vCPU not parked at WFI): a base captured mid-instruction can bake inconsistent state into every fork, so it returns `ERR` and resumes rather than write a dirty base. Set `snapshot_allow_dirty=1` in `nether.conf` to opt into best-effort capture. `ERR snapshot not supported on this backend` on KVM. |
 | `__put__ <hostpath> <guestpath>` | framed `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
 | `__get__ <guestpath> <hostpath>` | framed `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
 
@@ -513,7 +513,7 @@ Strict hygiene, both kinds: a failed capture unlinks its partial file (a half-wr
 full-RAM image - tenant secrets frozen inside - must not linger), and snapshot files are
 written 0600.
 
-## Snapshot / fork (HVF)
+## Snapshot / fork
 
 **Baking a base.** The platform pre-bakes a fork source by driving a control-mode sandbox
 to a ready state (install deps, warm caches) and issuing **`__snapshot__ <path>`** - an
@@ -562,5 +562,7 @@ fork's egress firewall / rate cap come from its own `nether.conf`, and `__stats_
 `__netlog__` report the fork session's own egress. Gpu scanout state is not captured. A base
 snapshot taken from a **non-control** sandbox has no vsock/agent state, so its forks are
 console + virtio-blk only even if `control_socket=` is set; the restore logs an explicit
-NOTE saying so. Snapshot-fork is HVF/aarch64 only (KVM snapshot is unimplemented). Fork
-latency is ~10 ms to a driveable VM (COW RAM map; ~25 ms to a first served request).
+NOTE saying so. Snapshot-fork works on both backends; the image formats differ and are not
+portable across them. Fork latency on HVF is ~10 ms to a driveable VM (COW RAM map; ~25 ms
+to a first served request); on KVM a COW-mapped fork reaches a live control socket in
+~150 ms.
