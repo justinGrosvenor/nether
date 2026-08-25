@@ -98,6 +98,7 @@ nav:
   - Security: security.md
   - Operations:
       - Reproducing the claims: reproducing.md
+      - Swerver guest per request: swerver-guest.md
       - Bringup notes: bringup-notes.md
   - About:
       - nether in one page: nether-for-execs.md

@@ -66,6 +66,7 @@ Then run any script directly, e.g. `python3 scripts/fork_serve.py`.
 | `data_plane_pacing.py` | The per-conn output cap paces upstream throughput to the configured rate (and ≪ uncapped). |
 | `data_plane_fairness.py` | A large transfer on one data-plane conn does **not** starve concurrent conns (no host-side head-of-line blocking): conn A streams ~1.2 GB while conn B keeps serving small requests. |
 | `relay_proof.py` | The two relay/pipe audit fixes, each verified on its own fresh VM. |
+| `swerver_guest_burst.py` | Concurrent unique-tenant requests each warm-fork a real VM and receive the first response from the HttpArena Swerver application inside it. Requires the [Swerver guest runbook](swerver-guest.md). |
 
 ### Control protocol
 

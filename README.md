@@ -102,6 +102,10 @@ Every latency and behavior claim above has a live proof script under `scripts/`;
 from a guest image to a warm base to a fork, driven by a declarative recipe
 ([`examples/base.nether.toml`](examples/base.nether.toml), run with `scripts/bake.py`).
 
+**Swerver in every fork:** [`docs/swerver-guest.md`](docs/swerver-guest.md) builds
+the real HttpArena Swerver application into a warm guest, then routes a unique
+tenant request through a host Swerver gateway to a fresh copy-on-write VM.
+
 ## Layout
 
 ```

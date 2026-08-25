@@ -1,0 +1,37 @@
+{
+  "server": {
+    "address": "127.0.0.1",
+    "port": 18080,
+    "workers": 1,
+    "max_connections": 512,
+    "disable_middleware": true
+  },
+  "routes": [
+    {
+      "path_prefix": "/tenant",
+      "rewrite_pattern": "/tenant",
+      "replacement": "",
+      "tenant": {
+        "socket_dir": "/tmp/nsw",
+        "header": "x-tenant"
+      }
+    }
+  ],
+  "wasm_filters": [
+    {
+      "match": "/tenant",
+      "module": "@FILTER_WASM@",
+      "instances": 16,
+      "fuel": 5000000
+    }
+  ],
+  "wasm_control_socket": "/tmp/nsw/control.sock",
+  "wasm_host_call_deadline_ms": 30000,
+  "tenant_idle_ttl_ms": 3600000,
+  "admin": {
+    "enabled": true,
+    "address": "127.0.0.1",
+    "port": 19280,
+    "api_key": "dev-admin-key"
+  }
+}

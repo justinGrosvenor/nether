@@ -1,0 +1,16 @@
+{
+  "server": {
+    "address": "127.0.0.1",
+    "port": 8080,
+    "workers": 1,
+    "max_connections": 128,
+    "disable_middleware": true
+  },
+  "limits": {
+    "max_body_bytes": 22020096
+  },
+  "buffer_pool": {
+    "buffer_size": 65536,
+    "buffer_count": 256
+  }
+}
