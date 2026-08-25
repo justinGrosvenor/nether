@@ -11,6 +11,22 @@ version surfaces (release, snapshot format, control protocol).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-24
+
+### Added
+- **Cross-process snapshot forks on x86_64/KVM.** The KVM backend can now restore and
+  fork snapshots across processes with SMP, vmgenid, platform plumbing, and SDK support,
+  bringing the Linux backend to practical parity with the HVF warm-fork path.
+- **Vendored Swerver guest stack.** A reproducible builder packages a committed Swerver
+  and HttpArena guest, tenant filter, aligned gateway/supervisor configuration, private
+  supervisor binary, provenance hashes, and direct or full-gateway burst tooling.
+
+### Fixed
+- Linux host networking no longer depends on macOS-specific behavior, and KVM APs
+  correctly re-enter `KVM_RUN` after `EAGAIN` while waiting for SIPI.
+- Fresh data-plane connections now use a 200 microsecond connect barrier instead of a
+  10 millisecond polling quantum, removing serialized latency from concurrent warm forks.
+
 ## [0.1.0] - 2026-07-14
 
 The first public cut, grouped by capability rather than by commit.
