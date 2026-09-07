@@ -87,6 +87,7 @@ nav:
       - Running on KVM: running-on-kvm.md
       - Code signing: codesigning.md
   - Guide:
+      - Current stack and backend status: stack.md
       - Forking a VM: forking.md
       - Provisioning base VMs: provisioning.md
       - Source layout: architecture.md

@@ -14,11 +14,12 @@ Policy surfaces are opt-in per sandbox via `nether.conf` in the working director
 
 Setting `control_socket=/path/to.sock` enables control mode even without `control=1`. Default socket path when unset: `/tmp/nether.sock`.
 
-Raw L2 tap (no egress firewall): add `net_tap=1` or touch `nether-net-tap`. Slirp + firewall is the default when only `net=1` is set.
+On KVM, raw L2 tap (no egress firewall): add `net_tap=1` or touch `nether-net-tap`. Slirp + firewall is the default when only `net=1` is set.
 
 ## Egress firewall
 
-When virtio-net uses the **slirp** backend (the default for `net=1`), an untrusted sandbox may reach the public internet but **not** the host LAN, loopback, link-local addresses, or cloud metadata (`169.254.169.254`). Tap mode (`net_tap=1`) bypasses the firewall.
+When virtio-net uses the **slirp** backend (the default for `net=1`), an untrusted sandbox may reach the public internet but **not** the host LAN, loopback, link-local addresses, or cloud metadata (`169.254.169.254`). KVM tap mode (`net_tap=1`) bypasses the firewall. The separate vsock egress
+relay has platform-owned policy; slirp rules do not automatically filter it.
 
 | Verdict | Behavior |
 | --- | --- |
@@ -37,14 +38,16 @@ net_rate_kbps = 4000          # download cap in kbps (0 = unlimited)
 
 Denied attempts increment `net_blocked` in the `__stats__` report.
 
-Slirp + firewall is implemented on **both** KVM and HVF when `net=1` is enabled, and verified end to end on both (DNS/HTTP/HTTPS through the NAT and the firewall on a bare-metal KVM host).
+Slirp + firewall is implemented on both KVM and HVF when `net=1` is enabled.
+Historical run notes record DNS/HTTP/HTTPS and firewall checks; they were not
+rerun in this documentation audit.
 
 ## Runtime budgets
 
 | Axis | Config | Behavior |
 | --- | --- | --- |
 | **Wall clock** | `max_runtime_s` | Watchdog terminates the sandbox |
-| **Idle** | `idle_timeout_s` | Reclaim when control-plane activity stops |
+| **Idle** | `idle_timeout_s` | Reclaim on Nether's tracked control/data inactivity |
 | **Bandwidth** | `net_rate_kbps` | Token-bucket on download; TCP backpressure when empty |
 | **Output volume** | `max_output_bytes` | Per-command output cap (0 = unlimited) |
 
@@ -52,7 +55,8 @@ Watchdogs arm whenever `max_runtime_s` or `idle_timeout_s` is set, even outside 
 
 ## Metering
 
-The `__stats__` control command reports uptime, RAM, CPU count, byte counters, and network totals. Requires **control mode**. The platform (swerver + x402) reads these to settle per use.
+The `__stats__` control command reports uptime, RAM, CPU count, byte counters, and network totals. Requires **control mode**. The console samples these values. Its settlement history is in memory and is
+not a durable final bill or proof of payment.
 
 ```sh
 printf '__stats__\n' | nc -U /tmp/nether.sock
@@ -70,6 +74,13 @@ All audit commands require **control mode** and a running control socket.
 
 Full examples and formats are in [Running on HVF](../running-on-hvf.md#booting-linux-to-a-shell) (reference runbook; same protocol on KVM).
 
-## Can't not won't
+## Scope of enforcement
 
-A sandbox **can't** reach host memory (EPT/IOMMU). With slirp and the firewall enabled it **can't** reach the metadata endpoint or your LAN. These are rules enforced in code, not terms of service.
+Hardware virtualization isolates guest execution, while host device parsers
+remain part of the trust boundary. slirp enforces its configured IP rules;
+`net_open`, allow rules, raw tap, and platform-owned egress relays change that
+boundary. There is no implemented VFIO/IOMMU passthrough policy in this tree.
+
+Supervisor reclaim is separate from Nether's inactivity timer. The supervisor
+tracks ensure/readiness timestamps, which gateway registry hits do not refresh.
+See [stack limits](../stack.md#operational-limits) and [security](../security.md).

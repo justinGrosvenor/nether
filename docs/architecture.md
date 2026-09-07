@@ -2,7 +2,7 @@
 
 How `src/` is organized after the flat-to-domains reorg, so the layout is a written
 contract and new files land in the right place. This is the *map of the code*; the
-*why* is in [design.md](design.md), the *what's-built* is in [roadmap.md](roadmap.md).
+*why* is in [design.md](design.md), the *what's-built* is in [stack.md](stack.md); milestone history is in [roadmap.md](roadmap.md).
 
 ## Domain tree
 
@@ -10,8 +10,8 @@ contract and new files land in the right place. This is the *map of the code*; t
 src/
   root.zig    the library root - the public API surface (nether.*); what main and
               embedders import. Re-exports the types each domain offers.
-  main.zig    dev/bringup binary wrapper: per-OS boot orchestration (linuxMain /
-              macBootLinux) + watchdogs. Production embeds via root.zig inside swerver.
+  main.zig    executable used by the supervisor: per-OS boot/restore orchestration
+              (linuxMain / macBootLinux) + bridges and watchdogs.
   fuzz.zig    always-on fuzz-smoke over the guest-facing parsers (vt, virtq, vsock, net).
 
   common/     shared kernel - leaf utilities with no domain deps.
@@ -19,9 +19,9 @@ src/
   mem/        guest memory map (single source of truth for the address space).
               memmap memmap_arm
   hv/         the hypervisor seam - the "isolate" core. Comptime backend by host OS.
-              backend vm  kvm kvm_backend  hvf hvf_backend  irqchip ioapic  smp
+              backend vm  kvm kvm_backend kvm_snapshot  hvf hvf_backend  irqchip ioapic  smp
   chipset/    the firmware floor / platform devices + the MMIO/PIO bus.
-              io(the bus) pci serial pl011 pm rtc fw_cfg acpi(+dsdt.aml/.asl) reset
+              io(the bus) pci serial pl011 pl031 gpe pm rtc fw_cfg acpi(+dsdt.aml/.asl) reset
   virtio/     virtio-pci transport + the device leaves.
               virtio virtq  virtio_net virtio_console virtio_blk virtio_gpu
               virtio_vsock virtio_rng virtio_mmio
@@ -30,7 +30,7 @@ src/
   boot/       kernel load.
               pvh elf dtb
   agent/      the agent control plane (the platform layer on top of the VMM).
-              control audit(journal) render webconsole snapshot armdev
+              control audit(journal) render webconsole snapshot armdev platform
   vt/         vendored VT parser + the Nether screen grid (terminal model).
               Parser Screen osc parse_table
 ```
@@ -64,10 +64,9 @@ table + accessors); shared leaf types live in `common/hvtypes.zig`. The host OS 
 the guest arch, and the two are never mixed in one binary. See
 [decisions.md](decisions.md) D9.
 
-HVF/aarch64 is the *lead* backend (where the full platform layer + SMP + snapshot were
-built and live-proven). KVM/x86 is the *reference* backend: the platform layer is
-wired there too and run-verified for control/vsock/watchdogs; it still trails on
-virtio-net, SMP, snapshot, and GPU — see the [roadmap](roadmap.md).
+HVF/aarch64 is the lead backend. KVM/x86 also implements virtio-net, SMP,
+control/vsock, and snapshots. Storage transforms, clock handling, GPU wiring,
+and restored egress behavior differ; see the [backend matrix](stack.md#backend-capabilities).
 
 ## Conventions (read before moving or adding a file)
 
@@ -85,17 +84,20 @@ virtio-net, SMP, snapshot, and GPU — see the [roadmap](roadmap.md).
   `agent/` (platform) or `chipset/`/`hv/` (machine), not `main.zig`.
 - **Expose it through `root.zig`** if other domains need it by namespace; keep it a
   direct relative import if only its own layer uses it.
-- **Keep all three targets green** on every change:
+- **Check both backend builds and the host suite** for changes that affect them:
+  ```sh
+  DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build test
+  DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=native
+  zig build -Dtarget=x86_64-linux
   ```
-  DEVELOPER_DIR=/Library/Developer/CommandLineTools zig test -target aarch64-macos src/root.zig
-  DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=x86_64-linux
-  ```
-  then a native build + codesign before running on HVF.
+  The native macOS build signs the installed binary by default. Live VM checks
+  are separate from these build and unit checks.
 
 ## Known follow-ups
 
 - The `virtio_` filename prefix is redundant under `virtio/` (`virtio/virtio_net.zig`);
   dropping it is a trivial optional rename pass.
 - `main.zig` still holds both boot orchestrations; splitting `boot/linux_main.zig` +
-  `boot/mac_main.zig` is a later option. The shared platform init that the Linux port
-  needs would land as `agent/platform.zig`.
+  `boot/mac_main.zig` is a later option. Shared platform initialization already
+  lives in `agent/platform.zig`; backend-specific bridges still need review as
+  their wiring evolves.

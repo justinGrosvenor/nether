@@ -2,146 +2,112 @@
 
 [![CI](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml/badge.svg)](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml)
 
-**Linux microVMs that fork like processes.** nether is a type-2 hypervisor (VMM)
-written in Zig. Boot a Linux guest once, snapshot it warm, then fork that snapshot
-into fresh VMs in **~10 ms** each, resuming exactly where the image froze, even
-mid-request. It runs in the layer below the guest, hence the name.
+**Linux microVMs that fork from a warm snapshot.** Nether is a type-2 VMM written
+in Zig. It boots Linux, captures guest state, and restores separate VM processes
+with copy-on-write RAM.
 
-**Documentation:** [justingrosvenor.github.io/nether](https://justingrosvenor.github.io/nether/) (source in [`docs/`](docs/index.md)). For the non-technical version of why this matters, see [nether in one page](docs/nether-for-execs.md).
+**Documentation:** [project site](https://justingrosvenor.github.io/nether/),
+[source](docs/index.md), and [current stack and backend status](docs/stack.md).
 
-## The idea
+## Current implementation
 
-A normal VM boots from cold every time. nether treats a running Linux VM as
-something you can snapshot, kill, and bring back, like `fork()` for a whole guest:
+- **macOS / Apple Silicon (HVF):** Linux boot, SMP, virtio-blk/net/rng/vsock,
+  2D GPU, control sockets, snapshots, COW fork, park/resume, and egress bridging.
+  The snapshot storage tools and mid-request resume demonstrations target this backend.
+- **Linux / x86-64 (KVM):** PVH Linux boot, SMP, virtio-blk/net/rng/vsock,
+  slirp networking with an egress firewall, control sockets, metering, snapshots,
+  COW restore, and park. Backend coverage differs; see the
+  [capability table](docs/stack.md#backend-capabilities).
+- **Optional metering:** per-VM usage counters and teardown settlement output.
+  The surrounding platform owns payment processing and durable accounting.
 
-- **Cold boot once (~0.5 s)** to a ready, serving base image.
-- **Warm-fork it in ~10 ms** to a live, driveable VM (a first served request through a
-  warm in-guest server lands in ~25 ms), copy-on-write: each fork shares the base's
-  pages and only copies what it writes, so a fork is cheap in both time and memory.
-- **Resume mid-flight.** Because the whole guest is captured, a fork wakes up
-  inside the exact system call the snapshot froze on. You can accept a request on
-  one VM, snapshot and kill it, and **complete the reply from a different VM** that
-  didn't exist when the request arrived. The upstream connection is held by the
-  host across the gap.
+The inspected Swerver integration runs a gateway, a separate
+`nether-supervisor` daemon, and one `nether` process per VM. The
+`swerver-console` bridge observes and controls those services. Nether also
+exports a library through `src/root.zig`; embedding it into one gateway process
+remains an integration design, rather than the topology used by this stack.
 
-The monotonic clock stays continuous across a park; the wall clock catches up to
-real time on resume; forks reseed their CRNG so siblings don't share randomness.
+## Fork and resume
 
-> Numbers are measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest, and are
-> reproducible via the proof scripts under [`scripts/`](scripts/). "~10 ms" is a
-> **warm fork / snapshot restore** to a driveable VM (not a cold boot); ~25 ms is fork
-> to a first served request through a warm app. Bigger guests copy more pages on
-> resume, so treat these as order-of-magnitude, not guarantees.
+A base captures an already running guest. Forks map the base RAM privately and
+copy pages as they write. Each fork still needs a new VMM process and VM/device
+setup; it is not a host process `fork()`.
 
-## What it is
+Historical Apple Silicon measurements recorded approximately 10 ms to a driveable
+restored VM and 25 ms to a first response from an already warm application, using
+a 512 MiB / 2-vCPU guest. These are different measurements from a complete
+gateway/supervisor request. They are not current benchmark guarantees.
 
-- A **type-2 VMM in Zig**, modern guests only (no legacy hardware emulation).
-- **Primary backend: Apple Hypervisor.framework on macOS / aarch64.** This is the
-  developed path: it boots Linux, runs SMP, virtio-blk/net/rng/vsock, a control
-  plane, snapshot + COW fork + park/resume, an egress plane, and a read-only web
-  console.
-- **Reference backend: KVM on Linux / x86-64.** The original backend, now at parity
-  with HVF for the platform primitive: PVH-boots Linux 6.12, runs SMP,
-  virtio-blk/net/vsock, the control plane, and the cross-process snapshot + COW fork
-  + park, all run-verified on bare metal. No GPU yet.
-- The hypervisor is a **compile-time backend seam**, so the guest-facing device and
-  protocol code is shared across both.
-- **Optional, off by default:** per-VM usage metering with an x402 settlement
-  record on teardown. General (unmetered) workloads are the default path.
+The HVF proof scripts also exercise mid-request resume, clock handling, and CRNG
+reseeding. Continuing an external connection requires the host relay used by
+those proofs; a memory snapshot alone cannot preserve a host TCP connection.
+See [forking](docs/forking.md) and [reproducing](docs/reproducing.md).
 
-## Security
+## Build and run
 
-The design assumes a **hostile guest**: malformed or malicious guest input is the
-primary attack surface, and the guest→host boundary is where correctness matters
-most. Two disciplines hold that line:
-
-- **One bounds-checked seam.** Every guest-physical memory access goes through a
-  single overflow-safe accessor that fails closed: an out-of-range address reads
-  as zero and drops the write, so a malicious descriptor ring can never steer the
-  VMM outside guest RAM. Guest-driven device state (virtqueues, snapshot headers)
-  is validated before it is trusted.
-- **Continuous fuzzing + adversarial review.** The guest-facing parsers (virtio
-  transport and devices, the vsock protocol engine, the terminal parser, the
-  snapshot-header decoder) run always-on fuzz smoke in the test suite, and the
-  guest→host surface is reviewed adversarially. Specific hardening fixes are
-  recorded in the [changelog](CHANGELOG.md).
-
-nether is pre-1.0 and has had **no external audit**. Don't run untrusted guests in
-production yet. But "malformed guest input must never corrupt the host" is a
-first-class, tested invariant here, not an afterthought.
-
-## Build & run (Apple Silicon)
-
-Requires **Zig 0.16.0** ([ziglang.org/download](https://ziglang.org/download/)) and
-an Apple Silicon Mac. The HVF backend needs a hypervisor entitlement, or boots fail
-`HV_DENIED`:
+Requires **Zig 0.16.0**. On Apple Silicon:
 
 ```sh
 zig build -Dtarget=native
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
-./scripts/fetch-guest-image.sh    # fetch/build a bootable aarch64 Linux guest
-./zig-out/bin/nether              # boots kernels/Image to an interactive shell
+./scripts/fetch-guest-image.sh
+./zig-out/bin/nether
 ```
 
-The guest kernel `Image` + rootfs is **not** checked in (it's gitignored);
-`scripts/fetch-guest-image.sh` builds one from a pinned Alpine release into
-`kernels/`. See [`docs/running-on-hvf.md`](docs/running-on-hvf.md) for the manual
-steps and a sample `nether.conf`. If `xcode-select` points into Xcode.app (e.g.
-during iOS work), prefix host-linking commands with
-`DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
+The native macOS install step signs `zig-out/bin/nether` with the hypervisor
+entitlement by default. `-Dcodesign=false` disables signing; see
+[code signing](docs/codesigning.md). Run the installed binary shown above.
 
-For the x86/KVM reference backend, see
-[`docs/running-on-kvm.md`](docs/running-on-kvm.md).
+The kernel and rootfs are not checked in. The image script builds the HVF guest
+artifacts under `kernels/`. If native linking cannot find the SDK, prefix the
+build with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
 
 ```sh
-zig build test          # run the test suite (includes the always-on fuzz smoke)
+zig build test                         # host tests; no VM boot required
+zig build -Dtarget=x86_64-linux         # KVM binary; this is also the default target
 ```
 
-Every latency and behavior claim above has a live proof script under `scripts/`;
-[`docs/reproducing.md`](docs/reproducing.md) indexes what each proves and how to run it.
+Running KVM requires an x86-64 Linux host with access to `/dev/kvm` and the
+guest layout in [Running on KVM](docs/running-on-kvm.md). For HVF configuration,
+see [Running on HVF](docs/running-on-hvf.md).
 
-**Provisioning a base to fork:** [`docs/provisioning.md`](docs/provisioning.md) walks the path
-from a guest image to a warm base to a fork, driven by a declarative recipe
-([`examples/base.nether.toml`](examples/base.nether.toml), run with `scripts/bake.py`).
+[Provisioning](docs/provisioning.md) describes the HVF base recipe runner.
+[Swerver guest per request](docs/swerver-guest.md) describes the application demo.
 
-**Swerver in every fork:** [`docs/swerver-guest.md`](docs/swerver-guest.md) builds
-the real HttpArena Swerver application into a warm guest, then routes a unique
-tenant request through a host Swerver gateway to a fresh copy-on-write VM.
+## Security and verification
+
+The design assumes a hostile guest. Bounds-checked guest-memory helpers, device
+validation, unit tests, and fuzz-smoke tests provide defenses, but do not establish
+that every guest-input path is safe. Nether is pre-1.0 and has had no external
+security audit. See [SECURITY.md](SECURITY.md) for scope and private reporting.
+
+The [stack status](docs/stack.md#verification-scope) separates compile and unit
+checks from live VM proofs. Passing host tests does not verify an end-to-end
+deployment or establish production readiness.
 
 ## Layout
 
+```text
+src/main.zig       executable: backend boot, restore, and runtime wiring
+src/root.zig       library exports
+src/hv/           HVF and KVM backends, VM state, KVM snapshots
+src/agent/        control, metering, HVF snapshots, shared platform setup
+src/virtio/       transport and devices, including the vsock protocol engine
+src/chipset/      platform devices, interrupt and bus plumbing
+src/boot/         PVH/ELF loading and device tree generation
+src/mem/          guest memory maps
+src/net/          user-mode networking
+src/common/       config, host helpers, locks
+src/vt/           terminal parser and screen
+src/fuzz.zig      guest-facing parser fuzz smoke
+docs/             architecture, protocols, operational guides, history
 ```
-src/main.zig       thin binary wrapper over the core
-src/root.zig       library root a host platform embeds
-src/hv/            hypervisor backends: HVF (Apple, aarch64) + KVM (Linux, x86-64) + shared seam
-src/agent/         control plane, metering, snapshot / fork / park lifecycle
-src/virtio/        virtio devices: blk, net, rng, vsock (protocol engine + device glue)
-src/chipset/       platform devices: GIC, PL011 UART, PL031 RTC, timer, PSCI
-src/boot/          guest boot: DTB, kernel/initramfs load, memory map
-src/mem/           guest physical memory map (single source of truth)
-src/net/           host networking (slirp-style egress)
-src/common/        shared helpers (config, host utils, locks)
-src/vt/            terminal subsystem: vendored parser + screen grid
-src/fuzz.zig       always-on fuzz-smoke for the guest-facing parsers
-docs/              design · roadmap · decisions · control protocol · runbooks
-```
 
-## Toolchain
+`build.zig.zon` declares version 0.1.1, Zig 0.16.0, and no external package
+dependencies. See [versioning](docs/versioning.md).
 
-Targets **Zig 0.16.0 stable**. `build.zig.zon` pins `minimum_zig_version` and has
-no external dependencies, so the build is self-contained. See
-[`docs/bringup-notes.md`](docs/bringup-notes.md).
+## Development and license
 
-## How it's built
-
-nether is developed with heavy AI assistance (Claude Code), and the commit cadence
-reflects that. That's stated plainly because the discipline is the point: velocity
-only counts if the result is correct, so correctness here is *demonstrated*, not
-asserted: a green test suite on every change, always-on fuzzing of the guest-facing
-parsers, proof scripts that reproduce the fork/park/boot latency claims, and
-adversarial review of the guest→host boundary. Authorship is owned openly; the
-verification is what earns the trust.
-
-## License
+The project is developed with AI assistance. Source review, automated checks,
+and live runtime proofs have distinct scopes; none substitutes for the others.
 
 [Apache-2.0](LICENSE).

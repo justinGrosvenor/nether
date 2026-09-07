@@ -22,9 +22,10 @@ cd ~/nether
 ```
 
 On a macOS host building a macOS target, `build.zig` runs `scripts/sign.sh` on the
-installed binary as the last step, so `zig build -Dtarget=native` (and `zig build run`)
-always leave a signed, entitlement-verified binary. The whole "rebuilt, forgot to
-re-sign, HV_DENIED" class is gone.
+installed binary as the default final step. Run `./zig-out/bin/nether` after
+`zig build -Dtarget=native`. The `run` step uses Zig's cached executable, while
+signing targets the installed copy; do not rely on `zig build run` for HVF.
+Explicit `zig build install` bypasses the default signing step.
 
 - `scripts/sign.sh` is the single source of truth for signing. It enforces all four
   gotchas below (asserts Mach-O arm64, signs, reads the entitlement back macOS-26-aware),
@@ -55,7 +56,7 @@ $ZIG build -Dtarget=native
 file zig-out/bin/nether                        # must say: Mach-O 64-bit executable arm64
 
 # 3. Sign it ad-hoc with the hypervisor entitlement.
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
+codesign --sign - --entitlements nether.entitlements --generate-entitlement-der --force zig-out/bin/nether
 
 # 4. Verify the entitlement actually embedded (see gotcha #2).
 codesign -d --entitlements :- zig-out/bin/nether 2>/dev/null | grep -aq hypervisor \

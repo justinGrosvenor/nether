@@ -1,19 +1,26 @@
-# Control protocol v2 - "frame everything" (PROPOSAL)
+# Control protocol v2: framing and migration reference
 
-Status: **IMPLEMENTED in nether** (2026-07-04). `proto_version` is now `2`; every command/ack
-reply is framed, with negative trailer exits for control-plane errors and a command-intake
-guard against forged frames. Reference client `tools/nether-ctl.c` speaks both v1 and v2.
-Proven live on HVF (`scripts/proto_v2.py`). **Consumers still to migrate:** the swerver
-`control_client`, its console codec, and the supervisor - each reads `proto_version`
-from the `__info__` handshake, so they can adopt the uniform framed loop (and drop the settle
-timer) at their own pace; a v1 client still works against a v2 server (section 4). This doc is
-the design + migration reference; the live contract is in [control-protocol.md](control-protocol.md).
+**Implemented in Nether.** `proto_version=2` frames command/ack replies and
+uses negative trailer exits for host control errors. The HVF
+`scripts/proto_v2.py` proof is a historical live check, not rerun in the
+2026-09-06 audit. The current contract is in
+[control-protocol.md](control-protocol.md).
+
+The reference C client and console support Nether v1/v2. The supervisor's
+southbound client accepts both; its northbound service intentionally advertises
+v1 to Swerver. The inspected Swerver WASM control client still requires v1,
+so it connects to the supervisor rather than directly to a v2 Nether socket.
+See [versioning](versioning.md).
+
+Sections describing the v1 problem and implementation options retain the design
+history. They are not a list of changes still needed in Nether.
+
 Decisions taken: single `-1` control-error code (section 3.4), and **Option A** - all `ERR`/`OK`
 framed uniformly (section 6).
 
 ## 1. Why
 
-Today (v1) a reply is one of two line shapes for the "command/ack" commands:
+In v1 a reply is one of two line shapes for the "command/ack" commands:
 
 - **Framed**: `<body> 0x1e <exit> \n` - `__info__`/`__stats__`/`__help__` and shell commands.
 - **Bare**: `ERR <reason>\n` or `OK <reason>\n` with **no `0x1e`** - `__shutdown__`,
@@ -126,7 +133,9 @@ error (body is `ERR <reason>`). No timer. No bare/framed branch.
 ## 4. Backward compatibility
 
 v2 is a wire change, so it is gated on `proto_version`. But a v1 consumer talking to a v2
-nether **mostly still works**, which makes rollout safe:
+nether may interoperate at the reply level **if it accepts the handshake**.
+A client that rejects version 2, such as the inspected Swerver control client,
+does not reach these cases:
 
 | v1 consumer path on a v2 nether | Behavior | Verdict |
 |---|---|---|
@@ -139,25 +148,25 @@ The handshake is version-safe: `__info__` is framed in **both** v1 and v2, so a 
 it the same way and learns `proto_version` before it has to pick a read strategy.
 
 A **v2-aware** consumer must still handle v1 servers until every nether is upgraded: read
-`proto_version` from `__info__`, and if `1`, keep the settle-timer + bare-guard path; if `>=2`,
+`proto_version` from `__info__`, and if `1`, keep the settle-timer + bare-guard path; if `2`,
 use the uniform framed loop and treat `__shutdown__`/`__snapshot__`/`__put__`/`__get__` as
 framed. This dual-path period ends when all deployed nether are v2.
 
-## 5. Consumer migration
+## 5. Consumer migration status
 
-- **`tools/nether-ctl.c`** (reference): add v2 to `is_framed()` (shutdown/snapshot/put/get
-  become framed); gate the `bare_status_line` settle path on `proto_version==1`. ~20 lines.
-- **swerver `control_client`**: same shape change; drop `SETTLE_MS` on v2.
-- **swerver console codec** (`clients/nether/codec.ts`, `connection.ts`): `isFramed()`
-  returns true for the ack commands on v2; delete the settle timer on v2 (fixes the
-  truncation bug found in review directly). `unescapeBody`/frame-finding are unchanged.
-- **the supervisor**: uses `__info__`/`__shutdown__`; gains the uniform loop.
+| Consumer | Source status at the audit |
+| --- | --- |
+| `tools/nether-ctl.c` | v1/v2-aware reference client |
+| Console Nether connection/codec | Accepts 1/2; uses the bare-reply settle guard only for v1 |
+| Supervisor southbound client | Accepts 1/2 and handles framed acknowledgments |
+| Supervisor northbound server | Advertises 1 for `__info__` and `ensure` |
+| Swerver WASM `control_client` | Requires 1; connects to the supervisor in this stack |
 
-All four already read `proto_version` from the `__info__` handshake, so the version gate has a
-home. Nether ships one version at a time (no per-client downgrade); consumers adapt off
-`proto_version`.
+Do not delete v1 support while the supervisor's public interface still uses it.
+Test the particular client/server pair; the compatibility examples above are
+not a guarantee that a v1-only client accepts a v2 handshake.
 
-## 6. Nether implementation sketch
+## 6. Original Nether implementation sketch (historical)
 
 - Bump `PROTO_VERSION` 1 -> 2 (`src/agent/control.zig`). `__info__`/`__help__` report it.
 - Replace the bare `reply(c, "ERR ...")` / `reply(c, "OK ...")` sites (41 today) with framing
@@ -175,7 +184,7 @@ home. Nether ships one version at a time (no per-client downgrade); consumers ad
 - The framed-report path (`__info__`/`__stats__`/`__help__`) and the guest-command relay are
   already framed - no change.
 
-## 7. Tests
+## 7. Original test plan (historical)
 
 - Flip the wire-shape assertions in the integration-contract test (`control.zig`,
   "control protocol: introspection replies, versioning, observer gating"): the bare `ERR`/`OK`
@@ -202,7 +211,7 @@ home. Nether ships one version at a time (no per-client downgrade); consumers ad
   bare/framed timing ambiguity - a consumer still needs the settle timer for the bare replies.
   Orthogonal; could layer on later, but v2 makes it unnecessary for the ack commands.
 
-## 9. Rollout
+## 9. Original rollout plan (historical)
 
 1. Land v2 in nether behind the `PROTO_VERSION=2` bump + framed replies + flipped tests.
 2. Update `tools/nether-ctl.c` (reference) in the same change, dual-path on `proto_version`.
@@ -215,8 +224,8 @@ home. Nether ships one version at a time (no per-client downgrade); consumers ad
 - **Distinct negative codes now or later?** v2.0 uses a single `-1`; assigning `-2/-3/-4` per
   error class is additive and can wait for a consumer that wants to branch without string
   matching.
-- **Option A vs B for streamed-command errors** (section 6) - A is simpler; B preserves
-  "streamed replies never contain `0x1e`." Pick before implementing.
+- **Streamed-command errors:** resolved as Option A; error replies are framed.
+  Successful streamed/binary replies retain their own shape.
 - **Do we ever need framed *streaming*?** If a future consumer wants a hard end-of-stream
   marker on `__events__`/`__screen__` (instead of idle-gap), that is a separate length- or
   sentinel-framed streaming design, out of scope here.

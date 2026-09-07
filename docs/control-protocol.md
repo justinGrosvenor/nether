@@ -1,5 +1,13 @@
 # Nether control protocol
 
+> **Backend scope (2026-09-06):** protocol version 2 is shared, but backend
+> configuration and snapshot behavior differ. Guest privilege drop, persistent
+> `disk=` setup, storage transforms, PL031/virtual-counter handling, and the
+> established-egress resume flow below describe HVF. KVM implements full
+> snapshot/restore and park with its own format. Its new data/egress bridge
+> wiring is source-inspected and cross-built, not live-verified in this audit.
+> See [backend status](stack.md#backend-capabilities).
+
 The control socket is the integration contract between the platform (swerver) and a
 running sandbox. The platform spawns one `nether` process per sandbox, points it at a
 Unix-domain socket via `control_socket=<path>` in `nether.conf`, and drives the sandbox
@@ -223,9 +231,10 @@ form is unchanged.
 | Command | Reply | Purpose |
 |---|---|---|
 | `__shutdown__` | framed `OK` | Clean teardown: the guest stops via its power-off path and the process exits (emitting the final usage bill). Reply `OK shutting down` + `0x1e0\n`. |
-| `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a fork-source base snapshot on demand (both backends): quiesce the guest, write full machine state to `path` (default `nether.snap`, confined to the transfer jail), and resume - the sandbox keeps running. The reply (framed, exit 0 on `OK` / -1 on `ERR`) blocks until the file is on disk, so the platform knows the base is ready to fork. **Fails closed if the guest is not quiescent** (a vCPU not parked at WFI): a base captured mid-instruction can bake inconsistent state into every fork, so it returns `ERR` and resumes rather than write a dirty base. Set `snapshot_allow_dirty=1` in `nether.conf` to opt into best-effort capture. `ERR snapshot not supported on this backend` on KVM. |
+| `__snapshot__ [path]` | framed `OK`/`ERR` | Capture a base on either backend, then resume the guest. Default `nether.snap`, confined to the launch-directory jail. The reply waits for the writer to finish. HVF requires its WFI quiescence gate unless `snapshot_allow_dirty=1`; KVM uses its own vCPU pause barrier. This is not a filesystem durability guarantee. |
 | `__put__ <hostpath> <guestpath>` | framed `OK`/`ERR` | Push a host file into the guest. Bytes move over vsock with length framing (binary-safe). Host path is confined to the transfer jail. |
 | `__get__ <guestpath> <hostpath>` | framed `OK`/`ERR` | Pull a guest file to the host. Same jail + framing. |
+| *(anything else)* | framed | Run the line as a shell command in the guest; output streams back, then `0x1e<exit>\n`. Metered as a command. |
 
 The transfer jail (the launch directory, pinned at startup) is enforced **at open time**,
 not just at path-check time: host-side transfer targets (`__put__` source, `__get__`
@@ -233,22 +242,20 @@ destination, `__snapshot__`/`__park__` output) are opened relative to a jail-roo
 directory fd, component-by-component with `O_NOFOLLOW` - so a symlink swapped into the
 path between the check and the open cannot redirect the I/O outside the jail (TOCTOU;
 same-uid defense-in-depth).
-| *(anything else)* | framed | Run the line as a shell command in the guest; output streams back, then `0x1e<exit>\n`. Metered as a command. |
 
 ## Lifecycle and settlement
 
-Every session ends with a **final usage record** printed to the process's stdout/stderr
-(which the spawning platform captures), regardless of how it stopped (guest shutdown, a
-govern budget, `__shutdown__`, or a **`SIGTERM`** from the platform / process manager -
-which is caught and drained through the same clean teardown, so a forced reclaim still
-settles rather than dying silently; only `SIGKILL` skips the bill):
+Normal teardown prints a usage record to process output, including the guest
+shutdown, budget, `__shutdown__`, and handled `SIGTERM` paths. The spawning
+platform must capture it. `SIGKILL`, a crash, or an early failure can skip this
+path; output alone is not durable accounting:
 
 ```
 [nether] final usage (reason=shutdown): uptime_ms=... cpu_ms=... mem_peak_mb=... ram_mb=... cpus=... commands=... bytes_in=... bytes_out=... net_tx=... net_rx=... net_blocked=...
 ```
 
-So a client never has to poll `__stats__` at exactly the right moment to bill a sandbox:
-the platform always gets a complete, machine-readable accounting from the process output.
+The console currently records its last sampled `__stats__`, not this final
+process-output record. Neither output format establishes payment completion.
 
 ### Settlement mode (x402)
 
@@ -272,8 +279,8 @@ appears only in settlement mode). Flip it per sandbox; nothing else about the ru
 inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
 default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb`
 (sizing), `disk`/`disk_size_mb` (persistent disk; below), `app_port`/`data_socket`/
-`max_data_conns` (data-plane proxy to an in-guest server; below). All caps are reported back
-by `__info__` so a client can verify what it got.
+`max_data_conns` (data-plane proxy to an in-guest server; below). Inspect `__info__` for the settings actually applied. KVM currently uses a
+fixed 256 MiB RAM constant; its boot path does not consume `ram_mb` like HVF.
 
 ### In-guest privilege drop (`run_as`)
 
@@ -370,11 +377,12 @@ and the cap is per-VM (each VM has its own bucket, so one tenant's flood cannot 
 another). Verified live on HVF (`scripts/data_plane_pacing.py`): an 8 MiB transfer paces to
 ~1 MB/s under an 8000-kbps cap vs ~850 MB/s uncapped, byte-for-byte lossless. Data-plane
 traffic also counts as sandbox activity, so a VM busy only with proxied requests is not
-idle-reclaimed. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
+idle-reclaimed by Nether's activity watchdog. The separate supervisor only
+refreshes idle age on ensure/readiness, so its reclaim behavior differs. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
 `data_idle_ms`, `data_rate_kbps`; `__stats__` and the bill report `data_conns` +
 `data_ms` (plus the shared `bytes_in`/`bytes_out`). A snapshot **fork inherits** `app_port`
 (on the cmdline), so a warmed base with the tenant server already running forks into an
-instantly-serving VM. Verified live on HVF: concurrent host connections reach an ordinary
+already-warm VM. Verified live on HVF: concurrent host connections reach an ordinary
 `127.0.0.1:8080` guest server and back; the cap refuses excess; the meters advance.
 
 ### Egress plane (guest outbound via the platform; park-while-awaiting-upstream)
@@ -412,7 +420,7 @@ state, it SURVIVES a snapshot (unlike slirp NAT flows, which hold real host sock
 die with the process). So the platform can run this play: the guest issues an outbound
 request through the egress plane and blocks in `recv()`; the platform (holding the real
 upstream socket) notes the conn id from the preamble; it issues **`__park__ <path>`** -
-the guest now exists only as a park file, costing nothing, while the upstream request
+the VMM exits and the snapshot file remains, while the upstream request
 stays alive in the platform's process. When the reply arrives, the platform restores the
 park; nether enumerates the surviving egress conns and re-dials `egress_socket` with
 `resume=1 conn=<id>` for each; the platform splices the reply in, and the guest's
@@ -423,9 +431,13 @@ reply delivered).
 Only vsock-proxied conns survive a park; anything over virtio-net/slirp still dies on
 restore and must re-establish at TCP level.
 
-### `__park__` and the snapshot lifecycle (strict)
+### `__park__` and the snapshot lifecycle (HVF details)
 
-**`__park__ [path]`** is the atomic end of a session that intends to come back:
+Both backends implement `__park__`; the following gates, clock behavior, and
+file kinds describe HVF. A failed KVM park can leave vCPUs paused, so callers
+must not assume every capture error resumes the guest.
+
+**`__park__ [path]`** ends a successful HVF capture session:
 quiesce (fail-closed at WFI, like `__snapshot__`) -> **ring gate** (refuse if the
 data/egress bridge still holds undelivered bytes - they are host memory a snapshot cannot
 carry; waits up to ~1s for drain, then `ERR` unless `park_dirty=1`) -> capture ->
@@ -499,14 +511,14 @@ randomness in the instant between resume and the IRQ being taken is vanishingly 
 rising edge is latched pending before cpu0 runs, so the handler runs before userspace
 resumes), but is not formally zero.
 
-**Snapshot kinds.** Every snapshot file carries its lifecycle contract in the header:
+**Snapshot kinds.** HVF NSNP files carry their lifecycle kind in the header; KVM NSKV does not:
 
 - **base** (`__snapshot__`): durable; forks many; re-bake on version drift.
 - **park** (`__park__`): **one-shot**. A wake CONSUMES it - `macRestore` unlinks the
   file at the moment the guest resumes (the fork's COW RAM mapping keeps the inode
   alive), so a second wake of the same park fails with `cannot open`. One park = one
-  wake, enforced by the filesystem, not platform discipline - a parked conn can never be
-  revived into two forks. `validate_snapshot` reports `kind=base` or `kind=park
+  sequential wake from that pathname. This is not an exclusive claim across
+  concurrent opens or copied files; serialize wake operations in the platform. `validate_snapshot` reports `kind=base` or `kind=park
   (one-shot)`; an unknown kind is rejected fail-closed.
 
 Strict hygiene, both kinds: a failed capture unlinks its partial file (a half-written
@@ -515,14 +527,18 @@ written 0600.
 
 ## Snapshot / fork
 
+The following device inventory describes HVF. See the KVM runbook for NSKV.
+Set both `restore=1` and `restore_from=<path>`; a path alone does not enable restore.
+
+
 **Baking a base.** The platform pre-bakes a fork source by driving a control-mode sandbox
 to a ready state (install deps, warm caches) and issuing **`__snapshot__ <path>`** - an
 on-demand capture that quiesces the guest, writes the base, and resumes, all while the
-sandbox stays driveable. This is the production path; the fixed-timer `snapshot_save=1`
-mode is a demo. Because the base is captured *after* the sandbox is driven, its forks
+sandbox stays driveable. This is the on-demand path; the fixed-timer `snapshot_save=1`
+mode is an HVF demo (KVM uses `snapshot=1`). Because the base is captured *after* the sandbox is driven, its forks
 inherit that warmed state (and, since it was control-mode, a live agent connection).
 
-**Vetting a base.** Before relying on a stored base, run `nether` with
+**Vetting an HVF base.** Before relying on a stored base, run `nether` with
 `validate_snapshot=<path>` in `nether.conf`: it checks the file against the current build
 (format version, struct-layout fingerprints, section sizes vs the file length, and the
 vsock engine state) and exits `0` with a one-line summary, or non-zero with a specific
@@ -541,9 +557,9 @@ The load-bearing property: the agent's vsock connection **survives the fork**. T
 captures the vsock transport (virtio device) state, the host-side engine state (connection
 table, listen registry, credit, staging ring), and the agent's connection id; the restore
 re-wires the engine's callbacks to the new process and resumes that connection mid-stream.
-So a driving command (a shell line, `__put__`/`__get__`) **round-trips immediately with no
-reconnect** - there is no reconnect barrier for a client to wait on. A client drives a fork
-exactly as it drives a fresh boot: connect → `__info__` → send commands.
+A client connects, reads `__info__`, then sends commands over the restored
+channel. Verify a guest command when the workflow needs agent readiness:
+the handshake is host-generated and does not establish guest responsiveness.
 
 What carries across: RAM (COW), per-vCPU state, GIC, console + virtio-blk, the disk;
 when the base was control-mode, the vsock device + engine + agent connection; and when the
@@ -554,7 +570,7 @@ own server live in guest RAM, so a fork inherits them already running. The host-
 so the restore path stands up a fresh one when the fork's `nether.conf` sets `data_socket`
 - giving each fork its own data socket onto the *same* warm tenant server. So a base baked
 with `app_port=` (forwarder running) and driven to start its server forks into an
-**instantly-serving** upstream: the fork answers requests on its `data_socket` in tens of
+**already-warm** upstream: the fork answers requests on its `data_socket` in tens of
 milliseconds with no reboot and no server cold start. The slirp **NAT engine** does **not** carry across - it holds real host
 sockets a forked process can't inherit, so the engine restarts fresh: in-flight outbound
 flows reset and the guest re-establishes them at the TCP level (normal for a fork). The
@@ -565,4 +581,5 @@ console + virtio-blk only even if `control_socket=` is set; the restore logs an 
 NOTE saying so. Snapshot-fork works on both backends; the image formats differ and are not
 portable across them. Fork latency on HVF is ~10 ms to a driveable VM (COW RAM map; ~25 ms
 to a first served request); on KVM a COW-mapped fork reaches a live control socket in
-~150 ms.
+~150 ms in earlier bare-metal notes. These are historical measurements, not
+results rerun in the current documentation audit.

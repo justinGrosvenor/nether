@@ -1,6 +1,6 @@
 # Running Nether on a KVM host
 
-Nether can only *run* on Linux x86_64 with hardware virtualization. This is the
+Nether's KVM backend runs on Linux x86-64 with hardware virtualization. This is the
 turnkey path from a fresh box to a live boot. AWS needs a bare-metal instance;
 GCP and Azure expose nested virtualization on ordinary VMs (cheaper, no metal).
 
@@ -157,10 +157,10 @@ copies only what it writes.
 `snapshot_after_s` seconds (default 8), quiesces the guest, writes `snapshot_path`
 (default `nether.snap`), and exits. The image is the guest.
 
-**On-demand capture (production).** With a control socket configured, `__snapshot__
+**On-demand capture.** With a control socket configured, `__snapshot__
 [path]` captures a base and resumes the guest; `__park__ [path]` captures, bills, and
-exits. Same [control protocol](control-protocol.md) and same SDK fork path as HVF
-(`Sandbox.create` forks a KVM image directly).
+exits. These commands use the shared [control protocol](control-protocol.md),
+with backend-specific capture behavior.
 
 **Restore / fork.** In a working directory with the same device set as the base
 (`vsock`, `net`, `cpus`, and whether `disk.img` is present):
@@ -171,18 +171,27 @@ restore_from=nether.snap
 ```
 
 The restored guest resumes where it was captured with its agent connection intact, so
-the control plane drives it immediately with no reconnect (about 150 ms to a live
-control socket). Two forks of one base get distinct VM Generation IDs: on restore
+the control path can reattach without a new guest-side connection. Earlier
+bare-metal notes recorded about 150 ms to a live control socket; this was not
+remeasured in the 2026-09-06 source audit. Two forks of one base get distinct VM Generation IDs: on restore
 nether writes a fresh GUID into the fork's private page and pulses GPE0/SCI, the
 guest's stock `vmgenid` driver reseeds the CRNG (`random: crng reseeded due to
 virtual machine fork`), and sibling forks draw different random streams from their
 first read. `fork_reseed=0` opts out. The guest kernel needs `CONFIG_VIRT_DRIVERS` +
 `CONFIG_VMGENID` (already in the recipe above).
 
-Constraints: images are same-host, same-build (native-endian, KVM format `NSKV`, not
+Constraints: retain the same host/build environment (native-endian, KVM format
+`NSKV` v2, not
 interchangeable with HVF images); the fork must launch with the same vCPU count and
 device set as the base; the slirp NAT engine restarts fresh (in-flight outbound flows
-reset, as on HVF); deflate-compressed bases and incremental diffs are HVF-only today.
+reset, as on HVF). HVF storage tools do not apply to NSKV. KVM park files do
+not carry the HVF one-shot kind/unlink contract. A failed KVM park can leave
+vCPUs paused; callers must not assume every capture error resumes execution.
+
+The inspected local KVM changes add data/egress bridge wiring. They were
+cross-built but not live-tested in this audit. There is no matching call to
+resume established egress connections on KVM restore; do not apply the HVF
+park-while-awaiting-upstream proof to this backend.
 
 ## Notes
 
@@ -197,11 +206,9 @@ reset, as on HVF); deflate-compressed bases and incremental diffs are HVF-only t
 - Full bring-up gotchas (segment limits, CPUID, PVH magic, the 16-byte serial
   stall, IOAPIC, ACPI) are in [bringup-notes.md](bringup-notes.md).
 - **Web console**: `touch nether-web` before `zig build run` to serve the live
-  console grid over HTTP on port 9000 (the guest's serial output, rendered to
-  HTML, polled by the page). Browse `http://<box-ip>:9000` (open the port / use an
-  SSH tunnel). It is interactive: keystrokes in the page are mapped to terminal
-  byte sequences and POSTed to the guest's serial RX. Without the marker, no port
-  is bound.
+  console grid over HTTP on port 9000. Use the tokenized loopback URL printed
+  by Nether, or an SSH tunnel to that listener. The page renders the guest's
+  serial output. Without the marker, no port is bound.
 - **virtio-vsock**: `touch nether-vsock` before `zig build run` to present a
   vsock device (PCI 0:2.0, guest CID 3) with a host echo service on port 1234.
   The guest kernel needs `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`. From the
@@ -210,17 +217,17 @@ reset, as on HVF); deflate-compressed bases and incremental diffs are HVF-only t
   # guest: needs a vsock-aware tool (socat with VSOCK, or a few lines of python)
   socat - VSOCK-CONNECT:2:1234     # type a line; it comes straight back
   ```
-  This is the spine for the swerver<->guest channel; the echo is a placeholder
-  for the real listener.
+  Echo is a standalone smoke service. Control mode also enables the real guest
+  agent listener and the shared control protocol.
 - **virtio-net**: enable with `net=1` in `nether.conf` or `touch nether-net`
   before launch. Presents PCI 0:3.0 (MAC 52:54:00:12:34:56). The guest kernel
   needs the virtio-net driver (`-e VIRTIO_NET` in the config recipe above).
   - **Default (slirp):** in-VMM user-mode NAT with the egress firewall — same as
     HVF. No host tap or root. Address plan 10.0.2.0/24 (guest .15, gateway .2,
     DNS .3). Tunables: `net_open`, `net_allow`, `net_block`, `net_rate_kbps` in
-    `nether.conf`. **Known issue on KVM:** the NIC enumerates but the guest may not
-    get an `eth` interface yet (under investigation; vsock on the same MSI-X path
-    works).
+    `nether.conf`. Earlier bare-metal notes record a working guest interface;
+    the old enumeration-only bring-up issue is no longer the stated backend
+    status. Configure the guest interface in `/init` for the image you build.
   - **Optional (tap):** `net_tap=1` or `touch nether-net-tap` for raw L2 on `tap0`
     (no egress firewall). The host must pre-create and configure `tap0`:
     ```sh

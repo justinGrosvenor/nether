@@ -1,73 +1,44 @@
-# base.nether.toml - a declarative nether base recipe.
-#
-# A base is a WARM memory snapshot: this recipe boots a guest, drives it to a running
-# state, and freezes it so forks resume in ~10 ms. Bake it with:
-#
+# HVF recipe for a warm Python HTTP server.
+# Prerequisites (from the repository root):
+#   ./scripts/fetch-guest-image.sh
+#   Prepare kernels/rootfs as described in docs/provisioning.md, then:
+#   ./tools/build-guest-aarch64-runtimes.sh   # Docker; includes Python
 #   ./scripts/bake.py bake examples/base.nether.toml
-#   ./scripts/bake.py fork base.snap --name tenant-1
+#   ./scripts/bake.py fork examples/base.snap --name tenant-1
 #
-# See docs/provisioning.md for the annotated field reference.
+# Optional top-level guest user setting, before all tables:
+# run_as = "nether"
 
 [image]
-# The capability layer (what the guest CAN do). Build it however you like - a Dockerfile
-# you export, Packer, Ansible against a chroot, or scripts/fetch-guest-image.sh. nether
-# only needs a kernel + initramfs; it does not reinvent image building.
-kernel = "kernels/Image"
-initramfs = "kernels/initramfs.cpio.gz"
+# Image paths are relative to THIS recipe directory.
+# The runner links this directory as kernels/ and expects these exact basenames.
+kernel = "../kernels/Image"
+initramfs = "../kernels/initramfs.cpio.gz"
 
 [resources]
 ram_mb = 512
 cpus = 2
 
-[disk]
-# Exactly one of these. In-memory disk is CAPTURED in the snapshot and COW-forked (cheap to
-# share, adds size_mb directly to the snapshot). A file-backed disk is persistent, NOT
-# captured, and skips the eager read on restore (so it is also the faster-restore choice).
-size_mb = 256
-# file = "app.img"     # file-backed: persistent + lean snapshot + fast fork
-
 [network]
-egress = "deny"   # deny | allow | <policy>. Default-deny is the safe base.
-
-run_as = "app"    # run guest commands as a non-root user (defense in depth).
-
-# Your code, pushed over the control socket before warm-up. NOTE: each file must be
-# <= 16 MiB (the __put__ transfer cap). Bake large assets (models, node_modules) into the
-# initramfs or a file-backed disk instead - the recipe runner will refuse an oversize file.
-[[files]]
-host = "./app"
-guest = "/app"
-
-# Warm-up: commands run in the guest, in order. `run` awaits completion; `start` launches
-# a long-running process and moves on.
-[[warmup]]
-run = "/app/install-deps.sh"
+egress = "deny"  # leaves the NIC off; the vsock data bridge still serves HTTP
 
 [[warmup]]
-start = "/app/server --port 8080"
+start = "python3 -m http.server 8080 --bind 127.0.0.1 --directory /tmp"
 
-# The base is warm when this gate passes. A declared condition, polled finely - NOT a fixed
-# sleep (fixed sleeps are how you get latency numbers wrong by 5x). Use `port` or `command`.
 [ready]
-port = 8080
-# command = "curl -sf localhost:8080/health"
+# A command avoids relying on the guest shell's /dev/tcp extension.
+port = 8080     # also tells the runner to emit app_port=8080
+command = "python3 -c \"import socket; socket.create_connection(('127.0.0.1',8080),1).close()\""
 
 [snapshot]
-out = "base.snap"
-kind = "base"       # base = durable, forks many. (park = one-shot, host-managed.)
+out = "base.snap"  # produces examples/base.snap
+compress = "none"  # or "deflate"; fork rehydrates compressed bases first
 
-# --- storage policy (the recipe is where policy lives; the VMM implements the mechanism) ---
-# Field names/semantics per docs/incremental-snapshot-spec.md. Shaped now so honoring them
-# later needs no format break. Until the sparse-storage / incremental work lands, the runner
-# parses these and rejects the gated one; the rest are no-ops.
-# sparse   = true     # [ships w/ storage work] zero pages as filesystem holes; near-free, on by default
-# compress = "none"   # "none" | "deflate". deflate (pure-Zig std.compress.flate, zero-dep) trades
-#                     #   CPU for a smaller stored/shipped base. The compressed base is not directly
-#                     #   forkable (a compressed RAM region can't be COW-mmap'd), so `fork` rehydrates
-#                     #   it once per host to a cached full base -> forks stay ~10 ms. Bases only.
-# ttl_s    = 0        # retention seconds for transient snapshots (0 = none); park/ttl reaper
+# Optional persistent storage (outside the snapshot, shared if forks reuse it):
+# [disk]
+# file = "/absolute/path/app.img"
+# size_mb = 64
 #
-# NOTE: incremental diff (`base=`) is intentionally NOT a bake field. Per
-# docs/incremental-snapshot-spec.md the content-diff is a __park__-only optimization (a parked
-# fork has dirtied little RAM); a durable base bake always writes a full snapshot, so its
-# storage win is `sparse` above, not diff. The runner rejects `base` in a bake recipe.
+# The runner does not consume snapshot.kind/sparse/ttl_s. It rejects a nonempty
+# snapshot.base. disk.size_mb without disk.file does not resize the ephemeral disk.
+# See docs/provisioning.md for transfer, cache, and fork-config limitations.

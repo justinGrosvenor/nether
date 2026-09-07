@@ -18,18 +18,20 @@ backend is chosen at compile time from the host OS (see
 ## 1. Build, sign, run
 
 The HVF backend is selected automatically when the target is macOS. Build
-natively, codesign with the hypervisor entitlement, then run:
+natively (the default build signs the installed binary), then run:
 
 ```sh
 DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=native
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
 ./zig-out/bin/nether
 ```
 
 `com.apple.security.hypervisor` is a restricted entitlement, but **ad-hoc signing
 (`--sign -`) works for running locally** - no paid Apple Developer account or
-provisioning profile is needed on your own machine. Re-sign after every rebuild
-(the binary's signature is replaced).
+provisioning profile is needed for local development. The default native build
+handles signing; see [code signing](codesigning.md) for manual verification.
+
+The shell output below is from an earlier guest build; current fetch pins live
+in `scripts/fetch-guest-image.sh`.
 
 With no kernel present it runs a first-light blob (prints over the PL011 and
 powers off via PSCI). With a kernel + rootfs in `kernels/` (below) it **boots
@@ -117,7 +119,13 @@ run). Bake them in with `tools/build-guest-aarch64-runtimes.sh`, which `apk add`
 runtimes into `kernels/rootfs/` via a native `linux/arm64` Alpine container (Docker runs
 arm64 natively on Apple Silicon) and repacks `kernels/initramfs.cpio.gz`:
 
-```
+```sh
+# fetch-guest-image.sh emits an archive but does not retain kernels/rootfs.
+# Extract it once if you do not already have the prepared rootfs tree.
+if [ ! -d kernels/rootfs ]; then
+  mkdir -p kernels/rootfs
+  (cd kernels/rootfs && gzip -dc ../initramfs.cpio.gz | cpio -idm)
+fi
 ./tools/build-guest-aarch64-runtimes.sh                 # default: python3 sqlite nodejs
 RUNTIMES="python3 sqlite nodejs go" ./tools/build-guest-aarch64-runtimes.sh   # custom set
 ```
@@ -125,7 +133,7 @@ RUNTIMES="python3 sqlite nodejs go" ./tools/build-guest-aarch64-runtimes.sh   # 
 Then pair it with a **warm base snapshot** so every fork inherits the runtimes (already
 imported / warmed) instantly: boot a control-mode sandbox, drive it to a ready state, and
 `nether-ctl <sock> __snapshot__ python-base.snap`; fork per sandbox with
-`restore_from=python-base.snap`. Verified: a warm fork runs `python3`/`node`/`sqlite3`
+`restore=1` plus `restore_from=python-base.snap`. Previously verified: a warm fork runs `python3`/`node`/`sqlite3`
 immediately (see docs/control-protocol.md "Baking a base"). The runtimes roughly double
 the initramfs (~25 MB -> ~60 MB) and the warm snapshot RAM accordingly.
 
@@ -328,4 +336,5 @@ the datapaths by hand.
   Cross-compiling the Linux artifact with `zig build` is unaffected and unsigned.
 - Snapshot save/restore and COW fork work on both backends; the x86 flow is in
   [Running on KVM](running-on-kvm.md#5-snapshot-and-fork). Deflate-compressed durable
-  bases and incremental diffs are HVF-only today.
+  bases and content-diff helpers target HVF; control-driven diff capture remains
+  unwired. See [snapshot storage](incremental-snapshot-spec.md).

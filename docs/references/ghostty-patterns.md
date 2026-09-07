@@ -74,7 +74,7 @@ Build the embeddable core once; swerver consumes the Zig API with zero marshalin
 (Zig to Zig), and any foreign host gets a C ABI, from a single codebase. Decide
 the shape now even if the C side is stubbed. The comptime "Zig struct matches the
 C header" discipline is the same one Nether already applies to hand-rolled KVM
-structs (`src/kvm.zig` ABI tests); here it is turned around onto Nether's own
+structs (`src/hv/kvm.zig` ABI tests); here it is turned around onto Nether's own
 *exported* API.
 
 **Adopt:** now, as a decision and a stub. Defer the full C surface until a
@@ -134,7 +134,7 @@ timers handle coalescing and watchdogs.
 moment there is a second host input source (a second serial, vsock, a control
 socket, a timer), switch to one I/O thread running an event loop rather than a
 thread per fd. libxev is in the Zig ecosystem, and its `xev.Async` is the same
-primitive as the eventfds already in `src/irqchip.zig`. The
+primitive as the eventfds already in `src/hv/irqchip.zig`. The
 [design](../design.md) already names "one I/O thread on epoll over eventfds" as
 the target; this is the concrete way to build it.
 
@@ -158,15 +158,15 @@ const OptionalTable = genTableType(true); // accumulate + detect invalid transit
 (pattern 2, D5 grid-level golden tests, web console) ever lands, this is the
 reference VT parser to copy. Generally: the technique (build an exactly-sized
 dispatch table at comptime with completeness validation) fits how Nether already
-comptime-generates ioctl numbers (`src/kvm.zig`) and the memory map
-(`src/memmap.zig`). The DEC parser is small and well-specified, a weekend not a
+comptime-generates ioctl numbers (`src/hv/kvm.zig`) and the memory map
+(`src/mem/memmap.zig`). The DEC parser is small and well-specified, a weekend not a
 project.
 
 **Adopt:** done, and the server-side console seam this pattern pointed at is
 realized. The parser slice (`Parser.zig` + `parse_table.zig`) is vendored and
 ported to 0.16 in `src/vt/`; the grid is owned (`src/vt/Screen.zig`: full enough
 for shells and TUIs, with UTF-8, scrollback, alt screen, and scroll regions);
-and `src/webconsole.zig` renders the live grid to HTML over a minimal HTTP
+and `src/agent/webconsole.zig` renders the live grid to HTML over a minimal HTTP
 server. We never needed Ghostty's terminal lib as a dependency: owning the parser
 plus a purpose-built grid covered the whole console use case.
 

@@ -29,9 +29,11 @@ which appends `Signed-off-by: Your Name <your@email>` (matching your git identit
 
 ## Build, test, run
 
+The following is the Apple Silicon/HVF path. For KVM, build
+`zig build -Dtarget=x86_64-linux` and use the KVM guest runbook.
+
 ```sh
-zig build -Dtarget=native                       # build the native binary
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
+zig build -Dtarget=native                       # Apple Silicon build; signs installed binary
 zig build test                                  # run the test suite (incl. fuzz smoke)
 ./scripts/fetch-guest-image.sh                  # fetch/build a bootable guest image
 ./zig-out/bin/nether                            # boot it

@@ -1,43 +1,49 @@
 # Limitations
 
-Honest scope notes for the current tree. These are intentional cuts and sequencing choices, not a backlog of unknown bugs.
+These are current source and integration limits, including unfinished work.
+See [stack status](../stack.md) for the backend matrix and verification scope.
 
-## Backends are asymmetric
+## Snapshot and backend differences
 
-| Track | Maturity |
-| --- | --- |
-| **HVF / aarch64** | Platform layer live: Linux boot, virtio (blk/net/vsock/gpu), snapshot-fork, control plane, govern, observe, meter, SMP |
-| **KVM / x86-64** | PVH Linux boot, virtio-blk/net/vsock, SMP, IOAPIC; the platform layer (control plane, metering, govern, observe, watchdogs, slirp + egress firewall) and the cross-process snapshot fork (COW restore, SMP fork, `__snapshot__`/`__park__`, vmgenid reseed), all **run-verified on bare metal**. Remaining gap: virtio-gpu |
+HVF and KVM both implement full snapshots, COW restore, and park. They use
+different formats (NSNP v5 and NSKV v2), with build-sensitive device and CPU state.
+Keep snapshots paired with the build and environment that created them.
 
-KVM parity is tracked in the [roadmap](../roadmap.md).
+HVF has additional clock handling, park-file consumption, storage transforms,
+and resume demonstrations. Content-diff helpers are present, but control-driven
+diff capture is not wired. KVM has no equivalent GPU or storage-transform
+integration, and its new data/egress bridge wiring has not been live-verified in
+this documentation audit. GPU device availability does not imply GPU state is
+captured by a snapshot.
 
-## Snapshot / restore
+HVF persistent disk files are shared external state, not part of the COW RAM
+image. Neither a snapshot nor the console restores arbitrary external services
+or TCP peers. Midstream resume depends on the separate relay and specific
+HVF restoration path demonstrated by the proof scripts.
 
-Snapshot save, COW restore (`restore=1` / `restore_from=`), and the on-demand `__snapshot__`/`__park__` capture work on **both** backends. The image formats differ (HVF vs KVM `NSKV`) and are same-host, same-build: a base is not portable across backends or machines. Still HVF-only: the rewind demo, GPU scanout capture, deflate-compressed durable bases, and incremental (diff) snapshots. See [Running on KVM](../running-on-kvm.md#5-snapshot-and-fork) for the x86 flow.
+## Guest and host scope
 
-## Not a general-purpose VMM (yet)
+- Supported backends are macOS/aarch64 HVF and Linux/x86-64 KVM.
+- ARM uses direct kernel boot; x86 Linux uses PVH. OVMF/UEFI and Windows support
+  remain future work.
+- Linux/aarch64, live migration, VFIO passthrough, and 3D GPU acceleration are
+  not current supported paths.
+- Hardware virtualization is required; there is no software CPU emulator.
 
-- **OVMF / UEFI** is deferred. The edge path is **PVH direct boot**, not full firmware emulation.
-- **Windows guests** are future scope (Phase 4+).
-- **Live migration** and **VFIO passthrough** are roadmap items, not shipping.
-- **3D virtio-gpu / virgl** is explicitly out of core. 2D framebuffer only; 3D would be out-of-process.
+## Integration and lifecycle
 
-## Embedding
+The current Swerver stack uses separate gateway, supervisor, and Nether processes.
+The proposed single-process embedding and event-loop registration are unfinished.
 
-The shipping artifact is one swerver binary with embedded nether. The integration
-contract (vsock spine, per-VM-per-worker, eventfd registration into `IoRuntime`) is
-designed but not fully wired yet. The standalone `nether` executable remains for
-dev and bringup only.
+The supervisor has an in-memory pool and no restart adoption. Reclaim uses
+ensure/readiness timestamps, not active-request leases. The console relies on
+gateway discovery and sampled VM state, with bounded in-memory histories.
 
-## API stability
+## Stability and security
 
-The library root (`src/root.zig`) and control protocol may change before 1.0. Downstream embedders should pin commits.
+The library API and wire protocols are pre-1.0. Pin compatible source revisions,
+rebake snapshots when updating, and read [versioning](../versioning.md).
 
-## Platform
-
-nether is the **isolate + govern** layer inside the swerver binary. It does not own
-routing, TLS, or billing — those stay in swerver and x402 above the embed boundary.
-
-## Roadmap
-
-Phases, done-lines, and the platform track are in [Roadmap](../roadmap.md). Architectural forks are recorded in [Decisions](../decisions.md).
+There has been no external security audit. Guest-input validation and fuzz smoke
+are defenses under development, not evidence that all malformed inputs are safe.
+The [security policy](../security.md) explains the trust boundary and reporting.

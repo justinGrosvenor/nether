@@ -1,101 +1,103 @@
 # Provisioning base VMs
 
-A **base** is the thing you fork. This page is the path from nothing to a base you can
-fork in ~10 ms, for someone who knows VMs and wants to not fight the tool.
+An image supplies the kernel and guest filesystem. A base is a snapshot of that
+image after boot and application warm-up. The current `scripts/bake.py` runner
+targets **HVF on Apple Silicon** and requires **Python 3.11+**.
 
-## The mental model: two layers, two tools
+## Prepare and bake
 
-Provisioning splits cleanly, and conflating the two is the main way people get confused:
-
-| Layer | What it is | Built with | Changes |
-| --- | --- | --- | --- |
-| **Image** | the guest's *filesystem*: kernel + rootfs, your runtimes, your app binary | anything that makes a rootfs: a Dockerfile you export, Packer, Ansible, or `scripts/fetch-guest-image.sh` | rarely |
-| **Base** | a *warm memory snapshot*: the guest booted and driven to a running state (app up, caches hot), then frozen | `nether bake` (this is the nether-native part) | often |
-
-The image is what the guest *can* do. The base is the *running state* you clone. Packer and
-Ansible build cold disk images; they cannot capture "python loaded, server accepting, caches
-hot, frozen at this instant." That warm capture is the only part nether owns. Build the image
-with whatever you already use; let nether own the freeze.
-
-## The path
+From the Nether checkout:
 
 ```sh
-# 0. Image (once per capability set): produce kernels/Image + kernels/initramfs.cpio.gz
-./scripts/fetch-guest-image.sh          # or bring your own rootfs
-
-# 1. Write a recipe (see examples/base.nether.toml)
-
-# 2. Bake: boot -> push files -> warm-up -> wait ready -> snapshot -> tear down
-./scripts/bake.py bake base.nether.toml   # -> base.snap (+ base.snap.manifest.json)
-
-# 3. Fork per tenant: restore a driveable VM in ~10 ms
-./scripts/bake.py fork base.snap --name tenant-1
+zig build -Dtarget=native
+./scripts/fetch-guest-image.sh
+# The fetch script does not retain its temporary rootfs tree.
+if [ ! -d kernels/rootfs ]; then
+  mkdir -p kernels/rootfs
+  (cd kernels/rootfs && gzip -dc ../initramfs.cpio.gz | cpio -idm)
+fi
+./tools/build-guest-aarch64-runtimes.sh
+export NETHER_ROOT="$(pwd)"
+./scripts/bake.py bake examples/base.nether.toml
+./scripts/bake.py fork examples/base.snap --name tenant-1
 ```
 
-`bake.py` is a reference runner over the control protocol your own orchestrator can drive
-directly; the declarative recipe is the ergonomic front door.
+The runtime-image helper requires Docker and adds Python, SQLite, and Node by
+default. The example starts Python's HTTP server before capture. Runtime-image
+building and a live bake were not rerun in the 2026-09-06 documentation audit.
 
-## The recipe
+The runner defaults to `~/nether/zig-out/bin/nether`; `NETHER_ROOT` changes
+the checkout root. It recreates its scratch directory before a bake
+(default `/tmp/nether-bake`) or named fork (under `/tmp/nether-fork`).
+`NETHER_WORK` changes those work roots. Use dedicated work directories:
+existing contents there are removed.
 
-The recipe is TOML (stdlib, no dependency, matching nether's zero-dep build). The annotated
-example is [`examples/base.nether.toml`](https://github.com/justinGrosvenor/nether/blob/main/examples/base.nether.toml); the fields:
+A successful fork leaves a VM process running and prints its PID, control/data
+sockets, and driveable latency. The runner is not a persistent pool supervisor.
+Use the control protocol or a process manager to shut the VM down.
 
-- **`[image]`** `kernel`, `initramfs`: the capability layer. Paths resolve relative to the
-  recipe file.
-- **`[resources]`** `ram_mb`, `cpus`.
-- **`[disk]`** (top-level) the one storage decision that matters at bake time. Exactly one of:
-  - `size_mb` (in-memory): **captured** in the snapshot, COW-forked, adds directly to snapshot
-    size.
-  - `file` (file-backed): **not captured**, persistent on its own, and it skips the eager read
-    on restore (so it is also the faster-restore choice for large disks).
-- **`[network]`** `egress`: `deny` (safe default) | `allow` | a policy.
-- **`run_as`**: run guest commands as a non-root user.
-- **`[[files]]`** `host`/`guest`: your code, pushed over the control socket before warm-up.
-  Each file must be **≤ 16 MiB** (the `__put__` cap); the runner refuses an oversize file.
-  Route large assets (models, `node_modules`) into the initramfs or a file-backed disk.
-- **`[[warmup]]`** ordered steps: `run` awaits completion, `start` launches a long-running
-  process and moves on.
-- **`[ready]`** the readiness gate: `port` or `command`. A *declared condition, polled
-  finely*, not a fixed sleep. (Fixed sleeps are how you get latency numbers wrong by 5x.)
-- **`[snapshot]`** `out`, `kind = "base"`, plus a storage-policy block defined in
-  [`docs/incremental-snapshot-spec.md`](incremental-snapshot-spec.md): `sparse` (zero pages
-  as holes; near-free, default on), `compress` (`"none"`/`"zstd"`; note zstd trades disk for
-  CPU *and forfeits the ~10 ms lazy restore*, since a compressed RAM region can't be COW-mmap'd,
-  so it's bases-only), and `ttl_s` (retention). Incremental diff (`base=`) is intentionally *not*
-  a bake field: per [`docs/incremental-snapshot-spec.md`](incremental-snapshot-spec.md) the
-  content-diff is a `__park__`-only optimization (a durable base always writes a full snapshot),
-  so a base bake's storage win is `sparse`, not diff. The recipe is where
-  storage *policy* lives; the VMM implements the *mechanism*.
+## Consumed recipe fields
 
-## The base is a cache, not an artifact you ship
+| Field | Current behavior |
+| --- | --- |
+| `image.kernel`, `image.initramfs` | Paths resolve relative to the recipe and participate in the cache key |
+| `resources.ram_mb`, `resources.cpus` | Default 512 MiB / 1 vCPU |
+| Top-level `run_as` | Emits the HVF guest-agent user setting; place it before TOML tables |
+| `network.egress` | `deny`/omitted leaves NIC off; `allow` enables networking with firewall disabled |
+| `files[].host`, `files[].guest` | Passes a host-to-guest file transfer command; see restrictions below |
+| `warmup[].run` | Executes a guest command and waits for its reply |
+| `warmup[].start` | Backgrounds a guest command, logging to `/tmp/bake-start.log` |
+| `ready.command` | Polls a command with an appended success marker |
+| `ready.port` | Polls using the guest shell's `/dev/tcp` support |
+| `snapshot.out` | Required; relative to the recipe directory |
+| `snapshot.compress` | `none` or `deflate` |
 
-This is the one thing that surprises people. A base is **build-specific**: `validateHeader`
-gates the snapshot on the exact nether version + struct layout + native endianness, so a
-base baked by one nether build is *refused* by the next. A base is therefore a derived,
-host-local cache keyed on **(nether build, image, recipe)**, not a portable image.
+The runner symlinks the kernel's **directory** as `kernels/`; Nether then opens
+`kernels/Image` and `kernels/initramfs.cpio.gz`. Use that exact layout.
+Selecting a differently named image file in the recipe does not make the runner
+stage it under those names.
 
-`bake` handles this for you:
+An arbitrary `network.egress` string is not parsed as a firewall policy: values
+other than `deny` enable `net=1`, and only `allow` also emits `net_open=1`.
+Use explicit Nether config for CIDR rules. Disk and storage fields are described
+in [snapshot storage](incremental-snapshot-spec.md).
 
-- **Idempotent.** If `base.snap` and its manifest already match the current build + image +
-  recipe, `bake` is a cache hit and does nothing. Change any of the three and it re-bakes.
-- **Self-GC'ing.** The manifest (`base.snap.manifest.json`) is the garbage-collection root.
-  When `bake` supersedes a base, it reaps the generation it replaced, so idempotent re-bakes
-  never silently accumulate dead full-size snapshots. `bake.py gc [--dir bases] [--orphans]`
-  reaps bases left by an older nether build, and (with `--orphans`) snapshots with no
-  manifest at all. A base no live manifest vouches for is garbage.
+## Readiness and transfer limits
 
-Practical consequence: after you rebuild nether, re-run `bake` (it re-bakes and reaps), or a
-`fork` of a stale base will be refused. `fork` warns when a base's manifest predates the
-current build.
+When both readiness fields exist, `ready.command` wins. With neither, the
+runner warns and sleeps two seconds. A port gate needs shell `/dev/tcp`
+support; use a command appropriate to the guest instead. The example uses Python
+to connect to its server.
 
-## Gotchas checklist
+Warm-up and transfer replies are printed, but the runner does not uniformly
+validate every guest exit code. Make readiness test the resulting application
+state.
 
-- **Control mode is required for a driveable fork.** The recipe boots the bake sandbox with
-  a `control_socket`; a snapshot taken without one yields console+blk-only forks. `bake`
-  always does this correctly; if you drive the protocol yourself, don't skip it.
-- **The base holds no per-tenant state.** Bake the *generic* warm state (app up, caches
-  hot); specialize per tenant *after* the fork. A fork inherits everything the base had open.
-- **Same host, same build.** Bases don't travel across nether versions or (in practice)
-  hosts. Regenerate, don't ship.
-- **Warm-up runs in the guest.** Your app must already be reachable in the guest (baked into
-  the image, mounted from a disk file, or `[[files]]`-pushed) before `[[warmup]]` can run it.
+`__put__` is limited to a regular file of at most 16 MiB, and Nether confines
+host transfer paths to its launch-directory jail. The runner resolves a host
+path relative to the recipe but does not copy that file into its scratch jail.
+A file elsewhere in the checkout is therefore not automatically transferable.
+Bake application files into the image or stage them through a custom launch
+flow; the example avoids this unresolved staging seam.
+
+## Cache identity and launch settings
+
+A manifest hashes the binary, kernel, initramfs, and recipe bytes. A matching
+manifest plus output is a cache hit. The contents of separately referenced files
+and persistent disks are not included. Use `bake --force` when those change.
+
+Rebuild-dependent layout changes can make an old base unrestorable. Rebake
+after changing Nether. `fork` warns on a recorded binary-hash mismatch; it
+does not reject every different build itself. See [versioning](versioning.md).
+
+The fork runner emits only restore and control/data-socket settings; it does
+not replay the recipe's full host configuration. Persistent disks, networking,
+and custom policy need a configured fork launch. Guest state already in the
+snapshot, including its boot-time agent settings, is inherited.
+
+Bakes should contain generic application state. Per-tenant credentials and
+mutable external resources require explicit ownership. COW RAM does not make
+a shared disk file or external connection private.
+
+See [snapshot storage](incremental-snapshot-spec.md) for compression,
+content-diff status, and the exact GC behavior.

@@ -1,20 +1,21 @@
 # Reproducing the claims
 
-Every latency and behavior claim in the README and design docs has a live proof
-script under [`scripts/`](https://github.com/justinGrosvenor/nether/tree/main/scripts). This page is the index: what each proves and
-how to run it.
+The scripts under [`scripts/`](https://github.com/justinGrosvenor/nether/tree/main/scripts)
+exercise specific runtime scenarios. This page indexes their scope, not proof
+of every possible workload or safety property. These live scripts were not rerun
+in the 2026-09-06 documentation audit; see [recorded checks](stack.md#verification-scope).
 
 > **These are live HVF proofs.** They boot real guests on Apple Hypervisor.framework,
 > so they need an **Apple Silicon Mac**. They cannot run on the x86/KVM reference
-> backend or in CI. The numbers below are measured on the author's machine (a
+> backend or in the current hosted CI workflow. The historical numbers below were
+> recorded on the author's machine (a
 > 512 MB / 2-vCPU guest); treat them as an order of magnitude, not a guarantee. Bigger
-> guests copy more pages on resume.
+> guests can incur more metadata work and demand-page faults after resume.
 
 ## Prerequisites
 
-1. **Zig 0.16.0** ([ziglang.org/download](https://ziglang.org/download/)), the
-   0.16.0 *stable* release. Recent dev nightlies do **not** link against current Xcode
-   SDKs; pin stable.
+1. **Zig 0.16.0** ([ziglang.org/download](https://ziglang.org/download/)), matching
+   the repository toolchain. Development nightlies are not the tested baseline.
 2. A **guest image** in `kernels/` (gitignored). Build one:
    ```sh
    ./scripts/fetch-guest-image.sh
@@ -22,9 +23,10 @@ how to run it.
 3. A **built, codesigned** binary (the HVF backend needs the hypervisor entitlement):
    ```sh
    zig build -Dtarget=native
-   codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
    ```
-4. **Python 3** (the proof harnesses are stdlib-only) and `NETHER_ROOT` set if the
+4. **Python 3** on the host and the guest runtimes each proof uses. The Python
+   application proofs need the [runtime image preparation](running-on-hvf.md#baking-language-runtimes-python3-node-sqlite3)
+   (including the rootfs extraction and Docker helper). Set `NETHER_ROOT` if the
    repo is not at `~/nether`:
    ```sh
    export NETHER_ROOT="$(pwd)"
@@ -38,10 +40,10 @@ Then run any script directly, e.g. `python3 scripts/fork_serve.py`.
 
 | Script | Proves |
 | --- | --- |
-| `fork_serve.py` | A base VM whose in-guest HTTP server is already running is snapshotted and warm-forked; the fork serves requests **instantly** through its own socket, inheriting the exact warm server process (same PID via CoW), with an independent request counter, while the parent keeps serving. |
+| `fork_serve.py` | A base VM whose in-guest HTTP server is already running is snapshotted and warm-forked; the fork serves requests through its own socket, inheriting the exact warm server process (same PID via CoW), with an independent request counter, while the parent keeps serving. |
 | `pool_serve.py` | A pool of warm VMs forked from one base, each serving independently. |
 | `park_density_proof.py` | A parked *fleet*, measured: bake one base, fork N VMs, park them, and show the per-VM memory/latency cost of density. |
-| `snapshot_quiesce_proof.py` | The snapshot is taken at a clean quiesce point: no in-flight device state is lost across capture. |
+| `snapshot_quiesce_proof.py` | Checks the configured quiescence gate in its test scenario; does not prove preservation of all in-flight device or bridge state. |
 
 ### Park and resume (mid-flight)
 
@@ -77,11 +79,12 @@ Then run any script directly, e.g. `python3 scripts/fork_serve.py`.
 ## Fuzzing and tests (no guest image needed)
 
 The parser and protocol test suite, including the always-on fuzz smoke over the
-guest-facing surfaces, runs on any host, cross-compiled, no HVF required:
+guest-facing surfaces, runs on the supported build host without a VM or guest image:
 
 ```sh
-zig build test          # 249 tests + fuzz smoke; must be green
+zig build test          # host unit tests, including fuzz smoke
 ```
 
 `scripts/fuzz_restore.py` drives the snapshot-restore parser with malformed inputs
-(the guest→host boundary the review hardened).
+using the HVF file-validation mode. Run it with a native binary; it is distinct
+from live guest execution.

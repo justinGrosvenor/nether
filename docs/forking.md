@@ -1,126 +1,100 @@
 # Forking a running Linux VM
 
-Here is a thing nether can do that I haven't seen anywhere else, so I want to
-describe the mechanism precisely rather than sell it.
+Nether can restore a warm Linux snapshot into a new VM process. The HVF proofs
+also demonstrate a guest blocked on an outbound request continuing that request
+after park and restore, with a separate host relay preserving the upstream.
 
-**You can send a request to a VM, snapshot the VM and kill it, and then answer the
-request from a different VM that did not exist when the request arrived.**
+## What a fork restores
 
-The guest code doing the work is ordinary. A process inside the guest makes an
-outbound call and blocks in `recv()` waiting for the reply. While it is blocked, the
-whole VM is snapshotted and the process is killed. Nothing runs. Later, when the
-reply is ready, a *fresh* VM is forked from that snapshot, and the original `recv()`
-returns the reply bytes into ordinary code that slept through its own death. It never
-learns it was moved.
+A snapshot stores guest RAM and selected CPU, interrupt-controller, and device
+state. Full snapshots map RAM with `MAP_PRIVATE` on restore. Pages are faulted
+in as needed; the fork copies a page when it writes it. Metadata, VM creation,
+device setup, and page faults still cost time.
 
-That composition - park a blocked syscall across a VM's death, and complete it on a
-fork - is the interesting part. The pieces underneath are simpler than they sound.
+Historical Apple Silicon results for a 512 MiB / 2-vCPU guest recorded roughly
+0.5 seconds for a base boot, 10 ms to a driveable restored VM, and 25 ms to a
+first response from a warm server. These are separate measurement boundaries,
+not guarantees or current stack benchmarks. They were not rerun in the
+2026-09-06 documentation audit.
 
-## A fork is a snapshot restore, and it's cheap
+HVF and KVM both implement full snapshot/COW restore, using different formats.
+See [backend status](stack.md#backend-capabilities) and the
+[KVM runbook](running-on-kvm.md#5-snapshot-and-fork).
 
-nether captures a running guest into a single file: CPU registers, device state, the
-interrupt controller, and RAM. Restoring is not "boot from a snapshot" - it is
-`fork()` for the whole machine. The important detail is how RAM comes back.
+## Capture and launch
 
-RAM is not read from the file. It is mapped copy-on-write (`mmap` `MAP_PRIVATE`) at
-the snapshot's offset, so a restore does **not** pull 512 MB off disk. The fork shares
-the base image's pages and only copies the pages it writes. That is the same
-demand-paging basis Firecracker uses, and it is why a fork is cheap in both time and
-memory:
+Boot with a control socket, start the guest service, and establish readiness
+before calling `__snapshot__ base.snap` through the primary control connection.
+Capture paths are confined to the launch directory. `__snapshot__` writes a
+base and resumes the original VM.
 
-- **Cold boot the base once: ~0.5 s** (kernel + userspace up, warm).
-- **Fork it: ~10 ms** to a live, driveable VM.
-- **~25 ms** to a first served request through a warm in-guest server.
+A new process selects restore mode in its working-directory `nether.conf`:
 
-Measured on Apple Silicon (HVF), a 512 MB / 2-vCPU guest. The ~10 ms is dominated by
-`hv_vm_create` and restoring the interrupt-controller state - unavoidable hypervisor
-setup, not data handling. The metadata read, disk, and vCPU rendezvous are each under
-a millisecond. (These numbers are reproducible; see the bottom of this page. An
-earlier version of the proof scripts polled readiness on a coarse timer and reported
-~70 ms - that was the poll granularity, not the fork.)
-
-So: one slow cold boot amortized over arbitrarily many cheap forks. That is the whole
-economics of it.
-
-## Why it isn't just "fast boot": the connection survives
-
-Fast restore is table stakes. The reason nether can answer a request from a different
-VM is that **the connection is part of the snapshot.**
-
-The channel a guest uses to talk to the outside world is virtio-vsock, and nether's
-vsock engine is a *pure in-memory state machine*: connection table, sequence numbers,
-credit windows, staging ring - no host kernel sockets, no file descriptors. It is just
-bytes in the guest's RAM and the VMM's heap. When you snapshot the VM, that state is
-captured along with everything else. When you restore, it comes back exactly as it
-was, mid-connection.
-
-So a guest blocked in `recv()` on an open connection, snapshotted, carries that
-connection into the snapshot file. The socket state on the guest side is frozen at the
-exact point it was waiting.
-
-The other half - the *real* upstream TCP socket to whatever the guest was calling - is
-held by the host process outside the VM. When the guest makes an outbound call, an
-in-guest forwarder bridges its ordinary loopback connection to a host-side Unix socket
-(the "egress plane"); the host dials the real upstream and splices the two together.
-That upstream socket is a normal host resource. It does not need the VM to exist.
-
-## Parking, and waking
-
-Put the two halves together and you get **park-while-awaiting-upstream**:
-
-1. The guest sends an outbound request and blocks in `recv()`.
-2. `__park__` quiesces the guest (fail-closed: it refuses if there are undelivered
-   bytes in flight), captures the snapshot, bills the usage, and calls
-   `exit(0)`. The VM is gone. Zero processes, zero RAM, zero CPU. The host keeps
-   the upstream socket open.
-3. The upstream reply arrives - seconds or minutes later. The host restores a fork
-   from the park snapshot. The fork re-attaches the host side of the surviving
-   connection (a one-line `resume=1` preamble tells the host to re-splice the parked
-   upstream rather than dial fresh), and the guest's original `recv()` completes with
-   the reply bytes.
-
-Because the guest is captured mid-syscall and the connection state is captured with
-it, the guest resumes *inside* the `recv()` it was in. There is no re-request, no
-retry, no application-level checkpoint. The blocking call that slept through the VM's
-death simply returns.
-
-The clocks are handled honestly across the gap: the guest's monotonic clock stays
-continuous (the virtual counter is captured and rebased so an armed timer fires with
-its remaining duration), while the wall clock catches up to real time on resume. And
-each fork reseeds its CRNG, so two forks of the same base do not share a random stream.
-
-Wake to reply-delivered is **~20 ms**.
-
-## Reproduce it
-
-Everything above is a live proof, not a diagram. On an Apple Silicon Mac:
-
-```sh
-zig build -Dtarget=native
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
-./scripts/fetch-guest-image.sh          # build a bootable aarch64 Linux guest
-python3 scripts/park_await_proof.py      # the mid-request park/wake, end to end
+```ini
+restore=1
+restore_from=/absolute/path/base.snap
+control_socket=/tmp/fork.control.sock
+data_socket=/tmp/fork.data.sock
 ```
 
-`park_await_proof.py` boots a base, drives a guest to block in `recv()` on an outbound
-request, `__park__`s it (killing the VM), holds the upstream, then forks a VM that
-completes the *same* `recv()` with the reply - and does it a second time to show the
-woken fork can itself re-park. `scripts/fork_serve.py` shows the raw fork-to-serving
-path; `scripts/reproducing.md` indexes the rest.
+`restore_from` selects the file; **`restore=1` enables restoration**.
+Supply the backend's matching CPU/device settings and external disk/network
+configuration. A control-mode base is needed to restore its guest-agent channel;
+an HTTP-serving base also needs its forwarder and application already running.
 
-## What this is, and isn't
+The first same-uid host control client becomes primary. The restored guest
+channel and the host client connection are separate: a handshake alone does not
+prove that the guest agent or application will respond.
 
-- **Backend:** Apple Hypervisor.framework (aarch64, macOS) is the lead path and where
-  the numbers above are measured. The x86/KVM backend has the same fork primitive
-  (cross-process snapshot, COW restore, `__snapshot__`/`__park__`, vmgenid reseed),
-  run-verified on bare metal; the proof scripts themselves are still HVF-only.
-- **Maturity:** pre-1.0, no external security audit. The guest is treated as hostile
-  (malformed guest input is the primary threat model, the guest-facing parsers are
-  continuously fuzzed), but don't run untrusted guests in production yet.
-- **Novelty:** snapshot-restore-as-fork is well-trodden (Firecracker, and the
-  FaaSnap/REAP line of research on fast serving). What I haven't seen elsewhere is
-  parking a *blocked syscall* across a VM's death and completing it on a fork - the
-  connection surviving the snapshot is what makes that work. If someone else does
-  this, I'd genuinely like to read how.
+## Mid-request park and wake: HVF
 
-The code is Zig, from scratch, in the open: [github.com/justinGrosvenor/nether](https://github.com/justinGrosvenor/nether).
+The vsock engine stores connection/credit state independently of host kernel
+socket descriptors. That state and the guest's memory can survive a snapshot.
+The real upstream TCP connection cannot be stored that way.
+
+In the demonstrated composition:
+
+1. A guest connects through its loopback egress forwarder and waits for a reply.
+2. Nether dials the separate platform relay with
+   `NETHER-EGRESS v1 conn=<id> resume=0`. The relay holds the real upstream.
+3. `__park__` waits for the HVF quiescence and bridge-drain gates, captures,
+   emits usage, and exits. The VMM process is gone; snapshot storage, mapped-file
+   lifetime/page cache, and relay resources are not zero.
+4. A fresh HVF process restores the park and reconnects surviving egress streams
+   with `resume=1`. The relay supplies the waiting reply to the restored guest.
+
+The guest resumes its blocked call without an application-level retry in this
+scenario. Ordinary virtio-net/slirp TCP flows are not preserved. KVM's inspected
+restore path does not call the equivalent established-egress resume hook.
+
+HVF captures the virtual counter so monotonic time can continue from the park
+point. Its PL031 RTC reads current host time, but guest wall time needs
+reconciliation such as `hwclock -s` after wake. VM Generation ID handling
+triggers guest CRNG reseeding when the base and guest driver support it.
+
+## Storage and lifecycle limits
+
+HVF park-kind files are unlinked on resume. This consumes the pathname for
+subsequent sequential launches; the caller must still serialize wake operations
+and avoid copies or concurrent opens if it needs exactly one consumer. KVM has
+no equivalent kind/unlink contract.
+
+Snapshots do not capture GPU scanout state, mutable external services, or HVF
+file-backed disk contents. A shared disk file remains shared even when RAM is
+COW. Content-diff helpers exist, but control-driven diff capture is not wired;
+see [snapshot storage](incremental-snapshot-spec.md).
+
+## Reproduce the HVF scenario
+
+Prepare the signed native binary and runtime image as described in
+[reproducing](reproducing.md), then run:
+
+```sh
+python3 scripts/park_await_proof.py
+python3 scripts/fork_serve.py
+```
+
+The first proof exercises two generations of mid-request park/wake using its
+own relay. The second measures warm-fork serving. Neither establishes every
+snapshot state or workload is safe. Nether is pre-1.0 with no external security
+audit; see [security](security.md).

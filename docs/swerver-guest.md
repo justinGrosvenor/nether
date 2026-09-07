@@ -103,10 +103,13 @@ new VM restore and its first real application response.
 
 ## Linux and EC2 Spot
 
-The example currently exercises Nether's developed Apple HVF/aarch64 path.
-An EC2 bare-metal Spot worker needs the KVM/x86-64 backend brought to feature
-parity for snapshot restore, data sockets, and the supervisor lifecycle before
-the same flow can run there. Keep cloud provisioning outside the request path:
-acquire Spot capacity, build/sign or fetch the host artifacts, bake one base,
-then accept requests. A Spot interruption should drain the gateway and discard
-the host; every tenant VM is disposable by design.
+This example targets Apple HVF/aarch64. KVM/x86-64 already implements
+snapshot/COW restore. The inspected local changes add KVM data/egress bridge
+wiring and Linux guest staging in the supervisor, but this full Swerver guest
+workflow has not been live-verified on Linux in the current audit.
+
+A Linux port needs matching x86 guest artifacts, a Linux Nether binary,
+application readiness checks, and a complete gateway/supervisor request gate.
+The current console `up` preflight expects the HVF Image/initramfs layout.
+Cloud capacity management and interruption/drain handling are outside these
+scripts; no EC2 Spot lifecycle integration is established by this example.

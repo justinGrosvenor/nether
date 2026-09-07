@@ -1,5 +1,10 @@
 # Nether bring-up notes (hard-won, verified on bare-metal KVM)
 
+Historical bring-up notes. Commands and observed outputs below describe the
+milestones recorded here. Use the [HVF](running-on-hvf.md) and
+[KVM](running-on-kvm.md) runbooks for current launch instructions and
+[stack status](stack.md) for current verification scope.
+
 Field notes from taking Nether from a `KVM_RUN` skeleton to a Linux 6.12 guest
 that boots to an interactive shell with working virtio-blk, on a real KVM host.
 Almost every item here cost a live debug cycle to find. Keep this current.
@@ -143,7 +148,7 @@ the guest is idle. Notes:
   - stable: there is **no `std.Thread.Mutex`** (it moved); only
     `std.atomic.Mutex` (a `tryLock`-only spinlock primitive) and `std.Io.Mutex`
     (needs an `Io`). nightly 2135 still has `std.Thread.Mutex`.
-  We use a tiny spin `Lock` (`src/lock.zig`) over `std.atomic.Mutex` so the
+  We use a tiny spin `Lock` (`src/common/lock.zig`) over `std.atomic.Mutex` so the
   freestanding device models need neither. Build/test with the stable path
   explicitly until `/etc/paths.d/zig` is repointed at `~/Library/zig/0.16.0`.
 

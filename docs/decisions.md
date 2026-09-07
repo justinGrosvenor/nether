@@ -1,5 +1,10 @@
 # Nether - Open Decisions
 
+These entries retain design rationale and milestone history. For current backend
+coverage and check results, use [stack status](stack.md). Proposed device
+boundaries below are not all implemented; the current net and GPU paths run
+inside the VMM.
+
 Decisions that shape the architecture and are cheaper to settle now than to
 retrofit. Each has a recommendation; mark them RESOLVED as they're locked.
 
@@ -41,17 +46,15 @@ direct-boot path, where the RSDP address is handed to the kernel instead.
 
 **Status:** open · **Recommendation:** per-device split below
 
-The datapath is zero-alloc and in-process *by default*, but high-risk or
-high-throughput devices are better offloaded. vhost/vhost-user moves the
-datapath out of Nether's address space - which means the in-process zero-alloc
-loop never runs for those devices, and (the point) the temporal-safety/fuzzing
-burden doesn't cover them.
+The proposed split aims to keep small device paths in process and move larger
+parsers into separate backends. The current net, block, RNG, console, vsock,
+and 2D GPU implementations run inside Nether. vhost/vhost-user offload is
+future work; it changes the process trust boundary rather than removing the
+need to validate backend input.
 
-- **In-process, zero-alloc, fuzzed:** rng, balloon, console, vsock. Small
-  parsers, low risk, worth owning.
-- **Out-of-process from day one:** net (vhost-net/vhost-user), fs
-  (virtiofsd/vhost-user), gpu (see D4).
-- **block:** start in-process for Phase 3 simplicity; revisit vhost-user later.
+- **Keep in process:** RNG, console, vsock; balloon is a proposed addition.
+- **Candidates for future offload:** net, filesystem, and GPU (see D4).
+- **Block:** implemented in process; reconsider offload when needed.
 
 ## D3 - Config-plane concurrency
 
@@ -72,7 +75,7 @@ First instances landed with the interactive-stdin I/O thread. The host stdin
 thread feeds `Serial.pushRx` while the vCPU thread services serial register
 exits, and the IOAPIC redirection table is read on `raise()` from both threads
 while the guest programs it from the vCPU thread. Each device carries its own
-`Lock` (`src/lock.zig`, now a plain `std.atomic.Value` spinlock - it dropped the
+`Lock` (`src/common/lock.zig`, now a plain `std.atomic.Value` spinlock - it dropped the
 version-volatile `std.atomic.Mutex` so the tree builds on both 0.16.0 stable and
 dev nightlies - since the critical sections are a few field writes). The rules
 that keep it correct, to be repeated for every future device:
@@ -131,7 +134,7 @@ Whatever the choice, it is explicit and not riding in on `rng`'s coattails.
 
 ## D5 - Test harness
 
-**Status:** partial -> fuzz-smoke built; unit suite at 181 tests; kvm-unit-tests +
+**Status:** partial -> fuzz-smoke built; unit suite and fuzz smoke in place; kvm-unit-tests +
 serial-golden layers still to stand up (not descoped)
 
 A VMM is the worst place to have no test story. Three layers, stood up early:
@@ -150,7 +153,7 @@ A VMM is the worst place to have no test story. Three layers, stood up early:
 In progress: the fuzz-smoke layer is stood up (`src/fuzz.zig`), an always-on
 deterministic smoke that runs with `zig build test`. It feeds thousands of
 random byte streams to the two guest-facing parsers that exist today, the
-vendored VT parser (`src/vt/`) and the virtqueue (`src/virtq.zig`), asserting
+vendored VT parser (`src/vt/`) and the virtqueue (`src/virtio/virtq.zig`), asserting
 each always terminates in bounds and never panics. Pattern borrowed from the
 jbsh harness (same toolchain, owned). A full AFL-style `zig build fuzz` target
 and the kvm-unit-tests / serial-golden layers remain to build.
@@ -164,12 +167,12 @@ header, not bundled with Zig, so `@cImport` only resolves on a Linux host with
 kernel headers installed - it breaks `zig build` when cross-compiling from a
 non-Linux dev host (this repo is driven from macOS). Phase 0 therefore uses
 hand-rolled `extern struct` layouts plus comptime-derived ioctl numbers
-(`src/kvm.zig`), validated against KVM's published ABI in unit tests.
+(`src/hv/kvm.zig`), validated against KVM's published ABI in unit tests.
 
 This is reversible. Revisit once the dev/CI host is reliably Linux: either keep
 hand-rolled (a stable uapi; rust-vmm-style hand maintenance is viable and keeps
 cross-compute trivial) or switch to `@cImport` behind a build option. The tests
-in `src/kvm.zig` are the safety net for either path.
+in `src/hv/kvm.zig` are the safety net for either path.
 
 ## D6 - irqchip model
 
@@ -243,7 +246,7 @@ Linux and `hvf_backend.zig` on macOS via `builtin.os.tag`; shared leaf types
 (`StopReason`, `Error`, LE marshalling) live in `hvtypes.zig` to avoid an import
 cycle. This matches the embeddable-core thesis (a compile-time seam, not a
 convention) and the ghostty apprt comptime-swap pattern in
-[references/ghostty-patterns.md](references/ghostty-patterns.md) (1).
+[references/ghostty-patterns.md](https://github.com/justinGrosvenor/nether/blob/main/docs/references/ghostty-patterns.md) (1).
 
 Consequences and rules going forward:
 - The shared `Vm` exposes the backend handle as `vm.hv` so x86-only host code
@@ -256,7 +259,8 @@ Consequences and rules going forward:
   (every op `Unimplemented`) and has since filled in completely over the aarch64 arc
   - it is where SMP, snapshot/fork, the full control plane, and every platform pillar
   were built and live-proven. The x86/KVM side has the platform layer wired and
-  run-verified for control/vsock/watchdogs; it still trails on virtio-net, SMP,
-  snapshot, and GPU. Both targets stay green every commit:
+  implementations for control/vsock/watchdogs, virtio-net, SMP, and snapshots.
+  GPU, storage transforms, clocks, and established-egress resume still differ.
+  The backend build checks are:
   `zig build test` (native macOS, HVF path) and `zig build -Dtarget=x86_64-linux`
   (KVM path + binary).

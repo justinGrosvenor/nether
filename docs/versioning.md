@@ -1,45 +1,48 @@
 # Versioning and stability
 
-nether follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). It is **pre-1.0
-(0.x)**: the surfaces below are still moving, so within `0.x` a MINOR bump may carry a
-breaking change (a patch never does). Once `1.0` is cut, the usual SemVer guarantees apply.
+The current package version in `build.zig.zon` is **0.1.1**. Nether is pre-1.0:
+pin compatible source revisions and keep snapshot-producing binaries available.
+Changes are recorded in the
+[changelog](https://github.com/justinGrosvenor/nether/blob/main/CHANGELOG.md).
 
-Changes are recorded in [CHANGELOG.md](https://github.com/justinGrosvenor/nether/blob/main/CHANGELOG.md).
+## Independent version surfaces
 
-## Three version surfaces, each with its own gate
+| Surface | Current source value | Meaning |
+| --- | --- | --- |
+| Package | 0.1.1 | Binary/library release version |
+| HVF snapshot | NSNP v5 | 128-byte header and HVF snapshot layout |
+| KVM snapshot | NSKV v2 | Separate KVM header and CPU/device layout |
+| Nether control | `proto_version=2` | Reply framing and command handshake |
+| Supervisor northbound control | `proto_version=1` | Supervisor's `__info__` and `ensure` protocol |
 
-nether has three things that can independently change shape, so each carries its own
-version and its own compatibility rule:
+The supervisor accepts Nether protocol versions 1 and 2 on its southbound
+connections. The console has separate Nether and supervisor clients. Do not
+infer a wire version from a package version or a snapshot header.
 
-1. **Release version** (`build.zig.zon` `.version`, git tags, and the SDK packages). Plain
-   SemVer over the binary and the SDK APIs.
+## Snapshots
 
-2. **Snapshot format version** (currently **v5**, in the 128-byte snapshot header's `version`
-   field). Restore and `validate_snapshot` **fail closed on a mismatch**: a base baked by one
-   build is *rejected* by a build with a different format, never silently misread. It is
-   bumped on any header, layout, or ABI change. See
-   [the incremental-snapshot spec](https://github.com/justinGrosvenor/nether/blob/main/docs/incremental-snapshot-spec.md).
+Restore checks format versions and selected geometry/layout fields. That does
+not establish compatibility for arbitrary builds with the same version number,
+nor does it make snapshots portable across backends or hosts.
 
-3. **Control-protocol version** (`proto_version`, currently **2**, reported by `__info__` and
-   `__help__`). Bumped on any breaking wire change. A client reads it from the handshake and
-   adapts; v2 frames every reply uniformly, which removed the v1 bare/framed ambiguity, and a
-   v1 client still mostly interoperates. See
-   [the control-protocol doc](control-protocol.md).
+The HVF `validate_snapshot` mode and bake storage transforms operate on HVF
+snapshots. KVM snapshots have their own reader/writer. See
+[snapshot storage](incremental-snapshot-spec.md) and
+[the KVM runbook](running-on-kvm.md#5-snapshot-and-fork).
 
-## Why this matters
+The bake manifest hashes the Nether binary, image, and recipe. Baking uses those
+hashes for cache invalidation. Forking a base with a different recorded binary
+hash currently **warns**; it does not refuse solely because that hash differs.
+Runtime format validation still applies.
 
-The **control protocol is the stable surface the SDKs build on** (`nether`, `@nether/sdk`).
-Because it is versioned and self-describing (`__help__` enumerates the command set at
-runtime, `__info__` reports `proto_version`), a client is never guessing at the wire, and a
-protocol change is a visible version bump rather than silent drift. The same discipline
-applies to snapshots: a format change is a fail-closed rejection with a clear message, not a
-corrupt restore.
+## Control clients
 
-## What "stable" means before 1.0
+Handshake with `__info__` and handle the reported protocol version.
+[Protocol v2](control-protocol-v2.md) describes uniform framed replies.
+Command enumeration is available through `__help__`, but a shared command name
+does not imply identical backend behavior. See the backend notes in
+[the command reference](control-protocol.md).
 
-- The **control protocol will not change shape within a `proto_version`**; a breaking wire
-  change bumps the version, and clients gate on the handshake.
-- The **snapshot format is version-gated and fail-closed** across builds: no silent misread,
-  ever.
-- The **SDK public APIs may still change in a `0.x` minor**; breaking changes are called out
-  in the SDK changelogs.
+A future breaking wire or snapshot change should bump the corresponding format
+version. Before 1.0, downstream integrations should test their pinned combination;
+a successful handshake is not a complete compatibility test.

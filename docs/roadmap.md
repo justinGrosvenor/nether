@@ -1,32 +1,25 @@
 # Nether - Roadmap
 
-**Status.** Phase 3 (the win condition) is **achieved on the aarch64/Apple-HVF
-backend**: Nether boots Alpine Linux 6.12 to an interactive shell over virtio-pci
-with MSI-X, with virtio-console, virtio-blk, virtio-vsock, and virtio-net all
-live. On top of that datapath we built the **agent-platform track**: a control
-plane (a Unix-socket API + an in-guest agent REPL + host-mediated file transfer),
-live surfaces for all six platform pillars (observe / govern / isolate / meter /
-run / render), and **snapshot -> copy-on-write fork -> ~10 ms lazy restore** - the
-microVM fork primitive the edge product is built on. The whole stack is hardened
-against malformed guest input *and* against a hostile local control client.
+**Current status, 2026-09-06.** Both HVF/aarch64 and KVM/x86-64 implement
+Linux boot, SMP, shared virtio devices, control, and full snapshot/COW restore.
+They are not at full parity. The [current stack matrix](stack.md) records
+storage, clock, GPU, egress-resume, and orchestration differences.
 
-The **x86-64/KVM** reference backend has now **reached parity with HVF** for the
-platform primitive. It PVH-boots Linux 6.12 to an interactive shell on bare metal
-(userspace IOAPIC routes serial IRQ4, no more 16-byte FIFO stall), virtio-blk reads
-and writes work end to end, **virtio-net** brings up a guest interface over the same
-slirp + egress firewall (DNS/HTTP/HTTPS through the NAT), and **SMP** boots multiple
-vCPUs (AP INIT/SIPI via KVM's in-kernel LAPIC). On top of that the whole
-**cross-process snapshot fork** landed: full vCPU/VM state via `KVM_GET/SET_*`
-(regs, sregs, MSRs, xsave/xcrs, lapic, mp_state, vcpu_events, kvmclock), a
-**driveable** restore (virtio transport + vsock engine + the live agent connection
-survive, so the control plane resumes with no reconnect), **COW-mmap** fast restore
-(~150 ms to a live control socket), **SMP fork**, the control-protocol
-`__snapshot__`/`__park__` commands + the SDK `Sandbox.create` fork path, and
-**vmgenid** entropy divergence (an ACPI VM Generation ID device + a GPE0/SCI notify
-so sibling forks reseed their CRNG). All run-verified on a bare-metal `c5.metal`,
-driven through the Python SDK. Every gap traced to the same root: host code written
-on the Mac that compiled for x86 but had never been *run* there. The one remaining
-KVM gap is **GPU** (virtio-gpu is still HVF-only).
+The inspected integration uses a gateway, a separate supervisor daemon, and
+per-VM Nether processes. Single-process Swerver embedding remains future work.
+The current KVM bridge and supervisor launch/readiness changes were reviewed
+from the working tree; they are not treated here as a released, live-tested stack.
+
+**How to read this page:** the phase and aarch64-arc entries below are a
+development history. Their test counts, benchmark numbers, and “verified” notes
+describe the milestone when recorded. They do not imply those proofs were
+rerun against today's tree or establish complete hardening. See
+[verification scope](stack.md#verification-scope).
+
+Earlier bare-metal KVM notes recorded PVH boot, networking, SMP, control,
+snapshot/fork, and vmgenid checks on c5.metal, with about 150 ms to a live
+control socket. Keep that as a historical manual result, not a universal
+latency or a claim that GPU is the only remaining backend gap.
 
 See [decisions.md](decisions.md) D8 for the PVH gotchas, D6 for the
 irqchip/IOAPIC, D3 for the concurrency model, and D9 for the backend seam.
@@ -155,16 +148,18 @@ bolted on. The principle: **build the embeddable path forward of the general-VMM
 path**, but never ahead of the Phase 3
 done-line.
 
-- **Embeddable core from Phase 0.** Library + thin dev binary, allocator injected,
-  no process-global state, device I/O expressed as fds. The shipping artifact is one
-  swerver binary that imports embedded nether. (Already true of the Phase 0 scaffold.)
+- **Embeddable core (partially implemented).** Library exports exist, but the
+  executable retains process-global state and backend-specific lifecycle wiring.
+  Allocator ownership, a clean multi-VM library lifecycle, and one-process
+  Swerver integration remain design work. The current supervisor launches
+  separate Nether processes.
   Make the host boundary a hard *compile-time* seam (not a convention) and plan
   the core to export both a Zig API and a C ABI from one build. See the apprt and
   one-library-two-ABIs patterns in
-  [references/ghostty-patterns.md](references/ghostty-patterns.md) (1, 2).
+  [references/ghostty-patterns.md](https://github.com/justinGrosvenor/nether/blob/main/docs/references/ghostty-patterns.md) (1, 2).
 - **vsock promoted to the spine** (lands with the virtio work in Phase 3+).
   The swerver↔guest channel, integrated via swerver's park-and-resume pattern.
-  The pure protocol engine is in-tree (`src/virtio_vsock.zig`): the 44-byte
+  The pure protocol engine is in-tree (`src/virtio/virtio_vsock.zig`): the 44-byte
   header codec, the per-connection state machine (REQUEST/RESPONSE/RW/SHUTDOWN/
   RST and credit), and credit-based flow control, with a fixed-pool connection
   table and outbound staging ring (snapshot-friendly by construction) and a
@@ -183,11 +178,11 @@ done-line.
   product, so the Phase 6 "snapshot" work is really a constraint applied early.
   Target fixed-size, pool-allocated, ref-countable, serializable-by-construction
   state; see the paged-storage pattern in
-  [references/ghostty-patterns.md](references/ghostty-patterns.md) (6).
+  [references/ghostty-patterns.md](https://github.com/justinGrosvenor/nether/blob/main/docs/references/ghostty-patterns.md) (6).
 - **Concurrency model: per-device lock now, message-passing later.** D3 is
   resolved with per-device locks (first instances: serial RX, IOAPIC raise). The
   scaling path is a mailbox/SPSC-queue model and a libxev event-loop I/O thread;
-  see [references/ghostty-patterns.md](references/ghostty-patterns.md) (3, 4),
+  see [references/ghostty-patterns.md](https://github.com/justinGrosvenor/nether/blob/main/docs/references/ghostty-patterns.md) (3, 4),
   adopted when lock contention or a second host input source forces it.
 - **Server-side console.** The VT engine exists in-tree (`src/vt/`): the
   vendored parser plus a Nether-authored screen grid (`Screen.zig`, with UTF-8),
@@ -197,11 +192,11 @@ done-line.
   the full boot log). That unlocks console-state snapshots and grid-level golden
   tests. The grid handles the alternate screen and scroll regions, so full-screen
   TUIs (vim/less/htop) render correctly, and an **interactive web console** is
-  wired (`src/webconsole.zig`: the server renders the live grid to HTML, a polling
+  wired (`src/agent/webconsole.zig`: the server renders the live grid to HTML, a polling
   page displays it, and key presses POST to `/input` which feeds the serial RX;
   opt-in via a `nether-web` marker, port 9000). The console subsystem is
   feature-complete; only the small DECOM / wide-character grid bits remain. See
-  [references/ghostty-patterns.md](references/ghostty-patterns.md) (2, 5) and
+  [references/ghostty-patterns.md](https://github.com/justinGrosvenor/nether/blob/main/docs/references/ghostty-patterns.md) (2, 5) and
   [decisions.md](decisions.md) D5.
 - **PVH / direct-boot fast path** beside OVMF. Linux-only edge guests boot via
   PVH (fast, no UEFI); OVMF stays for general/Windows guests. Slots alongside
@@ -833,15 +828,8 @@ The build-out arc (offline-first chunks):
    or an out-of-bounds write into the fixed disk buffer. Unit-tested and proven live
    (a wrong-version, wrong-magic, and oversized-disk snapshot are each rejected cleanly).
 
-The x86-64/KVM path stays the reference backend, now at **HVF parity** for the
-platform primitive. It PVH-boots to a shell with virtio-blk; virtio-net brings up a
-guest interface over the shared slirp + egress firewall; SMP boots multiple vCPUs
-(AP INIT/SIPI via the in-kernel LAPIC); and the full cross-process snapshot fork
-works: `KVM_GET/SET_*` for all vCPU/VM state, a driveable restore (device + vsock
-engine + agent connection survive), COW-mmap fast restore, SMP fork, the
-`__snapshot__`/`__park__` control commands + SDK `Sandbox.create` fork path, and
-vmgenid entropy divergence. All run-verified on a bare-metal `c5.metal` through the
-Python SDK. The deliberate bet of the aarch64-first detour paid off: the device
-models and control protocol transferred to KVM largely intact, and the gaps that
-remained were host-side macOS-isms flushed out by running on real hardware. The one
-remaining x86 gap is GPU (virtio-gpu is HVF-only).
+KVM now has full snapshot/COW restore in addition to PVH boot, networking,
+SMP, and control. GPU is not the only remaining difference: consult
+[stack status](stack.md) for current storage, clock, egress, and verification
+limits. Historical results above should be reproduced on the intended host
+before being used to assess a deployment.

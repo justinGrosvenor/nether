@@ -2,67 +2,44 @@
 
 <div class="nether-tagline">the layer below</div>
 
-A **type-2 hypervisor** in pure [Zig](https://ziglang.org). Modern guests only: no SeaBIOS, no IDE, no legacy chipset emulation. Runs beneath the guest on hardware-assisted virtualization (Apple Hypervisor.framework on aarch64, KVM on Linux/x86-64).
+Nether is a type-2 VMM in Zig. It boots Linux guests on Apple Silicon using
+Hypervisor.framework and on Linux/x86-64 using KVM, then restores warm snapshots
+into separate VMs with copy-on-write RAM.
 
-```
-swerver (one binary, embeds nether) ──► HVF / KVM ──► microVM
-              │
-              ├── egress firewall + budgets (when net enabled)
-              ├── control plane + virtio-vsock
-              └── snapshot → COW fork (HVF + KVM)
-```
+The inspected Swerver stack runs a gateway, a separate VM supervisor, per-VM
+Nether processes, and a console bridge. Read
+[current stack and backend status](stack.md) for ownership, capabilities, and
+verification limits. The exported library also supports work toward embedding.
 
-The standalone `nether` executable in this repo is a dev/bringup wrapper around the
-embeddable core (`src/root.zig`). Production is swerver importing that library.
+## Start here
 
-!!! warning "Building"
-    nether is past Phase 3 on both backends. Apple Silicon / HVF is the lead path (Linux boots, virtio works, snapshots fork, GPU). The x86/KVM reference backend has reached **parity for the platform primitive**, run-verified on bare metal: PVH boot, virtio-blk/net, SMP, the control plane over vsock, and the cross-process snapshot fork (COW restore, `__snapshot__`/`__park__`, vmgenid CRNG reseed). The one remaining KVM gap is virtio-gpu. See [Roadmap](roadmap.md) and [Limitations](about/limitations.md).
+- [Installation](getting-started/installation.md): Zig 0.16.0, build targets, signing.
+- [Running on HVF](running-on-hvf.md): Apple Silicon guests and configuration.
+- [Running on KVM](running-on-kvm.md): x86-64 PVH guests and snapshots.
+- [Forking](forking.md): capture, restore, and the HVF resume demonstrations.
+- [Provisioning](provisioning.md): bake an HVF base with a TOML recipe.
+- [Control protocol](control-protocol.md): control commands and framing.
+- [Security posture](security.md): threat model and limits.
+- [Source architecture](architecture.md): code map.
+- [Roadmap](roadmap.md): remaining work and historical milestone notes.
 
-## What it does today
-
-| Backend | Status |
-| --- | --- |
-| **HVF / aarch64** (lead) | Boots Alpine Linux to shell; full platform layer including snapshot-fork, egress firewall, control plane, metering, SMP, GPU |
-| **KVM / x86-64** (reference) | PVH-boots Linux 6.12 to an interactive shell; virtio-blk R/W; virtio-net over slirp + egress firewall (`net=1`); SMP (`cpus=N`); userspace IOAPIC; control plane, vsock, metering; cross-process snapshot fork with COW restore, `__snapshot__`/`__park__`, and vmgenid CRNG reseed. No GPU yet |
-
-Without a kernel in the working directory, the binary runs a comptime smoke-test guest that prints over serial and shuts down cleanly. The message depends on the backend:
-
-- **KVM** (x86 real-mode blob): `Nether lives. Phase 0: real-mode guest over COM1.`
-- **HVF** (aarch64 MMIO UART): `Nether lives. Phase 0: aarch64 guest over MMIO UART.`
-
-## Smoke test
+## Build check
 
 ```sh
 zig build test
+zig build -Dtarget=x86_64-linux
 ```
 
-On a host that can **run** the built binary (Linux + KVM, or macOS + signed HVF build):
+To run locally on Apple Silicon:
 
 ```sh
-zig build run          # Linux/KVM (default x86_64-linux target)
-# or on Apple Silicon:
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Dtarget=native run
-codesign --sign - --entitlements nether.entitlements --force zig-out/bin/nether
+zig build -Dtarget=native
+./zig-out/bin/nether
 ```
 
-KVM host with no `vmlinux` present:
+The native install step signs the installed binary by default. With no kernel
+present, it runs the built-in serial smoke guest. Full Linux guests require the
+artifacts described in the backend runbooks.
 
-```
-Nether lives. Phase 0: real-mode guest over COM1.
-[nether] guest shutdown.
-```
-
-## Where to next
-
-<div class="grid cards" markdown>
-
-- :material-download: **[Installation](getting-started/installation.md)**: Zig toolchain, backends, build and test.
-- :material-server: **[Running on KVM](running-on-kvm.md)**: bare-metal or nested virt, PVH kernel, initramfs, virtio-blk.
-- :material-apple: **[Running on HVF](running-on-hvf.md)**: Apple Silicon dev host, codesign, Alpine Linux boot.
-- :material-package-variant: **[Provisioning base VMs](provisioning.md)**: image vs base, the declarative bake recipe, forking, and the re-bake/GC model.
-- :material-shield-lock: **[Sandbox policy](guide/sandbox-policy.md)**: egress firewall, runtime budgets, metering.
-- :material-map: **[Design](design.md)**: scope, security posture, prior art.
-- :material-source-branch: **[Roadmap](roadmap.md)**: phases, platform track, what's next.
-- :material-presentation: **[nether in one page](nether-for-execs.md)**: the non-technical why, in outcome language.
-
-</div>
+Nether is pre-1.0. Tests and build checks are distinct from live VM verification;
+see the [recorded check scope](stack.md#verification-scope).
