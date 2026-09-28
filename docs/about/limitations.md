@@ -18,8 +18,8 @@ captured by a snapshot.
 
 HVF persistent disk files are shared external state, not part of the COW RAM
 image. Neither a snapshot nor the console restores arbitrary external services
-or TCP peers. Midstream resume depends on the separate relay and specific
-HVF restoration path demonstrated by the proof scripts.
+or TCP peers. Midstream resume depends on the separate relay and backend restoration path. Both backends reconnect established egress in source;
+only HVF has been exercised live in this update.
 
 ## Guest and host scope
 
@@ -35,8 +35,9 @@ HVF restoration path demonstrated by the proof scripts.
 The current Swerver stack uses separate gateway, supervisor, and Nether processes.
 The proposed single-process embedding and event-loop registration are unfinished.
 
-The supervisor has an in-memory pool and no restart adoption. Reclaim uses
-ensure/readiness timestamps, not active-request leases. The console relies on
+The supervisor has an in-memory pool and no restart adoption. A full pool rejects
+new tenants. Nether owns idle expiry using connection leases through response
+flush; explicit shutdown and hard runtime/CPU limits still apply. The console relies on
 gateway discovery and sampled VM state, with bounded in-memory histories.
 
 ## Stability and security

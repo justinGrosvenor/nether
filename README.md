@@ -3,49 +3,41 @@
 [![CI](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml/badge.svg)](https://github.com/justinGrosvenor/nether/actions/workflows/ci.yml)
 
 **Linux microVMs that fork from a warm snapshot.** Nether is a type-2 VMM written
-in Zig. It boots Linux, captures guest state, and restores separate VM processes
-with copy-on-write RAM.
+in Zig, running on Apple Silicon through Hypervisor.framework and on Linux/x86-64
+through KVM.
 
-**Documentation:** [project site](https://justingrosvenor.github.io/nether/),
-[source](docs/index.md), and [current stack and backend status](docs/stack.md).
+Boot Linux once, start your application, and capture its running state. Nether
+restores that snapshot into separate VMs with copy-on-write RAM, so each instance
+starts with the application already loaded. Control sockets, guest networking,
+resource limits, and usage metering make those VMs usable from a host application
+or a tenant-serving platform.
 
-## Current implementation
+[Documentation](https://justingrosvenor.github.io/nether/) ·
+[Architecture](docs/architecture.md) · [Forking](docs/forking.md) ·
+[Roadmap](docs/roadmap.md)
 
-- **macOS / Apple Silicon (HVF):** Linux boot, SMP, virtio-blk/net/rng/vsock,
-  2D GPU, control sockets, snapshots, COW fork, park/resume, and egress bridging.
-  The snapshot storage tools and mid-request resume demonstrations target this backend.
-- **Linux / x86-64 (KVM):** PVH Linux boot, SMP, virtio-blk/net/rng/vsock,
-  slirp networking with an egress firewall, control sockets, metering, snapshots,
-  COW restore, and park. Backend coverage differs; see the
-  [capability table](docs/stack.md#backend-capabilities).
-- **Optional metering:** per-VM usage counters and teardown settlement output.
-  The surrounding platform owns payment processing and durable accounting.
+## What you can do
 
-The inspected Swerver integration runs a gateway, a separate
-`nether-supervisor` daemon, and one `nether` process per VM. The
-`swerver-console` bridge observes and controls those services. Nether also
-exports a library through `src/root.zig`; embedding it into one gateway process
-remains an integration design, rather than the topology used by this stack.
+- **Fork a running guest.** Capture CPU, RAM, and device state, then restore
+  independent VM processes from a shared snapshot base.
+- **Park and resume work.** Capture a guest and stop its VMM process. The HVF
+  park/wake flow can resume an application blocked on an outbound request while
+  a separate host relay holds the upstream connection.
+- **Drive Linux over a control socket.** Run guest commands, transfer files,
+  inspect state, take snapshots, and shut down through a versioned protocol.
+- **Serve ordinary applications.** A vsock forwarder connects host Unix sockets
+  to a guest's loopback TCP service. Virtio networking provides slirp egress
+  with allow/block rules and bandwidth limits.
+- **Govern and observe each VM.** Set runtime, CPU, idle, output, and connection
+  limits; inspect usage counters, the event journal, and terminal state.
 
-## Fork and resume
-
-A base captures an already running guest. Forks map the base RAM privately and
-copy pages as they write. Each fork still needs a new VMM process and VM/device
-setup; it is not a host process `fork()`.
-
-Historical Apple Silicon measurements recorded approximately 10 ms to a driveable
-restored VM and 25 ms to a first response from an already warm application, using
-a 512 MiB / 2-vCPU guest. These are different measurements from a complete
-gateway/supervisor request. They are not current benchmark guarantees.
-
-The HVF proof scripts also exercise mid-request resume, clock handling, and CRNG
-reseeding. Continuing an external connection requires the host relay used by
-those proofs; a memory snapshot alone cannot preserve a host TCP connection.
-See [forking](docs/forking.md) and [reproducing](docs/reproducing.md).
+Both backends implement Linux boot, SMP, virtio-blk/net/rng/vsock, snapshots,
+COW restore, and park. HVF also provides a 2D virtio GPU and snapshot storage
+tooling. See the [backend matrix](docs/stack.md#backend-capabilities) for details.
 
 ## Build and run
 
-Requires **Zig 0.16.0**. On Apple Silicon:
+Requires **Zig 0.16.0**. On an Apple Silicon Mac:
 
 ```sh
 zig build -Dtarget=native
@@ -53,61 +45,56 @@ zig build -Dtarget=native
 ./zig-out/bin/nether
 ```
 
-The native macOS install step signs `zig-out/bin/nether` with the hypervisor
-entitlement by default. `-Dcodesign=false` disables signing; see
-[code signing](docs/codesigning.md). Run the installed binary shown above.
+The build signs the installed executable with the hypervisor entitlement. The
+image script prepares a Linux kernel and rootfs under `kernels/`; launching Nether
+then boots the guest. See [Running on HVF](docs/running-on-hvf.md) for configuration
+and [code signing](docs/codesigning.md) for signing options and SDK setup.
 
-The kernel and rootfs are not checked in. The image script builds the HVF guest
-artifacts under `kernels/`. If native linking cannot find the SDK, prefix the
-build with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`.
+For Linux/x86-64:
 
 ```sh
-zig build test                         # host tests; no VM boot required
-zig build -Dtarget=x86_64-linux         # KVM binary; this is also the default target
+zig build -Dtarget=x86_64-linux
 ```
 
-Running KVM requires an x86-64 Linux host with access to `/dev/kvm` and the
-guest layout in [Running on KVM](docs/running-on-kvm.md). For HVF configuration,
-see [Running on HVF](docs/running-on-hvf.md).
+Run on a host with `/dev/kvm`, using the kernel and initramfs setup in
+[Running on KVM](docs/running-on-kvm.md).
 
-[Provisioning](docs/provisioning.md) describes the HVF base recipe runner.
-[Swerver guest per request](docs/swerver-guest.md) describes the application demo.
+## From a guest to a service
 
-## Security and verification
+Use [provisioning recipes](docs/provisioning.md) to prepare an HVF guest with its
+application and capture a reusable base. The [forking guide](docs/forking.md)
+walks through capture, restore, and park/wake; the
+[control protocol](docs/control-protocol.md) describes the host API.
 
-The design assumes a hostile guest. Bounds-checked guest-memory helpers, device
-validation, unit tests, and fuzz-smoke tests provide defenses, but do not establish
-that every guest-input path is safe. Nether is pre-1.0 and has had no external
-security audit. See [SECURITY.md](SECURITY.md) for scope and private reporting.
+In the Swerver stack, a gateway routes tenant requests, `nether-supervisor`
+launches and pools Nether VMs, and `swerver-console` provides the UI. Requests
+flow through each VM's data socket to its guest service. Start with the
+[Swerver guest example](docs/swerver-guest.md) or the [stack overview](docs/stack.md).
+Nether also exposes its VM and device modules as a Zig library through
+[`src/root.zig`](src/root.zig).
 
-The [stack status](docs/stack.md#verification-scope) separates compile and unit
-checks from live VM proofs. Passing host tests does not verify an end-to-end
-deployment or establish production readiness.
+## Development
 
-## Layout
-
-```text
-src/main.zig       executable: backend boot, restore, and runtime wiring
-src/root.zig       library exports
-src/hv/           HVF and KVM backends, VM state, KVM snapshots
-src/agent/        control, metering, HVF snapshots, shared platform setup
-src/virtio/       transport and devices, including the vsock protocol engine
-src/chipset/      platform devices, interrupt and bus plumbing
-src/boot/         PVH/ELF loading and device tree generation
-src/mem/          guest memory maps
-src/net/          user-mode networking
-src/common/       config, host helpers, locks
-src/vt/           terminal parser and screen
-src/fuzz.zig      guest-facing parser fuzz smoke
-docs/             architecture, protocols, operational guides, history
+```sh
+zig build test
 ```
 
-`build.zig.zon` declares version 0.1.1, Zig 0.16.0, and no external package
-dependencies. See [versioning](docs/versioning.md).
+The suite covers guest-facing parsers, devices, snapshots, and control plumbing,
+including fuzz-smoke tests. The [proof scripts](docs/reproducing.md) exercise live
+VM workflows; [recorded results](docs/stack.md#verification-scope) document the
+checks and environments used.
 
-## Development and license
+| Path | Contents |
+| --- | --- |
+| `src/main.zig`, `src/root.zig` | Executable and library entry points |
+| `src/hv/`, `src/boot/`, `src/chipset/` | Host backends, guest boot, platform devices |
+| `src/virtio/`, `src/mem/`, `src/net/` | Virtio devices, guest memory, networking |
+| `src/agent/`, `src/vt/` | Control plane, snapshots, metering, terminal |
+| `tools/`, `scripts/` | Guest image builders, provisioning, runtime proofs |
+| `docs/` | Guides, architecture, protocols, project history |
 
-The project is developed with AI assistance. Source review, automated checks,
-and live runtime proofs have distinct scopes; none substitutes for the others.
+Nether is developed with AI assistance. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development conventions and [SECURITY.md](SECURITY.md) for the guest trust
+boundary and private vulnerability reporting.
 
 [Apache-2.0](LICENSE).

@@ -64,8 +64,9 @@ In the demonstrated composition:
    with `resume=1`. The relay supplies the waiting reply to the restored guest.
 
 The guest resumes its blocked call without an application-level retry in this
-scenario. Ordinary virtio-net/slirp TCP flows are not preserved. KVM's inspected
-restore path does not call the equivalent established-egress resume hook.
+scenario. Both backends reconnect surviving egress streams on restore; the
+live park/wake proofs below exercise HVF. Ordinary virtio-net/slirp TCP flows
+use a separate network path and are not preserved by this relay.
 
 HVF captures the virtual counter so monotonic time can continue from the park
 point. Its PL031 RTC reads current host time, but guest wall time needs
@@ -95,6 +96,4 @@ python3 scripts/fork_serve.py
 ```
 
 The first proof exercises two generations of mid-request park/wake using its
-own relay. The second measures warm-fork serving. Neither establishes every
-snapshot state or workload is safe. Nether is pre-1.0 with no external security
-audit; see [security](security.md).
+own relay. The second measures warm-fork serving.

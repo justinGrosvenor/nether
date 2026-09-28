@@ -88,13 +88,26 @@ chmod +x initrd/init
 
 For the full platform path (control socket, agent REPL, metering, observe, govern,
 render - the same surfaces as HVF), use the build script instead of the bare shell
-above. It cross-compiles the agent, fetches busybox, and writes an `/init` that
-configures `eth0` to the slirp plan and starts the agent:
+above. It cross-compiles the agent and TCP/vsock forwarder. Its `/init` brings up
+loopback even when `net=0`, configures an available NIC for slirp, starts the
+agent, and starts the forwarder when `app_port` or `egress_port` is configured:
 
 ```sh
-./tools/build-guest-x86.sh        # -> kernels/initramfs-x86.cpio.gz
+./tools/build-guest-x86.sh --minimal # static BusyBox + agent + forwarder
+# For the supervisor demo (Python), or Python/SQLite/Node workloads:
+./tools/build-guest-x86.sh --runtimes # requires Docker; builds linux/amd64
 cp kernels/initramfs-x86.cpio.gz initramfs
 ```
+
+`--runtimes` defaults to `RUNTIMES="python3 sqlite nodejs e2fsprogs"`; override that
+package list as needed. `OUT=/path` changes the output directory. This image was
+built and its runtimes executed under Docker on 2026-09-06; that is not a KVM boot
+result. For supervisor launches, put `vmlinux` and the image renamed to `initramfs`
+in `kernels_dir`. The supervisor checks both are readable, nonempty regular files
+before spawning; it does not validate kernel configuration or guest service readiness
+at that stage. The minimal image has no Python.
+For an offline minimal build, `BUSYBOX_X86=/path/to/static-x86_64-busybox`
+uses an existing binary instead of downloading it.
 
 This needs the kernel built with the platform stack (the `VIRTIO_NET`/`VIRTIO_CONSOLE`
 /`VSOCKETS`/`VIRTIO_VSOCKETS` options above). Then launch with a `nether.conf`:
@@ -188,10 +201,11 @@ reset, as on HVF). HVF storage tools do not apply to NSKV. KVM park files do
 not carry the HVF one-shot kind/unlink contract. A failed KVM park can leave
 vCPUs paused; callers must not assume every capture error resumes execution.
 
-The inspected local KVM changes add data/egress bridge wiring. They were
-cross-built but not live-tested in this audit. There is no matching call to
-resume established egress connections on KVM restore; do not apply the HVF
-park-while-awaiting-upstream proof to this backend.
+The KVM boot path wires data/egress bridges and reconnects established egress
+connections before resuming vCPUs. Both backends use the same helper, which sends
+`NETHER-EGRESS v1 conn=<id> resume=1` to the relay. Host socket regression tests and
+the x86-64 Linux build pass. Live KVM park/restore remains unverified in this
+update; the HVF park proof also checks a one-shot file lifecycle that KVM lacks.
 
 ## Notes
 

@@ -6,10 +6,13 @@ Nether is a type-2 VMM in Zig. It boots Linux guests on Apple Silicon using
 Hypervisor.framework and on Linux/x86-64 using KVM, then restores warm snapshots
 into separate VMs with copy-on-write RAM.
 
-The inspected Swerver stack runs a gateway, a separate VM supervisor, per-VM
-Nether processes, and a console bridge. Read
-[current stack and backend status](stack.md) for ownership, capabilities, and
-verification limits. The exported library also supports work toward embedding.
+Start from a running application, fork isolated instances from its snapshot,
+and drive each VM through a control socket. Nether provides guest networking,
+data/egress bridges, resource limits, usage metering, and a terminal view.
+
+In the Swerver stack, the gateway routes requests, nether-supervisor manages
+the VM pool, and swerver-console provides the UI. See the [stack overview](stack.md)
+for the architecture and backend matrix.
 
 ## Start here
 
@@ -19,11 +22,11 @@ verification limits. The exported library also supports work toward embedding.
 - [Forking](forking.md): capture, restore, and the HVF resume demonstrations.
 - [Provisioning](provisioning.md): bake an HVF base with a TOML recipe.
 - [Control protocol](control-protocol.md): control commands and framing.
-- [Security posture](security.md): threat model and limits.
+- [Security posture](security.md): guest trust boundary and reporting.
 - [Source architecture](architecture.md): code map.
 - [Roadmap](roadmap.md): remaining work and historical milestone notes.
 
-## Build check
+## Build and run
 
 ```sh
 zig build test
@@ -41,5 +44,5 @@ The native install step signs the installed binary by default. With no kernel
 present, it runs the built-in serial smoke guest. Full Linux guests require the
 artifacts described in the backend runbooks.
 
-Nether is pre-1.0. Tests and build checks are distinct from live VM verification;
-see the [recorded check scope](stack.md#verification-scope).
+Explore the [live VM examples](reproducing.md), or read the
+[recorded test results](stack.md#verification-scope).

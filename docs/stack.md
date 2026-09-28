@@ -1,7 +1,7 @@
 # Current stack and backend status
 
 This page describes the source inspected on **2026-09-06**, including the local
-KVM bridge and supervisor launch/readiness changes. It is a working-tree status,
+KVM bridge, connection-aware idle expiry, and supervisor launch/readiness changes. It is a working-tree status,
 not a claim that those changes are in a release.
 
 ## Process and ownership boundaries
@@ -42,8 +42,8 @@ proposed event-loop integration do not establish a deployed single-process embed
 | slirp egress firewall | Implemented | Implemented |
 | Full snapshot, COW restore, park | Implemented | Implemented |
 | Snapshot format | NSNP v5 | NSKV v2 |
-| Data and egress bridge wiring | Established HVF path | Present in the inspected local changes; live behavior not checked in this audit |
-| Restore of established egress connections | HVF resume path and relay proofs | No equivalent resume call in the inspected KVM path |
+| Data and egress bridge wiring | Established HVF path | Implemented; x86 image built and inspected, live KVM test pending |
+| Restore of established egress connections | Shared reconnection helper; live two-generation park/wake proof | Shared egress reconnection helper wired before vCPUs resume; host socket regression passes |
 | Park file consumed on resume | HVF park-kind lifecycle | No matching kind/unlink lifecycle in NSKV |
 | Sparse/compressed base tooling and content-diff helpers | HVF format; see storage caveats below | No matching storage-tool integration |
 | RTC/counter restore handling and rewind demo | HVF-specific implementation | Not equivalent |
@@ -66,9 +66,10 @@ interface. See [snapshot storage](incremental-snapshot-spec.md).
 - The supervisor treats a nonempty `base_snap` as an instruction to bake a base
   at startup under `work_root/00000000/base.snap`. It falls back to cold boot
   if baking fails, and does not recover a persisted pool on restart.
-- Supervisor idle age tracks ensure/readiness activity. Requests served through
-  an existing gateway mapping do not refresh that age. Reclaim is not protected
-  by a per-request VM lease.
+- A full supervisor pool returns `pool full`; it does not evict serving VMs.
+  Nether owns idle expiry and holds a lease across each data/egress connection,
+  including its final response flush. Cached gateway traffic therefore counts
+  without an ensure call. Explicit shutdown and hard runtime/CPU caps still stop a VM.
 - The console ledger is bounded and in memory. Its sandbox settlement entries
   use the last sampled stats; they are not a durable ledger or proof of payment.
 - The console's SSE heartbeat describes bridge connection health. It does not
@@ -80,12 +81,17 @@ Checks recorded during the 2026-09-06 review:
 
 | Check | Result and limit |
 | --- | --- |
-| Nether host unit/fuzz-smoke suite | 262 tests passed |
-| Nether native build | Passed with signing disabled in an isolated output prefix |
+| Nether host unit/fuzz-smoke suite | 267 tests passed |
+| Nether native build | Passed and signed in an isolated output prefix |
 | Nether x86-64 Linux cross-build | Passed; compilation does not exercise KVM |
-| Supervisor host suite | 46 tests passed |
+| Supervisor suite | 48 tests passed on macOS and under Docker linux/amd64 |
+| Restored-egress socket regression | Passed on macOS and under Docker linux/amd64; no hypervisor involved |
 | Console `pnpm test` | Passed: 43 bridge tests executed; 51 core tests reported from cache |
-| Live VM boots, snapshot proofs, complete console stack | Not rerun in this review |
+| x86 runtime image | Built; extracted Python/Node/SQLite executed under Docker linux/amd64 |
+| x86 minimal image | Built using cached static BusyBox; extracted BusyBox executes and init parses |
+| Live HVF park/wake | Held reply delivered across two park/wake generations |
+| Live supervisor/HVF idle regression | 8-second response survives a 5-second idle limit and full-pool pressure; cached traffic refreshes idle age |
+| Live KVM and complete console stack | Not rerun in this review |
 
 These counts describe that checkout and check run. Historical live results in
 the runbooks and roadmap are not new measurements. The

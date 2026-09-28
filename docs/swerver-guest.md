@@ -104,9 +104,10 @@ new VM restore and its first real application response.
 ## Linux and EC2 Spot
 
 This example targets Apple HVF/aarch64. KVM/x86-64 already implements
-snapshot/COW restore. The inspected local changes add KVM data/egress bridge
-wiring and Linux guest staging in the supervisor, but this full Swerver guest
-workflow has not been live-verified on Linux in the current audit.
+snapshot/COW restore. KVM data/egress bridge wiring, restored-egress reconnection,
+and Linux guest staging are implemented. The x86 runtime image is built and
+inspected, but this full Swerver guest workflow has not been live-verified on
+Linux in the current update.
 
 A Linux port needs matching x86 guest artifacts, a Linux Nether binary,
 application readiness checks, and a complete gateway/supervisor request gate.

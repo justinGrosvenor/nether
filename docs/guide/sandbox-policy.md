@@ -47,11 +47,11 @@ rerun in this documentation audit.
 | Axis | Config | Behavior |
 | --- | --- | --- |
 | **Wall clock** | `max_runtime_s` | Watchdog terminates the sandbox |
-| **Idle** | `idle_timeout_s` | Reclaim on Nether's tracked control/data inactivity |
+| **Idle** | `idle_timeout_s`, overridden by `idle_timeout_ms` | Reclaim after inactivity with no open data/egress connections |
 | **Bandwidth** | `net_rate_kbps` | Token-bucket on download; TCP backpressure when empty |
 | **Output volume** | `max_output_bytes` | Per-command output cap (0 = unlimited) |
 
-Watchdogs arm whenever `max_runtime_s` or `idle_timeout_s` is set, even outside control mode.
+Watchdogs arm whenever `max_runtime_s`, `idle_timeout_s`, or `idle_timeout_ms` is set, even outside control mode.
 
 ## Metering
 

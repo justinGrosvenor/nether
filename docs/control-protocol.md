@@ -3,9 +3,10 @@
 > **Backend scope (2026-09-06):** protocol version 2 is shared, but backend
 > configuration and snapshot behavior differ. Guest privilege drop, persistent
 > `disk=` setup, storage transforms, PL031/virtual-counter handling, and the
-> established-egress resume flow below describe HVF. KVM implements full
-> snapshot/restore and park with its own format. Its new data/egress bridge
-> wiring is source-inspected and cross-built, not live-verified in this audit.
+> park-file consumption describe HVF. KVM implements full snapshot/restore
+> and park with its own format. Both backends reconnect established egress
+> through the same helper; KVM is cross-built and host-tested, not live-verified
+> in this update.
 > See [backend status](stack.md#backend-capabilities).
 
 The control socket is the integration contract between the platform (swerver) and a
@@ -275,12 +276,19 @@ appears only in settlement mode). Flip it per sandbox; nothing else about the ru
 
 ## Govern knobs (set per sandbox in `nether.conf`)
 
-`max_runtime_s` (wall-clock cap), `max_cpu_s` (CPU-time cap), `idle_timeout_s` (reclaim on
-inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
+`max_runtime_s` (wall-clock cap), `max_cpu_s` (CPU-time cap), `idle_timeout_s` / `idle_timeout_ms` (reclaim on inactivity), `net_rate_kbps` (download cap), `max_output_bytes` (per-command output cap;
 default 1 MiB), `net`/`net_open`/`net_allow`/`net_block` (egress firewall), `cpus`/`ram_mb`
 (sizing), `disk`/`disk_size_mb` (persistent disk; below), `app_port`/`data_socket`/
 `max_data_conns` (data-plane proxy to an in-guest server; below). Inspect `__info__` for the settings actually applied. KVM currently uses a
 fixed 256 MiB RAM constant; its boot path does not consume `ram_mb` like HVF.
+
+`idle_timeout_ms`, when present, overrides the legacy seconds setting; zero
+disables idle expiry. `__info__` includes the effective millisecond value. Open
+data/egress connections prevent idle expiry, including while awaiting a silent
+upstream and while flushing a response tail. The idle period starts again when
+the last connection closes. Admission and expiry share a lock, so a connection
+cannot begin guest work after idle shutdown has been selected. Hard runtime/CPU
+budgets and explicit shutdown remain independent of this guard.
 
 ### In-guest privilege drop (`run_as`)
 
@@ -377,8 +385,9 @@ and the cap is per-VM (each VM has its own bucket, so one tenant's flood cannot 
 another). Verified live on HVF (`scripts/data_plane_pacing.py`): an 8 MiB transfer paces to
 ~1 MB/s under an 8000-kbps cap vs ~850 MB/s uncapped, byte-for-byte lossless. Data-plane
 traffic also counts as sandbox activity, so a VM busy only with proxied requests is not
-idle-reclaimed by Nether's activity watchdog. The separate supervisor only
-refreshes idle age on ensure/readiness, so its reclaim behavior differs. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
+idle-reclaimed by Nether's activity watchdog. The supervisor delegates idle expiry
+to Nether and rejects new tenants at capacity, so cached gateway hits do not need
+to call ensure to keep their active connections alive. `__info__` reports `data_plane`, `app_port`, `max_data_conns`,
 `data_idle_ms`, `data_rate_kbps`; `__stats__` and the bill report `data_conns` +
 `data_ms` (plus the shared `bytes_in`/`bytes_out`). A snapshot **fork inherits** `app_port`
 (on the cmdline), so a warmed base with the tenant server already running forks into an
