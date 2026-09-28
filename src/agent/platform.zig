@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const hostutil = @import("../common/hostutil.zig");
+const Lock = @import("../common/lock.zig").Lock;
 
 const nowMs = hostutil.nowMs;
 const usleep = hostutil.usleep;
@@ -58,14 +59,55 @@ pub const Snapshotter = struct {
     }
 };
 
+/// Serializes idle expiry with connection admission. A lease covers an entire
+/// data/egress connection, including its final buffered response flush. Once
+/// expiry wins, new work cannot enter the guest while it is shutting down.
+pub const Activity = struct {
+    lock: Lock = .{},
+    last_ms: i64 = 0,
+    leases: usize = 0,
+    expired: bool = false,
+
+    pub fn touch(self: *Activity) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.last_ms = nowMs();
+    }
+
+    pub fn begin(self: *Activity) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.expired) return false;
+        self.leases += 1;
+        self.last_ms = nowMs();
+        return true;
+    }
+
+    pub fn end(self: *Activity) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        std.debug.assert(self.leases > 0);
+        self.leases -= 1;
+        self.last_ms = nowMs();
+    }
+
+    pub fn expire(self: *Activity, now: i64, idle_ms: i64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (idle_ms <= 0 or self.expired or self.leases > 0 or now - self.last_ms < idle_ms) return false;
+        self.expired = true;
+        return true;
+    }
+};
+
 /// Lifecycle watchdogs (govern): the runtime budget (a hard wall-clock cap) and the
-/// idle timeout (reclaim a sandbox with no control-plane activity). Both stop the
+/// idle timeout (no activity and no open data/egress connections). Both stop the
 /// guest via the injected `Stop`, so the module is identical on both backends.
 /// Storage must live in the caller's frame (arm() spawns detached threads that hold
 /// `self` for the VM's lifetime); pass `&watchdogs` and do not move it after arm().
 pub const Watchdogs = struct {
     stop: Stop,
-    activity: ?*std.atomic.Value(i64) = null, // control-plane activity; required only for idle
+    activity: ?*Activity = null,
     start_ms: i64 = 0, // set by arm()
     runtime_ms: i64 = 0, // hard wall-clock cap (0 = unlimited)
     idle_ms: i64 = 0, // idle reclamation (0 = disabled; needs `activity`)
@@ -89,7 +131,7 @@ pub const Watchdogs = struct {
         }
         if (self.idle_ms > 0) {
             if (self.activity) |act| {
-                act.store(self.start_ms, .release); // count idle from boot
+                act.touch(); // count idle from boot; preserve existing connection leases
                 if (std.Thread.spawn(.{}, idleLoop, .{self})) |t| t.detach() else |_| {}
                 std.debug.print("[nether] idle timeout armed: {d}s\n", .{@divTrunc(self.idle_ms, 1000)});
             }
@@ -107,11 +149,11 @@ pub const Watchdogs = struct {
         self.stop.call();
     }
 
-    /// Stop once no control-plane activity has occurred for `idle_ms`. Only spawned
+    /// Stop once no activity or connections remain for `idle_ms`. Only spawned
     /// when `activity` is set, so the unwrap is safe.
     fn idleLoop(self: *Watchdogs) void {
         const activity = self.activity.?;
-        while (nowMs() - activity.load(.acquire) < self.idle_ms) _ = usleep(200_000); // ~5 Hz
+        while (!activity.expire(nowMs(), self.idle_ms)) _ = usleep(200_000); // ~5 Hz
         std.debug.print("\n[nether] idle timeout ({d}s) reached; stopping sandbox\n", .{@divTrunc(self.idle_ms, 1000)});
         self.stop.call();
     }
@@ -140,6 +182,31 @@ pub const Watchdogs = struct {
 
 // --- tests -----------------------------------------------------------------
 const testing = std.testing;
+
+test "idle expiry waits for every connection and the full timeout after release" {
+    var activity = Activity{};
+    try testing.expect(activity.begin());
+    try testing.expect(activity.begin());
+    try testing.expect(!activity.expire(activity.last_ms + 10_000, 100));
+    activity.end();
+    try testing.expect(!activity.expire(activity.last_ms + 10_000, 100));
+    activity.end();
+    try testing.expect(!activity.expire(activity.last_ms + 99, 100));
+    try testing.expect(activity.expire(activity.last_ms + 100, 100));
+    try testing.expect(!activity.begin()); // expiry wins admission; no guest work starts
+    activity.touch();
+    try testing.expect(!activity.begin()); // a late command cannot undo retirement
+}
+
+test "new connection wins admission before idle expiry; zero disables expiry" {
+    var activity = Activity{};
+    try testing.expect(!activity.expire(10_000, 0));
+    try testing.expect(activity.begin());
+    try testing.expect(!activity.expire(activity.last_ms + 100, 100));
+    activity.end();
+    activity.touch();
+    try testing.expect(!activity.expire(activity.last_ms + 99, 100));
+}
 
 test "injected Stop dispatches to the backend stop with its context" {
     const Spy = struct {

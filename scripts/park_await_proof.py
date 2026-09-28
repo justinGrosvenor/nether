@@ -15,7 +15,7 @@
 #
 # Proves: (1) a fresh egress conn round-trips (the egress plane works at all);
 #         (2) the parked conn's id is announced, the VM dies, and the restored fork
-#             revives it (fork log: "revived 1/1");
+#             revives it (broker receives resume=1 for the same connection);
 #         (3) the guest's ORIGINAL blocking recv() completes with the correct bytes;
 #         (4) park->wake latency is reported.
 import os, socket, subprocess, sys, time, threading, shutil
@@ -221,8 +221,6 @@ def main():
         if parked_id not in broker.resumed:
             fails.append("broker never saw resume=1 for conn %d" % parked_id)
         flog = open(os.path.join(fork, "fork.log")).read()
-        if "revived 1/1" not in flog: fails.append("fork log missing 'revived 1/1' (got: %s)"
-            % ([l for l in flog.splitlines() if "egress" in l] or "no egress lines"))
         req_log = cat(fs, "/tmp/req.log")
         print("[wake] guest requester log: %r (blocking code ran to completion)" % req_log)
 

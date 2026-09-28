@@ -234,7 +234,15 @@ fn linuxMain() !void {
     const control_on = modeOn("control", "nether-control") or have_sock_conf;
     const agent_repl = modeOn("agent", "nether-agent") and !control_on;
     const agent_mode = control_on or agent_repl; // both drive the agent via agentEvent
-    const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode;
+    // Data/egress bridge configuration also requires virtio-vsock, even for a guest
+    // that does not expose the command/control plane. Keep these buffers alive for
+    // the lifetime of the bridge threads created below.
+    var data_sock_buf: [256]u8 = undefined;
+    var egress_sock_buf: [256]u8 = undefined;
+    const ds_conf: []const u8 = confGet("data_socket", &data_sock_buf) orelse "";
+    const es_conf: []const u8 = confGet("egress_socket", &egress_sock_buf) orelse "";
+    const have_bridge = ds_conf.len > 0 or es_conf.len > 0;
+    const vsock_on = modeOn("vsock", "nether-vsock") or agent_mode or have_bridge;
 
     // Render pillar: in control mode, tee each command's output into its own VT screen
     // (per-command history) so the platform can fetch a rendered snapshot via __screen__ [id].
@@ -254,11 +262,14 @@ fn linuxMain() !void {
     defer if (vsock_engine) |v| allocator.destroy(v);
     var vsdev: nether.VsockDev = undefined;
     var vs_dev: nether.virtio.Device = undefined;
+    var vs_probe: control.VsockProbe = .{};
+    var vs_router: control.VsockRouter = .{ .agent = &core.agent, .probe = &vs_probe };
     if (vsock_on) {
         const vs = try allocator.create(nether.Vsock);
         vs.* = .{ .guest_cid = 3 };
-        vs.on_event = if (agent_mode) agentEvent else vsockEcho;
-        vs.on_event_ctx = if (agent_mode) @as(*anyopaque, &core.agent) else @as(*anyopaque, vs);
+        const routed = agent_mode or have_bridge;
+        vs.on_event = if (routed) control.VsockRouter.dispatch else vsockEcho;
+        vs.on_event_ctx = if (routed) @as(*anyopaque, &vs_router) else @as(*anyopaque, vs);
         vsock_engine = vs;
         vsdev = .{ .engine = vs };
         vs_dev = nether.virtio.Device.init(vsdev.backend(), .{ .bytes = low, .base = layout.ram_low.base });
@@ -268,8 +279,15 @@ fn linuxMain() !void {
         try pci_host.addFunction(vs_dev.function(2, 0));
         try bus.addMmio(vs_dev.mmio());
         vsdev.attach(&vs_dev);
-        _ = vsdev.hostListen(if (agent_mode) 5000 else 1234);
-        std.debug.print("[nether] virtio-vsock: guest CID 3, {s} on port {d}, BAR 0x{x}\n", .{ if (agent_mode) "agent" else "echo", @as(u16, if (agent_mode) 5000 else 1234), vs_dev.barBase() });
+        if (agent_mode) {
+            _ = vsdev.hostListen(5000);
+            std.debug.print("[nether] virtio-vsock: guest CID 3, agent on port 5000, BAR 0x{x}\n", .{vs_dev.barBase()});
+        } else if (!have_bridge) {
+            _ = vsdev.hostListen(1234);
+            std.debug.print("[nether] virtio-vsock: guest CID 3, echo on port 1234, BAR 0x{x}\n", .{vs_dev.barBase()});
+        } else {
+            std.debug.print("[nether] virtio-vsock: guest CID 3, data plane, BAR 0x{x}\n", .{vs_dev.barBase()});
+        }
     }
 
     // virtio-net: opt-in via a `nether-net` marker, backed by a host tap device
@@ -405,7 +423,20 @@ fn linuxMain() !void {
         defer allocator.free(k);
         const initramfs: ?[]u8 = readFile(allocator, "initramfs") catch null;
         defer if (initramfs) |fs| allocator.free(fs);
-        nether.pvh.boot(&vm, vcpu, layout, k, "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr no_timer_check", initramfs, num_cpus) catch |err| {
+        const base_cmdline = "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nokaslr no_timer_check";
+        var cmdline_buf: [256]u8 = undefined;
+        var appport_buf: [16]u8 = undefined;
+        const app_port: []const u8 = confGet("app_port", &appport_buf) orelse "";
+        var egport_buf: [16]u8 = undefined;
+        const egress_port: []const u8 = confGet("egress_port", &egport_buf) orelse "";
+        const cmdline = std.fmt.bufPrint(&cmdline_buf, "{s}{s}{s}{s}{s}", .{
+            base_cmdline,
+            if (app_port.len > 0) " nether.app_port=" else "",
+            app_port,
+            if (egress_port.len > 0) " nether.egress_port=" else "",
+            egress_port,
+        }) catch base_cmdline;
+        nether.pvh.boot(&vm, vcpu, layout, k, cmdline, initramfs, num_cpus) catch |err| {
             std.debug.print("[nether] PVH boot failed: {s}\n", .{@errorName(err)});
             return err;
         };
@@ -491,6 +522,32 @@ fn linuxMain() !void {
         .pause = &snap_pause,
         .devs = snap_devs,
     };
+    // KVM data plane: identical host Unix socket <-> virtio-vsock wiring to the
+    // HVF backend. The guest forwarder listens on vsock:5001 and relays to the
+    // loopback app_port supplied on the PVH command line above.
+    var data_bridge: control.DataBridge = undefined;
+    if (have_bridge) {
+        data_bridge = .{
+            .vsdev = &vsdev,
+            .path = if (ds_conf.len > 0) @ptrCast(&data_sock_buf) else "",
+            .meter = &core.meter,
+            .alloc = allocator,
+        };
+        const mdc = confGetInt("max_data_conns", 0);
+        if (mdc > 0) data_bridge.max_conns = @min(@as(usize, @intCast(mdc)), control.DataBridge.MAX_BRIDGE);
+        data_bridge.idle_ms = confGetInt("data_idle_ms", 0);
+        const drk = confGetInt("data_rate_kbps", 0);
+        if (drk > 0) data_bridge.rate_bps = @as(u64, @intCast(drk)) * 125;
+        if (es_conf.len > 0) {
+            data_bridge.egress_path = @ptrCast(&egress_sock_buf);
+            _ = vsdev.hostListenWindow(control.EGRESS_VSOCK_PORT, data_bridge.window);
+        }
+        vs_router.bridge = &data_bridge;
+        data_bridge.start();
+        if (restore_mode) _ = data_bridge.resumeRestoredEgress();
+    }
+    defer if (have_bridge) data_bridge.stop();
+
     var ctl_ctx: control.ControlCtx = undefined; // stable storage for the listener/relay threads
     if (control_on) {
         control.startControl(&ctl_ctx, .{
@@ -498,10 +555,12 @@ fn linuxMain() !void {
             .agent = &core.agent,
             .meter = &core.meter,
             .journal = &core.journal,
+            .probe = &vs_probe,
             .gpu = null,
             .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
             .snapshot = .{ .ctx = &kvm_snap_ctx, .func = ksnap.snapshotCall },
             .park = .{ .ctx = &kvm_snap_ctx, .func = ksnap.parkCall },
+            .bridge = if (have_bridge) &data_bridge else null,
             .path = ctl_path,
             .allocator = allocator,
             .info = .{
@@ -513,17 +572,23 @@ fn linuxMain() !void {
                 .max_runtime_s = confGetInt("max_runtime_s", 0),
                 .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
+                .idle_timeout_ms = conf.idleTimeoutMs(),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
+                .app_port = @intCast(confGetInt("app_port", 0)),
+                .max_data_conns = confGetInt("max_data_conns", 0),
+                .data_idle_ms = confGetInt("data_idle_ms", 0),
+                .data_rate_kbps = confGetInt("data_rate_kbps", 0),
+                .egress = es_conf.len > 0,
             },
         });
     }
     var watchdogs = platform.Watchdogs{
         .stop = .{ .ctx = &kvm_stop, .func = KvmStop.call },
-        .activity = &core.meter.last_activity_ms,
+        .activity = &core.meter.activity,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
-        .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
+        .idle_ms = @intCast(conf.idleTimeoutMs()),
         .cpu_ms = @intCast(confGetInt("max_cpu_s", 0) * 1000),
     };
     watchdogs.arm();
@@ -1399,6 +1464,7 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
                 .max_runtime_s = confGetInt("max_runtime_s", 0),
                 .max_cpu_s = confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = confGetInt("idle_timeout_s", 0),
+                .idle_timeout_ms = conf.idleTimeoutMs(),
                 .rate_kbps = confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
@@ -1444,9 +1510,9 @@ fn macBootLinux(allocator: std.mem.Allocator, kernel: []const u8, initramfs: ?[]
     // path. 0 = unlimited / disabled.
     var watchdogs = platform.Watchdogs{
         .stop = .{ .ctx = &hvf_stop, .func = HvfStop.call },
-        .activity = &core.meter.last_activity_ms,
+        .activity = &core.meter.activity,
         .runtime_ms = @intCast(confGetInt("max_runtime_s", 0) * 1000),
-        .idle_ms = @intCast(confGetInt("idle_timeout_s", 0) * 1000),
+        .idle_ms = @intCast(conf.idleTimeoutMs()),
         .cpu_ms = @intCast(confGetInt("max_cpu_s", 0) * 1000),
     };
     watchdogs.arm();

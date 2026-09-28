@@ -37,6 +37,11 @@ pub fn confGetInt(key: []const u8, default: u64) u64 {
     return default;
 }
 
+/// Millisecond override for supervisors; legacy seconds remain supported.
+pub fn idleTimeoutMs() u64 {
+    return @min(confGetInt("idle_timeout_ms", confGetInt("idle_timeout_s", 0) *| 1000), std.math.maxInt(i64));
+}
+
 /// nether.conf boolean (`1`/`true`/`yes`) for `key`, false if absent.
 pub fn confBool(key: []const u8) bool {
     var b: [16]u8 = undefined;

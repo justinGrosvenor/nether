@@ -1662,20 +1662,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
         if (have_bridge) {
             data_bridge.start(); // spawn the fork's data-plane listener
             if (ds_conf.len > 0) std.debug.print("[nether] fork data plane ON at {s}: dials the inherited in-guest forwarder; warm tenant server is immediately serving.\n", .{@as([*:0]const u8, @ptrCast(&data_sock_buf))});
-            // Park-while-awaiting-upstream: egress conns are pure in-memory vsock state, so
-            // they SURVIVED the snapshot - the guest side is typically still blocked in
-            // recv() awaiting its upstream reply. Re-attach each one's host side: dial the
-            // platform's egress listener with resume=1 so it re-splices the parked upstream
-            // (which it held while this VM did not exist) into the surviving conn.
-            if (es_conf.len > 0) {
-                var ids: [64]u16 = undefined; // >= the engine's MAX_CONNS
-                const n = vsdev.hostConnsOnPort(control.EGRESS_VSOCK_PORT, &ids);
-                var revived: usize = 0;
-                for (ids[0..n]) |id| {
-                    if (data_bridge.resumeEgress(id)) revived += 1;
-                }
-                if (n > 0) std.debug.print("[nether] egress plane: revived {d}/{d} parked conn(s) -> {s}\n", .{ revived, n, @as([*:0]const u8, @ptrCast(&egress_sock_buf)) });
-            }
+            _ = data_bridge.resumeRestoredEgress();
         }
 
         // Wire the (fresh) NAT engine into the meter + journal so __stats__ reports
@@ -1735,6 +1722,7 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
                 .max_runtime_s = conf.confGetInt("max_runtime_s", 0),
                 .max_cpu_s = conf.confGetInt("max_cpu_s", 0),
                 .idle_timeout_s = conf.confGetInt("idle_timeout_s", 0),
+                .idle_timeout_ms = conf.idleTimeoutMs(),
                 .rate_kbps = conf.confGetInt("net_rate_kbps", 0),
                 .max_output_bytes = conf.confGetInt("max_output_bytes", control.DEFAULT_MAX_OUTPUT_BYTES),
                 .x402 = core.x402,
@@ -1754,9 +1742,9 @@ pub fn macRestore(allocator: std.mem.Allocator, path: [*:0]const u8) !void {
 
         watchdogs = .{
             .stop = .{ .ctx = &hvf_stop, .func = RestoreStop.call },
-            .activity = &core.meter.last_activity_ms,
+            .activity = &core.meter.activity,
             .runtime_ms = @intCast(conf.confGetInt("max_runtime_s", 0) * 1000),
-            .idle_ms = @intCast(conf.confGetInt("idle_timeout_s", 0) * 1000),
+            .idle_ms = @intCast(conf.idleTimeoutMs()),
             .cpu_ms = @intCast(conf.confGetInt("max_cpu_s", 0) * 1000),
         };
         watchdogs.arm();

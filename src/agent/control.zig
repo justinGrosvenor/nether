@@ -35,13 +35,11 @@ pub const Metering = struct {
     data_conns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // data-plane conns accepted (3b)
     data_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // summed data-plane conn lifetimes
     net: ?*nether.Slirp = null, // network NAT, for egress/ingress byte counts
-    // Last control-plane activity (nowMs): a client command or agent output. The
-    // idle watchdog reclaims a sandbox that has seen none for idle_timeout_s.
-    last_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    activity: platform.Activity = .{},
 
     /// Mark control-plane activity (resets the idle timer).
     pub fn touch(self: *Metering) void {
-        self.last_activity_ms.store(nowMs(), .release);
+        self.activity.touch();
     }
 
     /// Render a stats report (text + the agent's 0x1e<exit>\n framing) into `buf`.
@@ -141,6 +139,7 @@ pub const SandboxInfo = struct {
     max_runtime_s: u64 = 0, // hard wall-clock cap (0 = unlimited)
     max_cpu_s: u64 = 0, // hard CPU-time cap (0 = unlimited)
     idle_timeout_s: u64 = 0, // idle reclamation (0 = disabled)
+    idle_timeout_ms: u64 = 0, // effective idle timeout, including millisecond override
     rate_kbps: u64 = 0, // download bandwidth cap (0 = unlimited)
     max_output_bytes: u64 = 0, // per-command output cap (0 = unlimited)
     x402: bool = false, // settlement mode: on = billable (teardown emits an x402 settlement); off = general workload
@@ -167,6 +166,7 @@ pub const SandboxInfo = struct {
             \\max_runtime_s={d}
             \\max_cpu_s={d}
             \\idle_timeout_s={d}
+            \\idle_timeout_ms={d}
             \\net_rate_kbps={d}
             \\max_output_bytes={d}
             \\x402={s}
@@ -190,6 +190,7 @@ pub const SandboxInfo = struct {
             self.max_runtime_s,
             self.max_cpu_s,
             self.idle_timeout_s,
+            self.idle_timeout_ms,
             self.rate_kbps,
             self.max_output_bytes,
             onOff(self.x402),
@@ -679,6 +680,10 @@ pub const AgentCtx = struct {
 
 pub fn agentEvent(ctx: *anyopaque, ev: nether.vsock.Event) void {
     const a: *AgentCtx = @ptrCast(@alignCast(ctx));
+    // A bridge/probe entry is detached before the guest's final RESET can
+    // arrive. Such late events fall through the router, but must never clear
+    // the agent's connection or inject another stream's bytes into its reply.
+    if (ev != .accept and a.conn_id.load(.acquire) != @as(i32, evConn(ev).?)) return;
     switch (ev) {
         .accept => |id| {
             a.conn_id.store(@intCast(id), .release);
@@ -780,9 +785,8 @@ pub const VsockProbe = struct {
 
 /// vsock event router: a host-dialed data/probe conn's events go to the data plane
 /// (the VsockProbe now; the Phase-2 bridge later); everything else - notably the
-/// guest-initiated agent conn - goes to the agent. Without this, a dialed conn's
-/// reset/shutdown would clobber the agent's conn-id tracking (agentEvent clears it on
-/// ANY reset). Seed of the data-plane bridge.
+/// guest-initiated agent conn - goes to the agent. agentEvent also checks its
+/// connection id, since a bridge/probe can detach before a late RESET arrives.
 pub const VsockRouter = struct {
     agent: *AgentCtx,
     probe: ?*VsockProbe = null,
@@ -1124,6 +1128,12 @@ pub const DataBridge = struct {
         if (active >= self.max_conns) return null; // govern cap reached
         const slot = free orelse return null; // pool full
         const buf = self.alloc.alloc(u8, self.window) catch return null; // delivery buffer
+        if (self.meter) |m| {
+            if (!m.activity.begin()) {
+                self.alloc.free(buf);
+                return null;
+            }
+        }
         const now = nowMs();
         self.conns[slot] = .{ .active = true, .state = .connecting, .vsock_id = id, .unix_fd = unix_fd, .start_ms = now, .last_ms = now, .buf = buf };
         if (self.meter) |m| _ = m.data_conns.fetchAdd(1, .release);
@@ -1151,6 +1161,7 @@ pub const DataBridge = struct {
         self.conns[slot] = .{};
         self.lock.unlock();
         if (e.buf.len > 0) self.alloc.free(e.buf);
+        if (e.active) if (self.meter) |m| m.activity.end();
     }
 
     /// Dial the platform's egress unix listener and write the identifying preamble.
@@ -1224,7 +1235,10 @@ pub const DataBridge = struct {
     /// Registers the surviving conn id and dials the egress socket with resume=1. Called
     /// from the restore thread (NOT the device thread).
     pub fn resumeEgress(self: *DataBridge, id: u16) bool {
-        const slot = self.register(id, -1) orelse return false;
+        const slot = self.register(id, -1) orelse {
+            self.vsdev.hostClose(id); // do not strand the guest in recv() on admission failure
+            return false;
+        };
         self.lock.lock();
         self.conns[slot].state = .established;
         self.conns[slot].egress = true;
@@ -1237,6 +1251,20 @@ pub const DataBridge = struct {
         return true;
     }
 
+    /// Reconnect restored egress before any vCPU resumes. Both backends use this
+    /// path: importState restores connections without firing new accept events.
+    pub fn resumeRestoredEgress(self: *DataBridge) usize {
+        const path = self.egress_path orelse return 0;
+        var ids: [nether.vsock.MAX_CONNS]u16 = undefined;
+        const n = self.vsdev.hostConnsOnPort(EGRESS_VSOCK_PORT, &ids);
+        var resumed: usize = 0;
+        for (ids[0..n]) |id| {
+            if (self.resumeEgress(id)) resumed += 1;
+        }
+        if (n > 0) std.debug.print("[bridge] reconnecting {d}/{d} restored egress conn(s) -> {s}\n", .{ resumed, n, path });
+        return resumed;
+    }
+
     /// Close both fds + free the slot. The pump thread is the single owner of this.
     fn teardown(self: *DataBridge, slot: usize) void {
         self.lock.lock();
@@ -1244,6 +1272,9 @@ pub const DataBridge = struct {
         self.conns[slot] = .{}; // clear slot (inactive + buf detached) so a late event skips it
         self.lock.unlock();
         if (!e.active) return;
+        // The entry is already detached, but its response tail still belongs to
+        // this VM. Retain the idle lease until flushing and closing complete.
+        defer if (self.meter) |m| m.activity.end();
         // Reset the guest conn FIRST so no more .recv fires for this (freed) slot; the buffer
         // already holds whatever was received.
         self.vsdev.hostClose(e.vsock_id);
@@ -1295,6 +1326,15 @@ pub const DataBridge = struct {
                 _ = libc.close(c);
                 continue;
             }
+            // Cover admission before hostConnect can deliver anything to the
+            // guest. register transfers protection to the connection's own lease.
+            if (self.meter) |m| {
+                if (!m.activity.begin()) {
+                    _ = libc.close(c);
+                    continue;
+                }
+            }
+            defer if (self.meter) |m| m.activity.end();
             // Non-blocking so the device-thread delivery (tryEvent) NEVER blocks the vCPU on a
             // wedged consumer; a large send buffer so brief lag doesn't fail a send. The pump
             // reads/drains this fd via pollRW.
@@ -2523,6 +2563,96 @@ fn drainReadInto(fd: c_int, got: []u8, glen: *usize) void {
         if (r <= 0) break; // EAGAIN (nothing buffered right now) or EOF
         glen.* += @intCast(r);
     }
+}
+
+test "late bridge close events cannot disconnect the live control agent" {
+    var engine = nether.Vsock{ .guest_cid = 3 };
+    var dev = nether.VsockDev{ .engine = &engine };
+    var bridge = DataBridge{ .vsdev = &dev, .path = "", .alloc = testing.allocator };
+    var agent = AgentCtx{};
+    agent.conn_id.store(0, .release);
+    var router = VsockRouter{ .agent = &agent, .bridge = &bridge };
+    const slot = bridge.register(1, -1).?;
+    bridge.teardown(slot);
+    VsockRouter.dispatch(&router, .{ .reset = 1 });
+    VsockRouter.dispatch(&router, .{ .shutdown = 1 });
+    VsockRouter.dispatch(&router, .{ .recv = .{ .conn = 1, .bytes = "unrelated response" } });
+    try testing.expectEqual(@as(i32, 0), agent.conn_id.load(.acquire));
+    VsockRouter.dispatch(&router, .{ .reset = 0 });
+    try testing.expectEqual(@as(i32, -1), agent.conn_id.load(.acquire));
+}
+
+test "restored egress reconnects with resume preamble and delivers the held upstream reply" {
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try temp.dir.realPath(testing.io, &root_buf)];
+    var path_buf: [104]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/eg.sock", .{root});
+    const server = libc.socket(AF_UNIX, SOCK_STREAM, 0);
+    try testing.expect(server >= 0);
+    defer _ = libc.close(server);
+    var addr = SockaddrUn{};
+    @memcpy(addr.path[0..path.len], path);
+    const addr_len: u32 = @intCast(@offsetOf(SockaddrUn, "path") + path.len + 1);
+    if (@hasField(SockaddrUn, "len")) addr.len = @intCast(addr_len);
+    try testing.expectEqual(@as(c_int, 0), libc.bind(server, &addr, addr_len));
+    try testing.expectEqual(@as(c_int, 0), libc.listen(server, 4));
+    hostutil.setNonblock(server);
+
+    var original = nether.Vsock{ .guest_cid = 3 };
+    original.conns[0] = .{ .state = .established, .host_port = 5000, .guest_port = 10 };
+    original.conns[1] = .{ .state = .established, .host_port = EGRESS_VSOCK_PORT, .guest_port = 11, .peer_buf_alloc = 4096 };
+    original.conns[2] = .{ .state = .established, .host_port = FWD_VSOCK_PORT, .guest_port = 12 };
+    original.conns[3] = .{ .state = .closing, .host_port = EGRESS_VSOCK_PORT, .guest_port = 13 };
+    const saved = original.exportState();
+    var restored = nether.Vsock{ .guest_cid = 0 };
+    restored.importState(&saved);
+    var dev = nether.VsockDev{ .engine = &restored }; // no guest/hypervisor required
+    var meter = Metering{};
+    var bridge = DataBridge{ .vsdev = &dev, .path = "", .egress_path = path, .alloc = testing.allocator, .meter = &meter };
+    defer bridge.stop();
+    try testing.expectEqual(@as(usize, 1), bridge.resumeRestoredEgress());
+    try testing.expect(hostutil.pollRW(server, false, 2000) > 0);
+    const peer = libc.accept(server, null, null);
+    try testing.expect(peer >= 0);
+    defer _ = libc.close(peer);
+    hostutil.setNonblock(peer);
+    var received: [128]u8 = undefined;
+    var used: usize = 0;
+    const deadline = nowMs() + 2000;
+    while (std.mem.indexOfScalar(u8, received[0..used], '\n') == null and nowMs() < deadline) {
+        _ = hostutil.pollRW(peer, false, 20);
+        drainReadInto(peer, &received, &used);
+    }
+    try testing.expectEqualStrings("NETHER-EGRESS v1 conn=1 resume=1\n", received[0..used]);
+    try testing.expect(!meter.activity.expire(nowMs() + 10_000, 100));
+    try testing.expectEqual(@as(isize, 6), libc.write(peer, "answer", 6));
+    var delivered = false;
+    while (nowMs() < deadline) {
+        {
+            dev.lock.lock();
+            defer dev.lock.unlock();
+            if (restored.peekOut()) |packet| {
+                try testing.expectEqualStrings("answer", packet[nether.vsock.HDR_LEN..]);
+                delivered = true;
+            }
+        }
+        if (delivered) break;
+        _ = usleep(1000);
+    }
+    try testing.expect(delivered);
+    bridge.stop();
+    try testing.expect(meter.activity.expire(nowMs() + 100, 100));
+}
+
+test "restored egress admission failure closes the surviving guest connection" {
+    var engine = nether.Vsock{ .guest_cid = 3 };
+    engine.conns[1] = .{ .state = .established, .host_port = EGRESS_VSOCK_PORT, .guest_port = 11 };
+    var dev = nether.VsockDev{ .engine = &engine };
+    var bridge = DataBridge{ .vsdev = &dev, .path = "", .egress_path = "/unused", .max_conns = 0 };
+    try testing.expectEqual(@as(usize, 0), bridge.resumeRestoredEgress());
+    try testing.expectEqual(nether.vsock.Conn.State.closing, engine.conns[1].state);
 }
 
 test "data-plane delivery ring is byte-exact across many wraparounds" {
