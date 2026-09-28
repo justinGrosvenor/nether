@@ -28,10 +28,10 @@ MIRROR="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}"
 
 # --- PINS (reproducible default) -------------------------------------------------------------
 # Exact versions + SHA256. Bump together when moving to a newer kernel (see --latest above).
-PIN_KVER="6.12.95-r0"                                  # linux-virt apk (kernel + modules)
-PIN_KSHA="86e7609c39def4175da43a14e0999829d6090f15d1cb63b7c58aad56749544b1"
-PIN_ROOTFS="alpine-minirootfs-3.21.7-aarch64.tar.gz"
-PIN_RSHA="d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da"
+PIN_KVER="6.12.111-r0"                                 # linux-virt apk (kernel + modules)
+PIN_KSHA="6ecce0b88acb8ea77513dc9eae8eeb1aee6707deec3cb99bcb26e8a7ab1408ca"
+PIN_ROOTFS="alpine-minirootfs-3.21.8-aarch64.tar.gz"
+PIN_RSHA="f25a96d2846a4bc439093107c1b48a8b0c93dcb411e2cb9cfded6f790b2bc001"
 
 latest() { curl -fsSL "$1" 2>/dev/null | grep -oE "$2" | sort | tail -1; }
 
